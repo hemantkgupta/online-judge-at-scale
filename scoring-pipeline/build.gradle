@@ -1,0 +1,72 @@
+plugins {
+    id 'java'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+ext {
+    flinkVersion = '1.18.1'
+}
+
+configurations {
+    flinkShadow
+}
+
+dependencies {
+    // Flink API - provided at runtime by Flink cluster
+    compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    compileOnly "org.apache.flink:flink-clients:${flinkVersion}"
+    compileOnly "org.apache.flink:flink-java:${flinkVersion}"
+
+    // Kafka connector - bundled in fat JAR
+    implementation "org.apache.flink:flink-connector-kafka:3.1.0-1.18"
+
+    // Redis client for leaderboard ZADD sink
+    implementation 'redis.clients:jedis:5.1.0'
+
+    // JSON parsing
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.16.1'
+
+    // Lombok
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+
+    // Test
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.assertj:assertj-core:3.25.3'
+    testImplementation 'org.mockito:mockito-core:5.10.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.10.0'
+    testImplementation "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-streaming-java:${flinkVersion}:tests"
+    testImplementation "org.apache.flink:flink-runtime:${flinkVersion}:tests"
+    testImplementation "org.apache.flink:flink-test-utils:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-core:${flinkVersion}:tests"
+    testImplementation "org.apache.flink:flink-clients:${flinkVersion}"
+}
+
+test {
+    useJUnitPlatform()
+    jvmArgs = [
+        '--add-opens', 'java.base/java.util=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.lang.reflect=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.io=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.util.concurrent=ALL-UNNAMED',
+    ]
+}
+
+shadowJar {
+    archiveBaseName.set('scoring-pipeline')
+    archiveClassifier.set('all')
+    mergeServiceFiles()
+
+    manifest {
+        attributes 'Main-Class': 'com.onlinejudge.scoring.ScoringJobApplication'
+    }
+
+    // Exclude Flink (provided by cluster) from fat JAR
+    dependencies {
+        exclude(dependency('org.apache.flink:flink-streaming-java'))
+        exclude(dependency('org.apache.flink:flink-clients'))
+        exclude(dependency('org.apache.flink:flink-java'))
+    }
+}

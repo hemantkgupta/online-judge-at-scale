@@ -1,0 +1,9 @@
+rootProject.name = 'online-judge-at-scale'
+
+include 'common'
+include 'api-gateway'
+include 'execution-worker'
+include 'scoring-pipeline'
+include 'leaderboard-service'
+include 'analytics-pipeline'
+include 'contest-service'

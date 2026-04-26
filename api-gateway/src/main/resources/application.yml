@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  threads:
+    virtual:
+      enabled: true   # Java 21 Virtual Threads
+
+  datasource:
+    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
+    username: root
+    password:
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+      acks: all
+      retries: 3
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+app:
+  kafka:
+    topic:
+      pretest: submissions.pretest
+      system: submissions.system
+  rate-limit:
+    submissions-per-minute: 10
+  outbox:
+    poll-interval-ms: 1000
+    batch-size: 50

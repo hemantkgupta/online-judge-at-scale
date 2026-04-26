@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package com.onlinejudge.events;
+option java_package = "com.onlinejudge.common.events";
+option java_outer_classname = "Events";
+
+message SubmissionEvent {
+  string submission_id = 1;
+  string user_id = 2;
+  string problem_id = 3;
+  string contest_id = 4;
+  string s3_code_url = 5;
+  string language = 6;
+  int64 gateway_ts_ms = 7;
+}
+
+message VerdictEvent {
+  string submission_id = 1;
+  string user_id = 2;
+  string problem_id = 3;
+  string contest_id = 4;
+  string result = 5; // ACCEPTED, WRONG_ANSWER, TIME_LIMIT_EXCEEDED, etc.
+  int32 execution_time_ms = 6;
+  int32 memory_used_mb = 7;
+  int64 gateway_ts_ms = 8;
+  int32 points = 9;
+}
+
+message AnalyticsEvent {
+  string submission_id = 1;
+  string user_id = 2;
+  string problem_id = 3;
+  string contest_id = 4;
+  string language = 5;
+  string verdict = 6;
+  int32 execution_time_ms = 7;
+  int32 memory_used_mb = 8;
+  int64 event_ts_ms = 9;
+}

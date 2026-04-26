@@ -1,0 +1,45 @@
+server:
+  port: 8081
+
+spring:
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
+    username: root
+    password:
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: execution-worker-t1
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+      max-poll-records: 1        # One submission at a time per worker thread
+      enable-auto-commit: false  # Manual offset commit after verdict
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+      acks: all
+
+app:
+  kafka:
+    topic:
+      pretest: submissions.pretest
+      evaluated-results: evaluated_results
+      analytics: analytics_events
+  execution:
+    timeout-seconds: 5
+    memory-limit-mb: 256
+    # Production: Firecracker MicroVM. Local: Docker container with resource limits.
+    mode: docker
