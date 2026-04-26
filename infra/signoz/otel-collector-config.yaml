@@ -1,0 +1,68 @@
+# OpenTelemetry Collector configuration for the Online Judge observability stack.
+#
+# Receives telemetry from all Java services via the OTLP gRPC/HTTP endpoints.
+# Each Spring Boot service sends traces, metrics, and logs via the
+# OpenTelemetry Java agent (auto-instrumentation, zero code changes).
+#
+# Pipeline:
+#   Service (OTLP) → OTel Collector → SigNoz (ClickHouse backend)
+#
+# To instrument a service, add these environment variables:
+#   JAVA_TOOL_OPTIONS: -javaagent:/otel/opentelemetry-javaagent.jar
+#   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+#   OTEL_SERVICE_NAME: <service-name>
+#   OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch telemetry to reduce export overhead
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+    send_batch_max_size: 1500
+
+  # Add resource attributes for environment identification
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: upsert
+
+exporters:
+  # SigNoz ClickHouse exporter for traces and metrics
+  clickhousetraces:
+    datasource: tcp://clickhouse-signoz:9000/signoz_traces
+    docker_multi_node_routing: true
+    low_cardinal_exception_grouping: true
+
+  clickhousemetricsv2:
+    dsn: tcp://clickhouse-signoz:9000/signoz_metrics
+
+  clickhouselogsv2:
+    dsn: tcp://clickhouse-signoz:9000/signoz_logs
+
+  # Debug exporter for local development (prints to stdout)
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [clickhousetraces, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [clickhousemetricsv2]
+    logs:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [clickhouselogsv2]
