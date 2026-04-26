@@ -14,13 +14,15 @@ Maps every blog part to the source files that implement it.
 |---|---|---|
 | **Part 1: The Problem and the Numbers** | N/A — pure architecture, no code | Architecture only |
 | **Part 2: System Overview** | All modules | Architecture only |
-| **Part 3: API Gateway** | `api-gateway/` — `SubmissionController`, `RateLimitService` | Implemented (rate limit via Redis sliding window; no JWT auth or contest window enforcement) |
-| **Part 4: Contest Service** | Not implemented | Gap — Contest Service is documented in implementation plan as not yet built |
+| **Part 3: API Gateway** | `api-gateway/` — `SubmissionController`, `RateLimitService`, `ContestWindowFilter`, `IdempotencyFilter` | Implemented (rate limit, contest window cache, client idempotency; no JWT auth) |
+| **Part 4: Contest Service** | `contest-service/` — `ContestStateMachine`, `ContestService`, `EncryptionService`, `LifecycleWorker` | Implemented (5-state FSM, AES-256-GCM encryption, automated T0/T1 transitions, Kafka state fanout) |
+| **Part 4.5: Problem Service** | `problem-service/` — `ProblemService`, `Problem`, `TestCase`, `ProblemController` | Implemented (CRUD, pre-signed URL generation, pretest/system test ordinal split) |
 | **Part 5: Submission Service** | `api-gateway/` — `SubmissionService`, `OutboxEvent`, `OutboxPublisherJob` | Implemented (poll-based outbox, not CDC) |
-| **Part 6: Execution Service** | `execution-worker/` — `SubmissionConsumer`, `DockerExecutionService`, `IdempotencyService` | Implemented (Docker, not Firecracker) |
+| **Part 6: Execution Service** | `execution-worker/` — `SubmissionConsumer`, `DockerExecutionService`, `IdempotencyService`, `SandboxManager`, `SandboxPool`, `TestCaseValidator` | Implemented (Docker, not Firecracker; sandbox pool with warm pool + watchdog) |
 | **Part 7: Scoring Pipeline** | `scoring-pipeline/` — `ScoringFunction`, `ScoreEncoder`, `RedisLeaderboardSink`, `ScoringState`, `ScoreUpdate` | Implemented (real Flink 1.18) |
-| **Part 8: Leaderboard + Push** | `leaderboard-service/` — `LeaderboardService`, `ScoreUpdateSubscriber`, `WebSocketConfig`, `RedisConfig`, `LeaderboardController` | Implemented (single Redis node, STOMP WebSocket, Redis Pub/Sub) |
+| **Part 8: Leaderboard + Push** | `leaderboard-service/` — `LeaderboardService`, `ScoreUpdateSubscriber`, `WebSocketConfig`, `RedisConfig`, `LeaderboardController`, `ScoreRangeShardRouter` | Implemented (single Redis node, STOMP WebSocket, Redis Pub/Sub, score-range shard logic) |
 | **Part 9: Analytics** | `analytics-pipeline/` — `AnalyticsConsumer`, `ClickHouseWriter` | Implemented (HTTP batch insert) |
+| **Observability** | `infra/signoz/` — `otel-collector-config.yaml`, SigNoz stack in `docker-compose.yml` | Implemented (OTLP → ClickHouse, zero-code Java agent instrumentation) |
 
 ---
 
@@ -80,19 +82,44 @@ Maps every blog part to the source files that implement it.
 | `consumer/AnalyticsConsumer.java` | Part 9 (Analytics) | Kafka consumer on `analytics_events` topic. Parses verdict events, buffers to `ClickHouseWriter`. Non-critical: acks even on error. |
 | `service/ClickHouseWriter.java` | Part 9 (ClickHouse ingest) | Batch HTTP insert to ClickHouse. `CopyOnWriteArrayList` buffer, flushes at batch-size or 5s interval. TabSeparated format. Re-buffers on failure. |
 
+### `contest-service/` — Contest Lifecycle + Encryption
+
+| File | Blog Reference | What It Does |
+|---|---|---|
+| `model/Contest.java` | Part 4 (Lifecycle) | JPA entity: id, title, state (ENUM), startTime, endTime, encryptionKey, encryptedBundleUrl, optimistic lock version. |
+| `model/ContestState.java` | Part 4 (State machine) | Enum: CREATED→REGISTRATION→ACTIVE→CLOSED→RESULTS. Forward-only transitions with valid-next-states map. |
+| `service/ContestStateMachine.java` | Part 4 (Transitions) | Validates and executes transitions. Precondition checks per state (e.g., ACTIVE requires encryption key). Idempotent. |
+| `service/ContestService.java` | Part 4 (Core logic) | CRUD + lifecycle operations. Kafka state-change fanout. Decryption key delivery endpoint. |
+| `service/EncryptionService.java` | Part 4 (Encryption) | AES-256-GCM: key generation, encrypt, decrypt. 12-byte IV, 128-bit auth tag. Tamper detection via GCM. |
+| `service/LifecycleWorker.java` | Part 4 (Automation) | `@Scheduled(1s)`: REGISTRATION→ACTIVE at T0, ACTIVE→CLOSED at T1. Concurrent-safe via optimistic locking. |
+| `controller/ContestController.java` | Part 4 (API) | REST endpoints: create, register, activate, close, results, key delivery, window check. |
+| `repository/ContestRepository.java` | Part 4 (Queries) | findByStateAndStartTimeBefore, findByStateAndEndTimeBefore for lifecycle worker. |
+
+### `problem-service/` — Problem CRUD + Pre-signed URLs
+
+| File | Blog Reference | What It Does |
+|---|---|---|
+| `model/Problem.java` | Part 4.5 (Data model) | JPA entity: id, title, timeLimitMs, memoryLimitMb, points, statementR2Key, testCaseCount. CockroachDB GLOBAL locality. |
+| `model/TestCase.java` | Part 4.5 (Test cases) | JPA entity: id, problemId, ordinal, inputR2Key, expectedOutputR2Key, maxScore. `isPretest()` = ordinal ≤ 10. |
+| `service/ProblemService.java` | Part 4.5 (Core logic) | CRUD, pre-signed URL generation (5-min TTL), pretest vs system test filtering by ordinal. |
+| `controller/ProblemController.java` | Part 4.5 (API) | REST: `GET /problems/{id}/test-cases?pretestOnly=true`. Called by Execution Service. |
+| `repository/ProblemRepository.java` | Part 4.5 (Queries) | Standard JPA repository. |
+| `repository/TestCaseRepository.java` | Part 4.5 (Queries) | findByProblemIdOrderByOrdinal, findByProblemIdAndOrdinalLessThanEqual for pretest filtering. |
+
 ### `common/` — Shared Protobuf + DTOs
 
 | File | Blog Reference | What It Does |
 |---|---|---|
 | `Events.java` (generated) | Part 2 (Protobuf events) | Generated from `events.proto`: `SubmissionEvent`, `VerdictEvent`, `AnalyticsEvent`. Currently unused — modules use JSON. |
 
-### Infrastructure
+### Infrastructure + Observability
 
 | File | Blog Reference | What It Does |
 |---|---|---|
-| `docker-compose.yml` | All parts | CockroachDB, Kafka (Confluent CP 7.5), Redis 7, ClickHouse 23.8, Flink jobmanager + taskmanager. |
+| `docker-compose.yml` | All parts | CockroachDB, Kafka (Confluent CP 7.5), Redis 7, ClickHouse 23.8, Flink jobmanager + taskmanager, SigNoz stack. |
 | `database/init.sql` | Part 5 (Schema) | CockroachDB initialization: creates database and tables. |
 | `database/clickhouse-init.sql` | Part 9 (Analytics) | ClickHouse `submission_analytics` MergeTree table. |
+| `infra/signoz/otel-collector-config.yaml` | Observability | OTLP gRPC/HTTP receivers → batch processor → ClickHouse exporters for traces, metrics, logs. |
 
 ---
 
@@ -101,15 +128,21 @@ Maps every blog part to the source files that implement it.
 | Blog Mechanism | Status | Notes |
 |---|---|---|
 | JWT authentication (Part 3) | Not implemented | Gateway accepts all requests; no auth layer. |
-| Contest window enforcement (Part 3) | Not implemented | No Contest Service exists. |
-| Contest Service (Part 4) | Not implemented | Lifecycle, encrypted pre-load, zero-second gate — all Part 4 mechanisms. |
-| Problem Service (Part 2) | Not implemented | Problem CRUD, test case storage, pre-signed URLs. |
-| Sandbox Manager (Part 6) | Not implemented | VM pool lifecycle, warm pools, host-side watchdog. Execution uses Docker directly. |
 | CockroachDB changefeed CDC (Part 5) | Substituted | Poll-based `OutboxPublisherJob` used instead. Documented gap. |
 | Firecracker MicroVMs (Part 6) | Substituted | Docker containers used. Documented gap. |
-| Score-range sharding (Part 7) | Not implemented | Single Redis node, single ZSET per contest. |
+| Score-range sharding (Part 7) | Logic only | `ScoreRangeShardRouter` implements routing algorithm; single Redis node in docker-compose. |
 | Confluent Cluster Linking (Part 7) | Not implemented | Single Kafka cluster locally. |
 | Regional read replicas (Part 8) | Not implemented | Single Redis node. |
 | Push Service materiality filter (Part 8) | Not implemented | All Pub/Sub messages pushed to all WebSocket clients. |
-| Client-side idempotency key (Part 5) | Not implemented | No `Idempotency-Key` header handling. Server generates submission IDs. |
 | Protobuf serialization (Part 2) | Not implemented | JSON used throughout. Proto definitions exist but are unused. |
+
+## Previously Documented Gaps — Now Resolved
+
+| Mechanism | Resolution |
+|---|---|
+| Contest Service (Part 4) | Implemented: `contest-service/` with 5-state FSM, AES-256-GCM, lifecycle automation |
+| Problem Service (Part 4.5) | Implemented: `problem-service/` with CRUD, pre-signed URLs, pretest/system split |
+| Contest window enforcement (Part 3) | Implemented: `api-gateway/security/ContestWindowFilter.java` with push+pull cache |
+| Client-side idempotency (Part 5) | Implemented: `api-gateway/security/IdempotencyFilter.java` with Redis SETNX |
+| Sandbox Manager (Part 6) | Implemented: `execution-worker/sandbox/SandboxManager.java` with warm pool, watchdog, pool metrics |
+| Observability | Implemented: SigNoz stack in docker-compose + OTel Collector config |
