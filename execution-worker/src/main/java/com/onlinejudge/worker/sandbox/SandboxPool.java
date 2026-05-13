@@ -98,6 +98,17 @@ public class SandboxPool {
     }
 
     /**
+     * Records that a provisioning attempt failed (Docker create errored, boot timed out, etc.).
+     * Decrements the in-flight counter so the replenishment loop's deficit calculation
+     * stays accurate. Symmetric to {@link #recordProvisioning()} for the failure path —
+     * the success path goes through {@link #addReady(Sandbox)}, which decrements the
+     * same counter and adds the sandbox to the ready queue.
+     */
+    public void recordProvisionFailed() {
+        provisioningCount.decrementAndGet();
+    }
+
+    /**
      * Computes the current deficit: how many more sandboxes need to be provisioned
      * to reach the target pool depth.
      *

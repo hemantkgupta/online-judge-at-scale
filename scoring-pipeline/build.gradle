@@ -12,6 +12,9 @@ configurations {
 }
 
 dependencies {
+    // Shared types (e.g., ScoreRangeShardRouter) — bundled into shadow JAR.
+    implementation project(':common')
+
     // Flink API - provided at runtime by Flink cluster
     compileOnly "org.apache.flink:flink-streaming-java:${flinkVersion}"
     compileOnly "org.apache.flink:flink-clients:${flinkVersion}"

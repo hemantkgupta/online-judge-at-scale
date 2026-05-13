@@ -170,35 +170,11 @@ class ScoringEndToEndTest {
     // --- Helpers ---
 
     private void processVerdict(String userId, String problemId, String result,
-                                 int points, long gatewayTsMs) throws Exception {
+                                 int points, long gatewayTsMs) {
         ScoringState state = userStates.computeIfAbsent(userId, k -> new ScoringState());
-
-        boolean stateChanged = false;
-
-        if ("ACCEPTED".equals(result)) {
-            if (!state.acceptedProblems.getOrDefault(problemId, false)) {
-                int wrongAttempts = state.wrongAttemptsPerProblem.getOrDefault(problemId, 0);
-                int penaltyForProblem = wrongAttempts * ScoreEncoder.PENALTY_PER_WRONG_ATTEMPT_MINUTES;
-
-                state.totalScore += points;
-                state.totalPenaltyMinutes += penaltyForProblem;
-                state.acceptedProblems.put(problemId, true);
-                stateChanged = true;
-            }
-        } else if ("WRONG_ANSWER".equals(result) || "RUNTIME_ERROR".equals(result)
-                || "TIME_LIMIT_EXCEEDED".equals(result)) {
-            if (!state.acceptedProblems.getOrDefault(problemId, false)) {
-                state.wrongAttemptsPerProblem.merge(problemId, 1, Integer::sum);
-            }
-        }
-
-        if (stateChanged) {
-            double zsetScore = ScoreEncoder.encode(state.totalScore, state.totalPenaltyMinutes);
-            allUpdates.add(new ScoreUpdate(
-                    userId, "contest-1",
-                    state.totalScore, state.totalPenaltyMinutes,
-                    zsetScore, gatewayTsMs));
-        }
+        com.onlinejudge.scoring.function.Scorer
+                .apply(state, userId, "contest-1", problemId, result, points, gatewayTsMs)
+                .ifPresent(allUpdates::add);
     }
 
     private void assertFinalScore(String userId, int expectedScore, int expectedPenalty) {

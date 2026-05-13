@@ -1,9 +1,9 @@
 package com.onlinejudge.leaderboard.service;
 
-import lombok.RequiredArgsConstructor;
+import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.DefaultTypedTuple;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.stereotype.Service;
@@ -11,70 +11,167 @@ import org.springframework.stereotype.Service;
 import java.util.*;
 
 /**
- * Read path: Redis ZSET operations for leaderboard queries.
+ * Read path: Redis ZSET operations for leaderboard queries, routed across
+ * score-range shards via {@link ScoreRangeShardRouter}.
  *
- * All reads are served from Redis - no relational DB involved.
- * ZREVRANGE: O(log N + M) where M = page size. At 100K users, log N ~ 17.
- * ZREVRANK:  O(log N).
- * ZCARD:     O(1).
+ * All reads are served from Redis — no relational DB involved.
  *
- * Production: score-range sharding across 3 nodes. Global rank =
- *   ZCARD(higher buckets) + ZREVRANK(user's bucket, userId).
- * Local: single node, all in one ZSET key "leaderboard:{contestId}".
+ * <p>For each query, the service walks shards from highest score to lowest:
+ * <ul>
+ *   <li>{@link #getLeaderboardPage(String, int, int)} fetches {@code ZCARD} of
+ *       each shard once, then issues at most one {@code ZREVRANGE} per shard
+ *       crossed by the requested page window.</li>
+ *   <li>{@link #getUserRank(String, String)} locates the user via {@code ZSCORE}
+ *       per shard (O(S) calls, S = shard count, ≤ 5 in practice), then sums
+ *       {@code ZCARD} of higher shards + the user's local {@code ZREVRANK}.</li>
+ *   <li>{@link #getParticipantCount(String)} sums {@code ZCARD} across all
+ *       shards.</li>
+ * </ul>
+ *
+ * <p>Per the Part 8 / Part 9 design: total complexity is O(S + log N) where
+ * S is the shard count (3–5) and N is the per-shard cardinality.
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class LeaderboardService {
 
+    /**
+     * Read-only template. In single-node mode this is the primary; with a replica
+     * configured ({@code app.redis.replica.host}) it points at the replica.
+     * Either way the leaderboard reads — ZREVRANGE, ZREVRANK, ZSCORE, ZCARD — are
+     * served from this template and never block writes from the scoring pipeline.
+     */
     private final StringRedisTemplate redisTemplate;
+    private final ScoreRangeShardRouter shardRouter;
+
+    public LeaderboardService(@Qualifier("readRedisTemplate") StringRedisTemplate redisTemplate,
+                              ScoreRangeShardRouter shardRouter) {
+        this.redisTemplate = redisTemplate;
+        this.shardRouter = shardRouter;
+    }
 
     @Value("${app.leaderboard.default-page-size:100}")
     private int defaultPageSize;
 
     /**
-     * Returns a leaderboard page. Higher score = lower rank index (rank 1 = best).
+     * Returns a leaderboard page across all shards. Page 0 = top of the
+     * highest-score shard. Ranks are 1-indexed (rank 1 = best).
      */
     public List<Map<String, Object>> getLeaderboardPage(String contestId, int page, int size) {
-        String key = "leaderboard:" + contestId;
         int pageSize = size > 0 ? Math.min(size, 500) : defaultPageSize;
-        long start = (long) page * pageSize;
-        long end   = start + pageSize - 1;
+        long globalStart = (long) page * pageSize;
+        long remaining = pageSize;
 
-        Set<ZSetOperations.TypedTuple<String>> entries =
-                redisTemplate.opsForZSet().reverseRangeWithScores(key, start, end);
-
-        if (entries == null || entries.isEmpty()) return List.of();
-
-        List<Map<String, Object>> rows = new ArrayList<>();
-        long rank = start + 1;
-        for (ZSetOperations.TypedTuple<String> entry : entries) {
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("rank", rank++);
-            row.put("userId", entry.getValue());
-            row.put("zsetScore", entry.getScore());
-            row.put("points",   decodePoints(entry.getScore()));
-            row.put("penaltyMinutes", decodePenalty(entry.getScore()));
-            rows.add(row);
+        // 1. Fetch ZCARD of every shard (highest-score shard first).
+        int shardCount = shardRouter.shardCount();
+        long[] cardsDesc = new long[shardCount];     // cardsDesc[0] = highest shard
+        for (int i = 0; i < shardCount; i++) {
+            int shardIdx = shardCount - 1 - i;
+            Long card = redisTemplate.opsForZSet().zCard(shardRouter.shardKey(contestId, shardIdx));
+            cardsDesc[i] = card != null ? card : 0L;
         }
-        return rows;
+
+        // 2. Walk shards from highest to lowest, accumulating until the page is full.
+        List<Map<String, Object>> result = new ArrayList<>();
+        long cumulative = 0;          // count of entries in shards higher than the current one
+        long rank = globalStart + 1;  // 1-indexed running rank counter
+
+        for (int i = 0; i < shardCount && remaining > 0; i++) {
+            int shardIdx = shardCount - 1 - i;
+            long shardCard = cardsDesc[i];
+
+            if (shardCard == 0) {
+                continue;
+            }
+
+            if (globalStart >= cumulative + shardCard) {
+                cumulative += shardCard;
+                continue;
+            }
+
+            long localStart = Math.max(0L, globalStart - cumulative);
+            long localEnd   = Math.min(shardCard - 1L, localStart + remaining - 1L);
+
+            Set<ZSetOperations.TypedTuple<String>> entries =
+                    redisTemplate.opsForZSet().reverseRangeWithScores(
+                            shardRouter.shardKey(contestId, shardIdx), localStart, localEnd);
+
+            if (entries != null) {
+                for (ZSetOperations.TypedTuple<String> entry : entries) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("rank", rank++);
+                    row.put("userId", entry.getValue());
+                    row.put("zsetScore", entry.getScore());
+                    row.put("points",   decodePoints(entry.getScore()));
+                    row.put("penaltyMinutes", decodePenalty(entry.getScore()));
+                    result.add(row);
+                }
+            }
+
+            remaining -= (localEnd - localStart + 1L);
+            cumulative += shardCard;
+        }
+
+        return result;
     }
 
     /**
-     * Returns a user's 1-indexed rank (1 = best). -1 if not on leaderboard.
+     * Returns a user's 1-indexed global rank across all shards, or -1 if the
+     * user is not on the leaderboard.
+     *
+     * <p>Algorithm:
+     * <ol>
+     *   <li>Probe each shard with {@code ZSCORE} to find which one holds the user.</li>
+     *   <li>Sum {@code ZCARD} of every shard above the user's shard.</li>
+     *   <li>Read the user's {@code ZREVRANK} within their own shard.</li>
+     *   <li>Apply {@link ScoreRangeShardRouter#computeGlobalRank}.</li>
+     * </ol>
      */
     public long getUserRank(String contestId, String userId) {
-        String key = "leaderboard:" + contestId;
-        Long rank = redisTemplate.opsForZSet().reverseRank(key, userId);
-        return rank != null ? rank + 1 : -1;
+        int shardCount = shardRouter.shardCount();
+
+        int userShard = -1;
+        for (int i = shardCount - 1; i >= 0; i--) {
+            Double s = redisTemplate.opsForZSet().score(shardRouter.shardKey(contestId, i), userId);
+            if (s != null) {
+                userShard = i;
+                break;
+            }
+        }
+        if (userShard < 0) {
+            return -1;
+        }
+
+        List<Long> higherCards = new ArrayList<>();
+        for (int i = userShard + 1; i < shardCount; i++) {
+            Long c = redisTemplate.opsForZSet().zCard(shardRouter.shardKey(contestId, i));
+            higherCards.add(c != null ? c : 0L);
+        }
+
+        Long localRank = redisTemplate.opsForZSet()
+                .reverseRank(shardRouter.shardKey(contestId, userShard), userId);
+        if (localRank == null) {
+            return -1;
+        }
+
+        return shardRouter.computeGlobalRank(localRank, higherCards);
     }
 
     /**
-     * Returns the user's current score entry.
+     * Returns the user's current score entry: rank + decoded points + penalty.
      */
     public Map<String, Object> getUserScore(String contestId, String userId) {
-        String key = "leaderboard:" + contestId;
-        Double zsetScore = redisTemplate.opsForZSet().score(key, userId);
+        int shardCount = shardRouter.shardCount();
+
+        Double zsetScore = null;
+        for (int i = shardCount - 1; i >= 0; i--) {
+            Double s = redisTemplate.opsForZSet().score(shardRouter.shardKey(contestId, i), userId);
+            if (s != null) {
+                zsetScore = s;
+                break;
+            }
+        }
+
         long rank = getUserRank(contestId, userId);
 
         Map<String, Object> result = new LinkedHashMap<>();
@@ -85,14 +182,23 @@ public class LeaderboardService {
         return result;
     }
 
+    /** Total participants on the leaderboard: sum of ZCARD across all shards. */
     public long getParticipantCount(String contestId) {
-        Long count = redisTemplate.opsForZSet().zCard("leaderboard:" + contestId);
-        return count != null ? count : 0L;
+        long total = 0;
+        for (int i = 0; i < shardRouter.shardCount(); i++) {
+            Long card = redisTemplate.opsForZSet().zCard(shardRouter.shardKey(contestId, i));
+            if (card != null) total += card;
+        }
+        return total;
     }
 
-    // Decode points from composite ZSET score
+    // Decode points from composite ZSET score.
+    // Note: with the encoding `points * 10M - penalty`, integer division loses
+    // the points-boundary because penalty subtracts into the next-lower bucket.
+    // Round on the floating-point divide instead so e.g. (4_999_999_880 / 10M)
+    // decodes back to 500, not 499.
     private long decodePoints(double zsetScore) {
-        return Math.round(zsetScore) / 10_000_000L;
+        return Math.round(zsetScore / 10_000_000.0);
     }
 
     // Decode penalty from composite ZSET score

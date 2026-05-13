@@ -1,4 +1,4 @@
-package com.onlinejudge.leaderboard.sharding;
+package com.onlinejudge.common.sharding;
 
 import java.util.*;
 
@@ -27,6 +27,10 @@ import java.util.*;
  *              + ZREVRANK(user's shard, userId) + 1
  *
  * ZCARD is O(1). Total computation is O(S + log N) where S = shard count.
+ *
+ * <p>This class lives in {@code common} so both the scoring-pipeline (Flink sink
+ * write side) and the leaderboard-service (read side) can share the same shard
+ * topology without duplication.
  */
 public class ScoreRangeShardRouter {
 
@@ -155,7 +159,6 @@ public class ScoreRangeShardRouter {
      */
     public List<ShardQuery> planPageQuery(int page, int pageSize) {
         List<ShardQuery> queries = new ArrayList<>();
-        long globalStart = (long) page * pageSize;
         long remaining = pageSize;
 
         // We need to figure out which shard contains the globalStart position.

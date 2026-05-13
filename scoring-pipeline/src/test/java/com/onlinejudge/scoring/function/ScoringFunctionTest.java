@@ -1,270 +1,243 @@
 package com.onlinejudge.scoring.function;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.scoring.model.ScoreUpdate;
 import com.onlinejudge.scoring.model.ScoringState;
 import com.onlinejudge.scoring.util.ScoreEncoder;
-import org.apache.flink.api.common.state.ValueState;
-import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.util.Collector;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
-import org.mockito.Captor;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.*;
 
 /**
- * Tests for the Flink ScoringFunction (KeyedProcessFunction).
+ * Unit tests for the production-style event-time-aware scoring logic.
  *
- * Directly tests the scoring logic by maintaining state manually and
- * collecting output via a mock Collector. This avoids the complexity of
- * the full Flink test harness while thoroughly verifying ICPC scoring rules:
- * - ACCEPTED adds points + 20min penalty per prior wrong attempt
- * - WRONG_ANSWER increments wrong attempts (no score change)
- * - Re-submission after acceptance is ignored
- * - Multiple problems accumulate correctly
+ * <p>These tests exercise {@link Scorer#apply} directly — the pure function
+ * extracted from {@link ScoringFunction} so scoring rules can be verified
+ * without spinning up a Flink runtime.
+ *
+ * <p>Behaviors verified:
+ * <ul>
+ *   <li>ACCEPTED with no prior WA → emit with no penalty.</li>
+ *   <li>WA alone → no emit (the problem isn't accepted yet).</li>
+ *   <li>WA, WA, AC (in order) → one emit with 2×20 min penalty.</li>
+ *   <li>AC, AC for same problem (with a <em>later</em> event-time) → second is ignored.</li>
+ *   <li>WA arriving <em>after</em> the AC but with a strictly <em>earlier</em>
+ *       event-time → <strong>correction</strong>: penalty grows, ScoreUpdate emitted.</li>
+ *   <li>WA arriving with event-time after the AC → not counted (penalty unchanged).</li>
+ *   <li>Multiple problems accumulate correctly.</li>
+ *   <li>Composite ZSET score is correctly encoded and ordered.</li>
+ *   <li>Replaying the same event twice is a no-op.</li>
+ * </ul>
  */
-@ExtendWith(MockitoExtension.class)
 class ScoringFunctionTest {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
-
-    private ScoringState currentState;
-    private List<ScoreUpdate> collected;
-
-    @Mock
-    private KeyedProcessFunction<String, byte[], ScoreUpdate>.Context context;
+    private ScoringState state;
+    private List<ScoreUpdate> emitted;
 
     @BeforeEach
     void setUp() {
-        currentState = null;
-        collected = new ArrayList<>();
+        state = new ScoringState();
+        emitted = new ArrayList<>();
     }
 
-    /**
-     * Simulates processElement by directly applying the same scoring logic
-     * as ScoringFunction. This is a faithful reproduction of the production code
-     * that avoids Flink runtime dependencies in tests.
-     */
+    /** Test helper: apply an event via the real Scorer and capture any emit. */
     private void processEvent(String userId, String problemId, String contestId,
-                               String result, int points, long gatewayTsMs) throws Exception {
-        Map<String, Object> event = new HashMap<>();
-        event.put("userId", userId);
-        event.put("problemId", problemId);
-        event.put("contestId", contestId);
-        event.put("result", result);
-        event.put("points", points);
-        event.put("gatewayTsMs", gatewayTsMs);
-
-        byte[] eventBytes = MAPPER.writeValueAsBytes(event);
-        var jsonNode = MAPPER.readTree(eventBytes);
-
-        String evUserId = jsonNode.get("userId").asText();
-        String evProblemId = jsonNode.get("problemId").asText();
-        String evContestId = jsonNode.has("contestId") && !jsonNode.get("contestId").isNull()
-                ? jsonNode.get("contestId").asText() : "global";
-        String evResult = jsonNode.get("result").asText();
-        int evPoints = jsonNode.has("points") ? jsonNode.get("points").asInt() : 0;
-        long evGatewayTs = jsonNode.get("gatewayTsMs").asLong();
-
-        // Initialize or restore state (same as ScoringFunction)
-        if (currentState == null) {
-            currentState = new ScoringState();
-        }
-
-        boolean stateChanged = false;
-
-        if ("ACCEPTED".equals(evResult)) {
-            if (!currentState.acceptedProblems.getOrDefault(evProblemId, false)) {
-                int wrongAttempts = currentState.wrongAttemptsPerProblem.getOrDefault(evProblemId, 0);
-                int penaltyForThisProblem = wrongAttempts * ScoreEncoder.PENALTY_PER_WRONG_ATTEMPT_MINUTES;
-
-                currentState.totalScore += evPoints;
-                currentState.totalPenaltyMinutes += penaltyForThisProblem;
-                currentState.acceptedProblems.put(evProblemId, true);
-                stateChanged = true;
-            }
-        } else if ("WRONG_ANSWER".equals(evResult) || "RUNTIME_ERROR".equals(evResult)
-                || "TIME_LIMIT_EXCEEDED".equals(evResult)) {
-            if (!currentState.acceptedProblems.getOrDefault(evProblemId, false)) {
-                currentState.wrongAttemptsPerProblem.merge(evProblemId, 1, Integer::sum);
-            }
-        }
-
-        if (stateChanged) {
-            double zsetScore = ScoreEncoder.encode(currentState.totalScore, currentState.totalPenaltyMinutes);
-            collected.add(new ScoreUpdate(
-                    evUserId, evContestId,
-                    currentState.totalScore, currentState.totalPenaltyMinutes,
-                    zsetScore, evGatewayTs
-            ));
-        }
+                              String result, int points, long gatewayTsMs) {
+        Optional<ScoreUpdate> update = Scorer.apply(
+                state, userId, contestId, problemId, result, points, gatewayTsMs);
+        update.ifPresent(emitted::add);
     }
+
+    // --- In-order events (legacy expectations) ---
 
     @Test
-    void accepted_emitsScoreUpdate() throws Exception {
+    void accepted_emitsScoreUpdate() {
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
 
-        assertThat(collected).hasSize(1);
-        ScoreUpdate update = collected.get(0);
-        assertThat(update.userId()).isEqualTo("user-1");
-        assertThat(update.contestId()).isEqualTo("contest-1");
-        assertThat(update.totalScore()).isEqualTo(100);
-        assertThat(update.penaltyMinutes()).isEqualTo(0);
+        assertThat(emitted).hasSize(1);
+        ScoreUpdate u = emitted.get(0);
+        assertThat(u.userId()).isEqualTo("user-1");
+        assertThat(u.contestId()).isEqualTo("contest-1");
+        assertThat(u.totalScore()).isEqualTo(100);
+        assertThat(u.penaltyMinutes()).isEqualTo(0);
     }
 
     @Test
-    void wrongAnswer_doesNotEmitScoreUpdate() throws Exception {
+    void wrongAnswer_doesNotEmitScoreUpdate() {
         processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L);
 
-        assertThat(collected).isEmpty();
+        assertThat(emitted).isEmpty();
+        // But the WA event-time IS recorded — so a later AC will see it.
+        assertThat(state.problems.get("prob-1").wrongAttemptTimes).containsExactly(1000L);
     }
 
     @Test
-    void accepted_afterWrongAttempts_includesPenalty() throws Exception {
+    void accepted_afterWrongAttempts_includesPenalty() {
         processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L);
         processEvent("user-1", "prob-1", "contest-1", "RUNTIME_ERROR", 0, 2000L);
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 3000L);
 
-        assertThat(collected).hasSize(1);
-        ScoreUpdate update = collected.get(0);
-        assertThat(update.totalScore()).isEqualTo(100);
-        // 2 wrong attempts * 20 min = 40 min penalty
-        assertThat(update.penaltyMinutes()).isEqualTo(2 * ScoreEncoder.PENALTY_PER_WRONG_ATTEMPT_MINUTES);
-        assertThat(update.penaltyMinutes()).isEqualTo(40);
+        assertThat(emitted).hasSize(1);
+        ScoreUpdate u = emitted.get(0);
+        assertThat(u.totalScore()).isEqualTo(100);
+        assertThat(u.penaltyMinutes()).isEqualTo(2 * ScoreEncoder.PENALTY_PER_WRONG_ATTEMPT_MINUTES);
     }
 
     @Test
-    void resubmission_afterAccepted_isIgnored() throws Exception {
+    void resubmission_afterAccepted_isIgnored() {
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
+        // Second ACCEPTED at a LATER time — ignored (first acceptance wins).
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 2000L);
 
-        assertThat(collected).hasSize(1); // Only one emission
-        assertThat(collected.get(0).totalScore()).isEqualTo(100); // Not 200
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).totalScore()).isEqualTo(100);
     }
 
     @Test
-    void multipleProblems_accumulateCorrectly() throws Exception {
-        // Accept problem 1: 100 pts, 0 penalty
+    void multipleProblems_accumulateCorrectly() {
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
-
-        // Wrong on problem 2, then accept: +100 pts, +20 min penalty
         processEvent("user-1", "prob-2", "contest-1", "WRONG_ANSWER", 0, 2000L);
         processEvent("user-1", "prob-2", "contest-1", "ACCEPTED", 100, 3000L);
 
-        assertThat(collected).hasSize(2);
-
-        ScoreUpdate lastUpdate = collected.get(1);
-        assertThat(lastUpdate.totalScore()).isEqualTo(200);
-        assertThat(lastUpdate.penaltyMinutes()).isEqualTo(20);
+        assertThat(emitted).hasSize(2);
+        ScoreUpdate last = emitted.get(1);
+        assertThat(last.totalScore()).isEqualTo(200);
+        assertThat(last.penaltyMinutes()).isEqualTo(20);
     }
 
     @Test
-    void wrongAnswer_afterAccepted_doesNotCountPenalty() throws Exception {
-        // Accept problem first
+    void wrongAnswer_afterAccepted_butLaterEventTime_doesNotCountPenalty() {
+        // AC at T=1000, then a WA arrives later but with event-time AFTER the AC.
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
-
-        // WA on same problem after accepted — should be ignored
         processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 2000L);
 
-        // Accept a new problem — no wrong attempts on prob-2
-        processEvent("user-1", "prob-2", "contest-1", "ACCEPTED", 100, 3000L);
-
-        assertThat(collected).hasSize(2);
-        ScoreUpdate lastUpdate = collected.get(1);
-        assertThat(lastUpdate.totalScore()).isEqualTo(200);
-        assertThat(lastUpdate.penaltyMinutes()).isEqualTo(0); // No penalty from WA on already-accepted prob-1
+        // No re-emit: WA at T=2000 is after AC at T=1000, so penalty is unaffected.
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).penaltyMinutes()).isEqualTo(0);
+        // But it IS recorded; just doesn't contribute.
+        assertThat(state.problems.get("prob-1").wrongAttemptTimes).containsExactly(2000L);
     }
 
     @Test
-    void timeLimitExceeded_countsAsWrongAttempt() throws Exception {
+    void timeLimitExceeded_countsAsWrongAttempt() {
         processEvent("user-1", "prob-1", "contest-1", "TIME_LIMIT_EXCEEDED", 0, 1000L);
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 2000L);
 
-        assertThat(collected).hasSize(1);
-        ScoreUpdate update = collected.get(0);
-        assertThat(update.totalScore()).isEqualTo(100);
-        assertThat(update.penaltyMinutes()).isEqualTo(20); // 1 TLE * 20 min
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).penaltyMinutes()).isEqualTo(20);
     }
 
     @Test
-    void zsetScore_isCorrectlyEncoded() throws Exception {
+    void zsetScore_isCorrectlyEncoded() {
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L);
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 500, 2000L);
+
+        double expected = ScoreEncoder.encode(500, 20);
+        assertThat(emitted.get(0).zsetScore()).isEqualTo(expected);
+    }
+
+    @Test
+    void nullContestId_defaultsAtFlinkLayer() {
+        // The Flink layer substitutes "global" when contestId is null in the payload;
+        // the Scorer just takes the contestId argument verbatim.
+        processEvent("user-1", "prob-1", "global", "ACCEPTED", 100, 1000L);
+        assertThat(emitted.get(0).contestId()).isEqualTo("global");
+    }
+
+    @Test
+    void multipleWrongAttempts_accumulatePenalty() {
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 100L);
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 200L);
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 300L);
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 400L);
+
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).penaltyMinutes()).isEqualTo(60);
+    }
+
+    @Test
+    void zsetScore_correctOrderingAfterMultipleProblems() {
+        // user-1: 100 points, 0 penalty
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
+        double scoreA = emitted.get(0).zsetScore();
 
-        ScoreUpdate update = collected.get(0);
-        double expectedZsetScore = ScoreEncoder.encode(100, 0);
-        assertThat(update.zsetScore()).isEqualTo(expectedZsetScore);
-        assertThat(update.zsetScore()).isEqualTo(100.0 * 10_000_000);
+        setUp();
+        // user-2: 100 points, 20 penalty (worse rank than user-1)
+        processEvent("user-2", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L);
+        processEvent("user-2", "prob-1", "contest-1", "ACCEPTED", 100, 2000L);
+        double scoreB = emitted.get(0).zsetScore();
+
+        assertThat(scoreA).isGreaterThan(scoreB); // Fewer penalties = higher ZSET score = better rank
     }
 
-    @Test
-    void nullContestId_defaultsToGlobal() throws Exception {
-        Map<String, Object> event = new HashMap<>();
-        event.put("userId", "user-1");
-        event.put("problemId", "prob-1");
-        event.put("contestId", null);
-        event.put("result", "ACCEPTED");
-        event.put("points", 100);
-        event.put("gatewayTsMs", 1000L);
-
-        // Process raw bytes directly
-        byte[] eventBytes = MAPPER.writeValueAsBytes(event);
-        var jsonNode = MAPPER.readTree(eventBytes);
-
-        String contestId = jsonNode.has("contestId") && !jsonNode.get("contestId").isNull()
-                ? jsonNode.get("contestId").asText() : "global";
-
-        assertThat(contestId).isEqualTo("global");
-
-        // Also verify via full processing
-        processEvent("user-1", "prob-1", null, "ACCEPTED", 100, 1000L);
-        // processEvent wraps null contestId, test the behavior
-    }
+    // --- Event-time correction (the production gap that was closed) ---
 
     @Test
-    void multipleWrongAttempts_accumulatePenalty() throws Exception {
-        // 5 wrong attempts on prob-1, then accepted
-        for (int i = 0; i < 5; i++) {
-            processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L + i);
-        }
-        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 2000L);
+    void lateWrongAnswer_beforeAcceptedEventTime_triggersCorrection() {
+        // First two events arrive in order, but the third (a late WA) carries an
+        // event-time that is BEFORE the previously-seen accepted event-time.
+        // The penalty must be corrected upward and a fresh ScoreUpdate emitted.
 
-        assertThat(collected).hasSize(1);
-        assertThat(collected.get(0).penaltyMinutes()).isEqualTo(5 * 20); // 100 minutes
-    }
-
-    @Test
-    void zsetScore_correctOrderingAfterMultipleProblems() throws Exception {
-        // User solves 3 problems with various wrong attempts
+        // T=1000: AC, no prior WA → score = 100, penalty = 0.
         processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L);
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).penaltyMinutes()).isEqualTo(0);
 
-        processEvent("user-1", "prob-2", "contest-1", "WRONG_ANSWER", 0, 2000L);
-        processEvent("user-1", "prob-2", "contest-1", "ACCEPTED", 100, 3000L);
+        // T=500 (late!): WA whose event-time precedes the AC.
+        // The Scorer must record it AND recompute penalty → +20 min.
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 500L);
 
-        processEvent("user-1", "prob-3", "contest-1", "WRONG_ANSWER", 0, 4000L);
-        processEvent("user-1", "prob-3", "contest-1", "WRONG_ANSWER", 0, 5000L);
-        processEvent("user-1", "prob-3", "contest-1", "ACCEPTED", 100, 6000L);
+        assertThat(emitted).hasSize(2);
+        ScoreUpdate correction = emitted.get(1);
+        assertThat(correction.totalScore()).isEqualTo(100);          // Points unchanged
+        assertThat(correction.penaltyMinutes()).isEqualTo(20);       // +20 from the late WA
+    }
 
-        assertThat(collected).hasSize(3);
+    @Test
+    void earlierAcceptedArrivesLast_replacesAcceptedTimeAndRecomputesPenalty() {
+        // T=1000: WA
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 1000L);
+        // T=2000: WA
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 2000L);
+        // T=3000: AC → penalty = 2×20 = 40
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 3000L);
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).penaltyMinutes()).isEqualTo(40);
 
-        ScoreUpdate finalUpdate = collected.get(2);
-        assertThat(finalUpdate.totalScore()).isEqualTo(300);
-        assertThat(finalUpdate.penaltyMinutes()).isEqualTo(20 + 40); // 1*20 + 2*20 = 60 min
+        // Later, an earlier AC arrives — at T=1500 (between the two WAs).
+        // ICPC rule: earliest acceptance wins. After the correction:
+        //   acceptedAtMs = 1500
+        //   WAs with t < 1500: just the T=1000 one
+        //   penalty = 1×20 = 20
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1500L);
 
-        double expectedZset = ScoreEncoder.encode(300, 60);
-        assertThat(finalUpdate.zsetScore()).isEqualTo(expectedZset);
+        assertThat(emitted).hasSize(2);
+        ScoreUpdate correction = emitted.get(1);
+        assertThat(correction.totalScore()).isEqualTo(100);
+        assertThat(correction.penaltyMinutes()).isEqualTo(20);
+    }
+
+    @Test
+    void replayingSameEvent_isIdempotent() {
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 100L);
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 200L);
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 300L);
+
+        int emitsBefore = emitted.size();
+        int scoreBefore = state.totalScore;
+        int penaltyBefore = state.totalPenaltyMinutes;
+
+        // Replay each event verbatim — none should change the state or emit.
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 100L);
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 200L);
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 300L);
+
+        assertThat(emitted).hasSize(emitsBefore);
+        assertThat(state.totalScore).isEqualTo(scoreBefore);
+        assertThat(state.totalPenaltyMinutes).isEqualTo(penaltyBefore);
     }
 }

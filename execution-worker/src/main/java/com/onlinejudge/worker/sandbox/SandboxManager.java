@@ -235,6 +235,8 @@ public class SandboxManager {
         Sandbox sandbox = new Sandbox(pool.language());
         aliveSandboxes.add(sandbox);
 
+        boolean succeeded = false;
+        Process process = null;
         try {
             String image = LANGUAGE_IMAGES.getOrDefault(pool.language(), "python:3.12-slim");
 
@@ -252,25 +254,36 @@ public class SandboxManager {
                     "sleep", "infinity"  // Keep container alive until killed
             );
             pb.redirectErrorStream(true);
-            Process process = pb.start();
+            process = pb.start();
             String containerId = new String(process.getInputStream().readAllBytes()).trim();
-            process.waitFor(10, TimeUnit.SECONDS);
+            boolean exited = process.waitFor(10, TimeUnit.SECONDS);
 
-            if (process.exitValue() == 0 && !containerId.isBlank()) {
+            if (exited && process.exitValue() == 0 && !containerId.isBlank()) {
                 sandbox.markReady(containerId);
-                pool.addReady(sandbox);
+                pool.addReady(sandbox);  // decrements provisioningCount on success
+                succeeded = true;
                 log.debug("[sandbox] Provisioned sandbox={} language={} container={}",
                         sandbox.getId(), pool.language(), containerId.substring(0, 12));
             } else {
-                aliveSandboxes.remove(sandbox);
-                log.error("[sandbox] Failed to provision sandbox={}: exit={}",
-                        sandbox.getId(), process.exitValue());
+                int exitCode = exited ? process.exitValue() : -1;
+                log.error("[sandbox] Failed to provision sandbox={}: exited={} exitCode={}",
+                        sandbox.getId(), exited, exitCode);
             }
 
         } catch (Exception ex) {
-            aliveSandboxes.remove(sandbox);
             log.error("[sandbox] Provisioning error for sandbox={}: {}",
                     sandbox.getId(), ex.getMessage());
+        } finally {
+            // Whether we threw, timed out, or got a non-zero exit, the provisioning counter
+            // must be decremented. addReady() handles the success case; recordProvisionFailed()
+            // handles every other path so computeDeficit() stays accurate.
+            if (!succeeded) {
+                aliveSandboxes.remove(sandbox);
+                pool.recordProvisionFailed();
+                if (process != null && process.isAlive()) {
+                    process.destroyForcibly();
+                }
+            }
         }
     }
 

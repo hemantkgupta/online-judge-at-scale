@@ -35,6 +35,10 @@ class SandboxPoolTest {
     }
 
     private Sandbox addReadySandbox() {
+        // Real lifecycle: recordProvisioning() then addReady() once the sandbox is booted.
+        // addReady() decrements the provisioning counter, so callers must record provisioning first
+        // or the counter goes negative and computeDeficit() reads incorrectly.
+        pool.recordProvisioning();
         Sandbox s = new Sandbox("python");
         s.markReady("container-" + s.getId());
         pool.addReady(s);
@@ -179,6 +183,31 @@ class SandboxPoolTest {
         pool.recordProvisioning(); // 1 in-flight
 
         assertThat(pool.computeDeficit()).isEqualTo(2); // target=5, ready=2, prov=1
+    }
+
+    @Test
+    void recordProvisionFailed_decrementsProvisioningCounter() {
+        // Symmetric to recordProvisioning(): without this, a failed Docker boot
+        // would leak an in-flight slot and computeDeficit() would under-report.
+        pool.recordProvisioning();
+        pool.recordProvisioning();
+        assertThat(pool.provisioningCount()).isEqualTo(2);
+
+        pool.recordProvisionFailed();
+        assertThat(pool.provisioningCount()).isEqualTo(1);
+
+        // Deficit after one success + one failure: target=5, ready=0, provisioning=1
+        assertThat(pool.computeDeficit()).isEqualTo(4);
+    }
+
+    @Test
+    void recordProvisionFailed_pairedWithRecordProvisioning_isZeroSum() {
+        int initial = pool.provisioningCount();
+        for (int i = 0; i < 10; i++) {
+            pool.recordProvisioning();
+            pool.recordProvisionFailed();
+        }
+        assertThat(pool.provisioningCount()).isEqualTo(initial);
     }
 
     @Test

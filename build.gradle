@@ -23,4 +23,11 @@ subprojects {
         compileOnly 'org.projectlombok:lombok:1.18.30'
         annotationProcessor 'org.projectlombok:lombok:1.18.30'
     }
+
+    // Default test config — JUnit 5 platform across every module.
+    // Modules with extra requirements (e.g. scoring-pipeline's Flink jvmArgs)
+    // append to this in their own test {} block.
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+    }
 }

@@ -1,4 +1,4 @@
-package com.onlinejudge.leaderboard.sharding;
+package com.onlinejudge.common.sharding;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -107,35 +107,27 @@ class ScoreRangeShardRouterTest {
 
     @Test
     void computeGlobalRank_topUserInHighestShard() {
-        // User is rank 0 (best) in shard 2. No higher shards have entries.
         long globalRank = router.computeGlobalRank(0, List.of());
-        assertThat(globalRank).isEqualTo(1); // 0 + 0 + 1
+        assertThat(globalRank).isEqualTo(1);
     }
 
     @Test
     void computeGlobalRank_userInShard1_withHigherShard() {
-        // User is rank 3 in shard 1. Shard 2 has 50 users.
         long globalRank = router.computeGlobalRank(3, List.of(50L));
-        assertThat(globalRank).isEqualTo(54); // 50 + 3 + 1
+        assertThat(globalRank).isEqualTo(54);
     }
 
     @Test
     void computeGlobalRank_userInShard0_withBothHigherShards() {
-        // User is rank 10 in shard 0. Shard 1 has 200 users, shard 2 has 50 users.
         long globalRank = router.computeGlobalRank(10, List.of(50L, 200L));
-        assertThat(globalRank).isEqualTo(261); // 50 + 200 + 10 + 1
+        assertThat(globalRank).isEqualTo(261);
     }
 
     @Test
     void computeGlobalRank_realIcpcScenario() {
-        // 1M users:
-        //   Shard 2 (6+ solved): 5,000 users
-        //   Shard 1 (3-5 solved): 200,000 users
-        //   Shard 0 (0-2 solved): 795,000 users
-        //
-        // User solved 4 problems (shard 1), local rank = 150
+        // User solved 4 problems (shard 1), local rank = 150, shard 2 has 5K users.
         long globalRank = router.computeGlobalRank(150, List.of(5_000L));
-        assertThat(globalRank).isEqualTo(5_151); // 5000 + 150 + 1
+        assertThat(globalRank).isEqualTo(5_151);
     }
 
     // --- Constructor validation ---
@@ -158,8 +150,6 @@ class ScoreRangeShardRouterTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("strictly ascending");
     }
-
-    // --- Custom shard configuration ---
 
     @Test
     void customShardConfig_fiveShards() {

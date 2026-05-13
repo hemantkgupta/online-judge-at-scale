@@ -1,6 +1,6 @@
 package com.onlinejudge.leaderboard.integration;
 
-import com.onlinejudge.leaderboard.sharding.ScoreRangeShardRouter;
+import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -72,7 +72,7 @@ class LeaderboardShardingIntegrationTest {
 
         for (int i = 0; i < 1000; i++) {
             String userId = "user-" + i;
-            int solved = rng.nextInt(8) * 100; // 0-700 points
+            int solved = rng.nextInt(8); // 0-7 problems solved — spans all 3 shards
             int penalty = rng.nextInt(300);
             double zset = (double) ((long) solved * 10_000_000L - penalty);
 

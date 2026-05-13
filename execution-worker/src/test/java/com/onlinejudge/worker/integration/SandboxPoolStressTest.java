@@ -237,8 +237,11 @@ class SandboxPoolStressTest {
     void pool_deficitComputation_underConcurrency() throws Exception {
         SandboxPool pool = new SandboxPool("python", 10);
 
-        // Add 10 sandboxes
+        // Add 10 sandboxes — pair each addReady() with the corresponding
+        // recordProvisioning() the real boot loop would have made; addReady()
+        // decrements the provisioning counter.
         for (int i = 0; i < 10; i++) {
+            pool.recordProvisioning();
             Sandbox s = new Sandbox("python");
             s.markReady("c-" + i);
             pool.addReady(s);

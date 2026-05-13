@@ -1,5 +1,6 @@
 package com.onlinejudge.scoring.sink;
 
+import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
 import com.onlinejudge.scoring.model.ScoreUpdate;
 import org.junit.jupiter.api.Test;
 
@@ -14,30 +15,37 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class RedisLeaderboardSinkTest {
 
-    @Test
-    void luaScript_containsZadd() {
-        // The Lua script must perform an atomic ZADD + PUBLISH
-        // We verify the script structure via reflection or by examining
-        // the sink's behavior
-        RedisLeaderboardSink sink = new RedisLeaderboardSink("localhost", 6379);
+    private final ScoreRangeShardRouter router = ScoreRangeShardRouter.defaultIcpcRouter();
 
-        // ScoreUpdate that the sink processes
+    @Test
+    void sinkConstructible_withRouter() {
+        // The sink must be constructible with a ScoreRangeShardRouter so writes are sharded.
+        RedisLeaderboardSink sink = new RedisLeaderboardSink("localhost", 6379, router);
+
         ScoreUpdate update = new ScoreUpdate("user-1", "contest-1", 300, 45, 2_999_999_955.0, 1000L);
         assertThat(update.userId()).isEqualTo("user-1");
         assertThat(update.contestId()).isEqualTo("contest-1");
         assertThat(update.zsetScore()).isEqualTo(2_999_999_955.0);
+        assertThat(sink).isNotNull();
     }
 
     @Test
-    void scoreUpdate_leaderboardKeyPattern() {
+    void scoreUpdate_pubsubKeyPattern() {
         ScoreUpdate update = new ScoreUpdate("user-abc", "contest-42", 500, 100, 4_999_999_900.0, 2000L);
 
-        // Verify the key pattern the sink would use
-        String expectedLeaderboardKey = "leaderboard:" + update.contestId();
         String expectedPubsubChannel = "score_updates:" + update.contestId();
-
-        assertThat(expectedLeaderboardKey).isEqualTo("leaderboard:contest-42");
         assertThat(expectedPubsubChannel).isEqualTo("score_updates:contest-42");
+    }
+
+    @Test
+    void shardKey_routesToCorrectBucket() {
+        // 300 points × 10M - 45 ≈ 3 billion — well above the 60M shard-2 boundary.
+        double zset = (double) ((long) 300 * 10_000_000L - 45);
+        int shard = router.shardForScore(zset);
+        assertThat(shard).isEqualTo(2);
+
+        String key = router.shardKey("contest-1", shard);
+        assertThat(key).isEqualTo("leaderboard:contest-1:shard:2");
     }
 
     @Test
@@ -72,9 +80,9 @@ class RedisLeaderboardSinkTest {
     }
 
     @Test
-    void sinkConstructor_acceptsHostAndPort() {
+    void sinkConstructor_acceptsHostPortAndRouter() {
         // Verify the sink can be constructed with custom Redis coordinates
-        RedisLeaderboardSink sink = new RedisLeaderboardSink("redis.example.com", 6380);
+        RedisLeaderboardSink sink = new RedisLeaderboardSink("redis.example.com", 6380, router);
         assertThat(sink).isNotNull();
     }
 

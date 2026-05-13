@@ -13,14 +13,16 @@ import org.springframework.dao.DataIntegrityViolationException;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
  * Tests for the exactly-once idempotency guard.
  *
- * Verifies: first claim succeeds, duplicate submission_id is skipped,
- * concurrent claim race is handled gracefully, markCompleted updates status.
+ * Verifies: first claim succeeds, duplicate (submissionId, phase) is skipped,
+ * concurrent claim race is handled gracefully, markCompleted updates status,
+ * and the composite key is scoped by phase so the same submission can run
+ * once in Phase 1 (pretest) and once in Phase 2 (system).
  */
 @ExtendWith(MockitoExtension.class)
 class IdempotencyServiceTest {
@@ -50,7 +52,7 @@ class IdempotencyServiceTest {
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenReturn(1); // 1 row inserted
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId);
+        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
 
         assertThat(claimed).isTrue();
     }
@@ -59,9 +61,9 @@ class IdempotencyServiceTest {
     void claimSubmission_returnsFalse_whenDuplicate() {
         when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
-        when(insertQuery.executeUpdate()).thenReturn(0); // 0 rows = ON CONFLICT DO NOTHING fired
+        when(insertQuery.executeUpdate()).thenReturn(0);
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId);
+        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
 
         assertThat(claimed).isFalse();
     }
@@ -73,7 +75,7 @@ class IdempotencyServiceTest {
         when(insertQuery.executeUpdate()).thenThrow(
                 new DataIntegrityViolationException("duplicate key"));
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId);
+        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
 
         assertThat(claimed).isFalse();
     }
@@ -84,24 +86,40 @@ class IdempotencyServiceTest {
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenReturn(1);
 
-        idempotencyService.claimSubmission(submissionId);
+        idempotencyService.claimSubmission(submissionId, "pretest");
 
-        // Verify the SQL contains ON CONFLICT DO NOTHING
         verify(entityManager).createNativeQuery(argThat(sql ->
                 sql.contains("ON CONFLICT") && sql.contains("DO NOTHING")
         ));
     }
 
     @Test
-    void claimSubmission_setsKeyAndSubmissionIdParameters() {
+    void claimSubmission_keyIsScopedByPhase() {
         when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenReturn(1);
 
-        idempotencyService.claimSubmission(submissionId);
+        idempotencyService.claimSubmission(submissionId, "pretest");
 
-        verify(insertQuery).setParameter("key", submissionId);
+        verify(insertQuery).setParameter("key", submissionId + ":pretest");
         verify(insertQuery).setParameter(eq("sid"), eq(UUID.fromString(submissionId)));
+    }
+
+    @Test
+    void claimSubmission_sameSubmissionDifferentPhase_isAllowed() {
+        // The two phases use distinct composite keys, so both can claim the same
+        // submissionId — exactly what the Phase 1 → Phase 2 promotion needs.
+        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(1);
+
+        boolean pretestClaim = idempotencyService.claimSubmission(submissionId, "pretest");
+        boolean systemClaim  = idempotencyService.claimSubmission(submissionId, "system");
+
+        assertThat(pretestClaim).isTrue();
+        assertThat(systemClaim).isTrue();
+        verify(insertQuery).setParameter("key", submissionId + ":pretest");
+        verify(insertQuery).setParameter("key", submissionId + ":system");
     }
 
     @Test
@@ -110,25 +128,24 @@ class IdempotencyServiceTest {
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
         when(updateQuery.executeUpdate()).thenReturn(1);
 
-        idempotencyService.markCompleted(submissionId);
+        idempotencyService.markCompleted(submissionId, "pretest");
 
         verify(entityManager).createNativeQuery(argThat(sql ->
                 sql.contains("UPDATE") && sql.contains("completed")
         ));
-        verify(updateQuery).setParameter("key", submissionId);
+        verify(updateQuery).setParameter("key", submissionId + ":pretest");
     }
 
     @Test
     void claimSubmission_duplicateDetectionPreventsDoubleExecution() {
-        // Simulate: first call succeeds, second call (same submissionId) detects duplicate
         when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate())
-                .thenReturn(1)   // First claim succeeds
-                .thenReturn(0);  // Second claim blocked by ON CONFLICT
+                .thenReturn(1)
+                .thenReturn(0);
 
-        boolean first = idempotencyService.claimSubmission(submissionId);
-        boolean second = idempotencyService.claimSubmission(submissionId);
+        boolean first  = idempotencyService.claimSubmission(submissionId, "pretest");
+        boolean second = idempotencyService.claimSubmission(submissionId, "pretest");
 
         assertThat(first).isTrue();
         assertThat(second).isFalse();
