@@ -15,6 +15,10 @@ CREATE TABLE problems (
     points INT NOT NULL
 );
 
+-- `region` is added to the write-path tables so a multi-region cluster can
+-- enable LOCALITY REGIONAL BY ROW on them (see database/multi-region-setup.sql).
+-- On this single-node demo it is just a STRING column carrying the originating
+-- region; the application sets it via the X-Region header (or app.region default).
 CREATE TABLE submissions (
     id UUID PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id),
@@ -23,6 +27,7 @@ CREATE TABLE submissions (
     language STRING NOT NULL,
     s3_code_url STRING NOT NULL,
     status STRING NOT NULL,
+    region STRING NOT NULL DEFAULT 'us-east-1',
     created_at TIMESTAMP DEFAULT now()
 );
 
@@ -31,8 +36,12 @@ CREATE TABLE outbox_events (
     submission_id UUID NOT NULL REFERENCES submissions(id),
     event_type STRING NOT NULL,
     payload JSONB NOT NULL,
+    region STRING NOT NULL DEFAULT 'us-east-1',
     created_at TIMESTAMP DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_outbox_region_unpublished
+    ON outbox_events (region, created_at);
 
 CREATE TABLE idempotency_keys (
     key STRING PRIMARY KEY,

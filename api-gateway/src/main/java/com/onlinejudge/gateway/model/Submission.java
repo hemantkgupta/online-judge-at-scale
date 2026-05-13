@@ -37,6 +37,15 @@ public class Submission {
     @Column(name = "gateway_ts_ms", nullable = false)
     private long gatewayTsMs;
 
+    /**
+     * Region the gateway pod that accepted this submission lives in. On a
+     * multi-region CRDB cluster this column is the REGIONAL BY ROW key —
+     * CRDB pins this row's replicas to the region named here. Single-node
+     * locally; populated by {@link com.onlinejudge.gateway.service.RegionResolver}.
+     */
+    @Column(nullable = false, length = 32)
+    private String region;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 }

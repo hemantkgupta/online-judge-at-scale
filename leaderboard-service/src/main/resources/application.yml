@@ -11,6 +11,27 @@ spring:
       host: localhost
       port: 6379
 
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: leaderboard-verdict-push
+      auto-offset-reset: latest          # only deliver new verdicts to live clients
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+      enable-auto-commit: true           # fire-and-forget; missed verdicts fall back to HTTP polling
+
 app:
   leaderboard:
     default-page-size: 100
+  kafka:
+    topic:
+      evaluated-results: evaluated_results
+  # Read-replica routing (Part 9 of the blog).
+  #   - host/port left empty → reads fall through to the primary (single-node mode).
+  #   - With a replica running (docker-compose redis-replica on :6380), set
+  #     host=localhost and port=6380 to route ZREVRANGE/ZREVRANK/ZSCORE/ZCARD
+  #     through it. Writes (verdict-cache SET, Pub/Sub) stay on the primary.
+  redis:
+    replica:
+      host: ${REDIS_REPLICA_HOST:}
+      port: ${REDIS_REPLICA_PORT:0}

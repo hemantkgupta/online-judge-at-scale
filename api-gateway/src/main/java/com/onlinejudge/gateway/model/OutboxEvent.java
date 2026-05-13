@@ -29,6 +29,15 @@ public class OutboxEvent {
     @Column(nullable = false)
     private boolean published = false;
 
+    /**
+     * Region the originating submission was accepted in. Carried alongside the
+     * submission so the changefeed / polling publisher's regional reads stay
+     * local on a multi-region CRDB cluster. Always equals the source
+     * {@code submissions.region}.
+     */
+    @Column(nullable = false, length = 32)
+    private String region;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 }
