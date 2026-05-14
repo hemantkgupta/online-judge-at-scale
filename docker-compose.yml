@@ -10,6 +10,13 @@ services:
     ports:
       - "2181:2181"
 
+  # ─── Regional Kafka cluster ──────────────────────────────────────
+  # In production this is one of N per-region Kafka clusters that the
+  # Execution Service publishes verdicts to (e.g. `evaluated_results` on
+  # `kafka-us-east-1`, `kafka-eu-west-1`, etc.). Locally there is one
+  # "regional" cluster — `kafka` — that all services produce to and
+  # consume from on the regional path. MirrorMaker 2 (below) replicates
+  # its topics into `kafka-global` to model the regional → global hop.
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     depends_on:
@@ -19,11 +26,67 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      # Advertise to host-side clients via $KAFKA_HOST_EXTERNAL when set
+      # (e.g. the Mac's LAN IP so a remote execution-worker on a Raspberry Pi
+      # can reach this broker over the LAN). Defaults to localhost for the
+      # single-host case so existing dev workflows keep working unchanged.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${KAFKA_HOST_EXTERNAL:-localhost}:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+
+  # ─── Global Kafka cluster (MirrorMaker 2 destination) ────────────
+  # Second Kafka cluster representing the global aggregation tier. In
+  # production every region's `evaluated_results` is replicated here by
+  # MirrorMaker 2 so a single global Flink job can score across regions.
+  # Locally we run one regional broker (`kafka`) and one global broker
+  # (`kafka-global`) with MM2 streaming between them. Same architectural
+  # shape as the blog's Confluent Cluster Linking design, with zero
+  # vendor lock-in — MM2 ships inside Apache Kafka itself (Apache 2.0).
+  kafka-global:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      # Sharing one ZK ensemble is fine for the demo — separate ZK is a
+      # multi-node production concern. Each broker owns its own data dir
+      # under a distinct cluster ID (KAFKA_BROKER_ID=2 above).
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ZOOKEEPER_CONNECT_NAMESPACE: kafka-global
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-global:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+
+  # MirrorMaker 2 — the open-source equivalent of Confluent Cluster Linking.
+  # Runs the dedicated MM2 driver (`connect-mirror-maker.sh`) packaged with
+  # Apache Kafka and replicates topics from the regional cluster (`kafka`)
+  # to the global cluster (`kafka-global`). Topics are renamed by MM2's
+  # DefaultReplicationPolicy as `<source-alias>.<topic>` — e.g.
+  # `regional.evaluated_results` on `kafka-global`. The global Flink job
+  # consumes that prefixed topic.
+  mirrormaker2:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - kafka
+      - kafka-global
+    volumes:
+      - ./infra/mm2/mm2.properties:/etc/mm2/mm2.properties
+    command: >
+      bash -c "
+        echo '[mm2] Waiting for both Kafka clusters to be reachable...';
+        until kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1 \
+          && kafka-broker-api-versions --bootstrap-server kafka-global:29093 >/dev/null 2>&1; do
+          sleep 2;
+        done;
+        echo '[mm2] Both clusters ready — starting MirrorMaker 2';
+        connect-mirror-maker /etc/mm2/mm2.properties
+      "
 
   redis:
     image: redis:7.2
@@ -31,8 +94,30 @@ services:
       - "6379:6379"
     command: redis-server --appendonly yes
 
+  # Read replica of the primary Redis instance. Demonstrates the leaderboard
+  # read-replica pattern from Part 9 of the blog: writes go to primary, reads
+  # served from the replica. Single-host docker-compose can't model
+  # *regional* replicas, but the read/write split + async replication lag
+  # are real and observable here.
+  #
+  # The leaderboard-service auto-detects this replica via
+  # `app.redis.replica.host` (set in its application.yml) and routes
+  # ZREVRANGE/ZREVRANK/ZSCORE/ZCARD through it. Writes (the verdict-cache
+  # SET in VerdictPushConsumer) continue to go to the primary.
+  redis-replica:
+    image: redis:7.2
+    depends_on:
+      - redis
+    ports:
+      - "6380:6379"
+    command: redis-server --appendonly yes --replicaof redis 6379 --replica-read-only yes
+
   cockroachdb:
-    image: cockroachdb/cockroach:v23.1.10
+    # v24.1+ ships free-tier CDC for ALL sinks (Kafka, S3, webhook) — enables the
+    # real CREATE CHANGEFEED ... INTO 'kafka://...' flow documented in
+    # database/changefeed-setup.sql. Earlier versions only allowed Core
+    # changefeeds (stdout) without an Enterprise license.
+    image: cockroachdb/cockroach:v24.1.10
     command: start-single-node --insecure
     ports:
       - "26257:26257"
