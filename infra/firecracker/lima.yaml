@@ -1,0 +1,135 @@
+# =============================================================================
+# Lima VM for running Firecracker on an Apple Silicon Mac.
+#
+# Lima (https://lima-vm.io) is a macOS-native Linux VM manager that uses Apple
+# Hypervisor.framework — no kernel extensions, fast, battery-friendly. We use
+# it here to give the execution-worker a real `/dev/kvm` so Firecracker can
+# boot guest microVMs.
+#
+# Usage (from the Mac):
+#
+#   brew install lima
+#   limactl start --name=fc-dev infra/firecracker/lima.yaml
+#   limactl shell fc-dev          # SSH into the VM
+#   /workspace/infra/firecracker/smoke-microvm.sh   # boot a sample microVM
+#
+# What this config does on first boot (via the `provision` script):
+#   * apt-get installs curl + openjdk-17 (so you can run :execution-worker
+#     inside the VM if you want),
+#   * downloads the Firecracker aarch64 release and installs to /usr/local/bin,
+#   * downloads the Firecracker CI's prebuilt aarch64 kernel + Ubuntu rootfs
+#     into /var/lib/firecracker/ (matches the paths app.sandbox.firecracker.*
+#     expects),
+#   * adds the default `ubuntu` user to the `kvm` group.
+#
+# After first boot, `/dev/kvm` exists, `firecracker --version` works, and
+# /var/lib/firecracker/{vmlinux,rootfs.ext4} are in place.
+#
+# Networking: the VM can reach the host (your Mac) at `host.lima.internal`,
+# so the execution-worker inside the VM can talk to the docker-compose
+# Kafka/CRDB/Redis running on the Mac with:
+#
+#   SPRING_KAFKA_BOOTSTRAP_SERVERS=host.lima.internal:9092
+#   SPRING_DATASOURCE_URL=jdbc:postgresql://host.lima.internal:26257/defaultdb?sslmode=disable
+#   SPRING_DATA_REDIS_HOST=host.lima.internal
+# =============================================================================
+
+# Native ARM Linux — required on Apple Silicon. Avoids x86 emulation slowdown.
+arch: "aarch64"
+
+# Use Apple Virtualization.framework + opt into nested virtualization so
+# /dev/kvm appears inside the guest (this is what Firecracker needs).
+# Requirements: Apple Silicon M3 or newer + macOS 15 (Sequoia) or newer.
+# M1 / M2 chips do NOT support nested virt — see infra/firecracker/macos-setup.md
+# for fallback options if you're on an older Mac.
+vmType: "vz"
+vmOpts:
+  vz:
+    nestedVirtualization: true
+
+# Ubuntu 24.04 LTS cloud image (matches the Firecracker CI's rootfs base).
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# 4 vCPUs + 4 GiB RAM is plenty for one execution-worker plus a handful of
+# in-flight microVMs (each microVM gets the 256 MiB the worker requests).
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+
+# Mount the repo into the VM so you can edit code on the Mac and build / run
+# inside the VM with zero file syncing. Adjust the location if your clone
+# isn't at ~/code-all/online-judge-at-scale.
+#
+# Also mount $HOME so Lima can land you in your usual working directory when
+# you `limactl shell fc-dev` — without this, you get `cd: <path>: No such file
+# or directory` because Lima tries to chdir into the host-side CWD.
+mounts:
+  - location: "~"
+    writable: false
+  - location: "~/code-all/online-judge-at-scale"
+    mountPoint: "/workspace"
+    writable: true
+
+# Forward Mac → VM for the worker's actuator endpoint, in case you want to
+# curl it from your Mac browser. Everything else flows VM → Mac via
+# host.lima.internal so you don't need extra forwards.
+portForwards:
+  - guestPort: 8081
+    hostPort: 18081
+
+# One-shot system-level provisioning on first `limactl start`. Idempotent —
+# safe to re-run; existing installs are skipped.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        curl ca-certificates openjdk-17-jdk-headless
+
+      ARCH=aarch64
+      FC_VERSION=v1.10.1
+
+      # ---- Firecracker binary ----
+      if [ ! -x /usr/local/bin/firecracker ]; then
+        cd /tmp
+        curl -fsSL -o fc.tgz \
+          "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz"
+        tar -xf fc.tgz
+        install -m 0755 \
+          "release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" \
+          /usr/local/bin/firecracker
+        rm -rf fc.tgz "release-${FC_VERSION}-${ARCH}"
+      fi
+
+      # ---- Prebuilt kernel + rootfs from the Firecracker CI ----
+      # Pinned to v1.10/aarch64 because v1.11+ moved to squashfs rootfs.
+      # If the URLs 404 in the future, list available kernels with:
+      #   curl -s "https://s3.amazonaws.com/spec.ccfc.min/?prefix=firecracker-ci/v1.10/aarch64/" \
+      #     | grep -oE 'vmlinux-[0-9.]+' | sort -u
+      install -d /var/lib/firecracker
+      if [ ! -s /var/lib/firecracker/vmlinux ]; then
+        curl -fsSL -o /var/lib/firecracker/vmlinux \
+          "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-5.10.223"
+      fi
+      if [ ! -s /var/lib/firecracker/rootfs.ext4 ]; then
+        curl -fsSL -o /var/lib/firecracker/rootfs.ext4 \
+          "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/ubuntu-22.04.ext4"
+      fi
+
+      # ---- KVM group membership for the default Lima user ----
+      # /dev/kvm is exposed by the Lima VM; the user just needs read/write.
+      if ! getent group kvm >/dev/null; then groupadd kvm; fi
+      # The login user inside a Lima VM matches your macOS username.
+      LIMA_USER="${SUDO_USER:-$(logname 2>/dev/null || echo)}"
+      if [ -n "${LIMA_USER}" ]; then
+        usermod -aG kvm "${LIMA_USER}" || true
+      fi
+
+      echo "[provision] firecracker: $(firecracker --version | head -1)"
+      echo "[provision] /dev/kvm:    $(ls -la /dev/kvm || echo MISSING)"
+      echo "[provision] artifacts:   $(ls -lh /var/lib/firecracker)"

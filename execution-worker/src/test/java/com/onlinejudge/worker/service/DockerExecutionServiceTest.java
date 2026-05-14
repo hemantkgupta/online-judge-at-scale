@@ -88,4 +88,50 @@ class DockerExecutionServiceTest {
 
         assertThat(ok).isNotEqualTo(tle);
     }
+
+    @Test
+    void buildDockerCommand_omitsLinuxHardeningWhenDisabled() {
+        ReflectionTestUtils.setField(executionService, "linuxHardeningEnabled", false);
+        ReflectionTestUtils.setField(executionService, "seccompProfilePath", "/etc/seccomp/sandbox-seccomp.json");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).doesNotContain("--security-opt", "--cap-drop", "--cgroupns");
+    }
+
+    @Test
+    void buildDockerCommand_appliesLinuxHardeningOnLinuxHosts() {
+        // The hardening branch fires only on Linux. On macOS the flags should
+        // be skipped even when the config switch is on — verified by reading
+        // the OS at runtime, so this test will assert one of the two states
+        // based on where it runs.
+        ReflectionTestUtils.setField(executionService, "linuxHardeningEnabled", true);
+        ReflectionTestUtils.setField(executionService, "seccompProfilePath", "/etc/seccomp/sandbox-seccomp.json");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        if (DockerExecutionService.isLinuxHost()) {
+            assertThat(cmd).contains("--security-opt", "seccomp=/etc/seccomp/sandbox-seccomp.json");
+            assertThat(cmd).contains("--security-opt", "no-new-privileges");
+            assertThat(cmd).contains("--cap-drop", "ALL");
+            assertThat(cmd).contains("--cgroupns", "private");
+        } else {
+            // Mac/Windows host: flags must not appear.
+            assertThat(cmd).doesNotContain("--cap-drop", "--cgroupns");
+            assertThat(cmd).noneMatch(s -> s.startsWith("seccomp="));
+        }
+    }
+
+    @Test
+    void buildDockerCommand_alwaysIncludesBaselineConstraints() {
+        // Baseline cgroup-equivalent flags must be present regardless of the
+        // hardening switch — these are what gives us memory/cpu/pids limits
+        // and the air-gapped network on every backend.
+        ReflectionTestUtils.setField(executionService, "linuxHardeningEnabled", false);
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).contains("--memory", "--cpus", "--pids-limit",
+                "--network", "none", "--read-only", "--rm");
+    }
 }
