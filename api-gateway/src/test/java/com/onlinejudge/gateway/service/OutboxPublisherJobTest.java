@@ -1,6 +1,7 @@
 package com.onlinejudge.gateway.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.onlinejudge.common.events.Events.SubmissionEvent;
 import com.onlinejudge.gateway.model.OutboxEvent;
 import com.onlinejudge.gateway.repository.OutboxEventRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -59,7 +60,14 @@ class OutboxPublisherJobTest {
         event.setId(UUID.randomUUID());
         event.setSubmissionId(UUID.randomUUID());
         event.setEventType("SUBMISSION_RECEIVED");
-        event.setPayload("{\"userId\":\"" + userId + "\",\"submissionId\":\"" + event.getSubmissionId() + "\"}");
+        event.setPayload("{\"userId\":\"" + userId + "\"" +
+                ",\"submissionId\":\"" + event.getSubmissionId() + "\"" +
+                ",\"problemId\":\"p-1\"" +
+                ",\"contestId\":\"c-1\"" +
+                ",\"s3CodeUrl\":\"local://x\"" +
+                ",\"language\":\"python\"" +
+                ",\"gatewayTsMs\":12345" +
+                ",\"region\":\"us-east-1\"}");
         event.setPublished(false);
         event.setCreatedAt(Instant.now());
         return event;
@@ -120,6 +128,26 @@ class OutboxPublisherJobTest {
 
         // The Kafka partition key must be userId for per-user ordering
         verify(kafkaTemplate).send(eq("submissions.pretest"), eq("user-xyz-123"), any(byte[].class));
+    }
+
+    @Test
+    void publishPendingEvents_wireFormatIsProtobufSubmissionEvent() throws Exception {
+        OutboxEvent event = createTestEvent("user-proto");
+        when(outboxEventRepository.findUnpublished(50)).thenReturn(List.of(event));
+
+        ArgumentCaptor<byte[]> bytesCaptor = ArgumentCaptor.forClass(byte[].class);
+        outboxPublisherJob.publishPendingEvents();
+        verify(kafkaTemplate).send(eq("submissions.pretest"), eq("user-proto"), bytesCaptor.capture());
+
+        // The Kafka payload must parse back as a SubmissionEvent proto (Part 2).
+        SubmissionEvent decoded = SubmissionEvent.parseFrom(bytesCaptor.getValue());
+        assertThat(decoded.getUserId()).isEqualTo("user-proto");
+        assertThat(decoded.getProblemId()).isEqualTo("p-1");
+        assertThat(decoded.getContestId()).isEqualTo("c-1");
+        assertThat(decoded.getLanguage()).isEqualTo("python");
+        assertThat(decoded.getGatewayTsMs()).isEqualTo(12345L);
+        assertThat(decoded.getRegion()).isEqualTo("us-east-1");
+        assertThat(decoded.getPhase()).isEqualTo("pretest");
     }
 
     @Test

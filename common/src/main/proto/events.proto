@@ -12,6 +12,13 @@ message SubmissionEvent {
   string s3_code_url = 5;
   string language = 6;
   int64 gateway_ts_ms = 7;
+  // Region the API gateway pod that accepted this submission was pinned to —
+  // becomes the REGIONAL BY ROW key on the CRDB write. See database/multi-region-setup.sql.
+  string region = 8;
+  // "pretest" or "system" — execution-worker dispatches phase-specific
+  // consumers by topic (submissions.pretest vs submissions.system), but the
+  // phase travels on the envelope too for telemetry / log clarity.
+  string phase = 9;
 }
 
 message VerdictEvent {
@@ -24,6 +31,15 @@ message VerdictEvent {
   int32 memory_used_mb = 7;
   int64 gateway_ts_ms = 8;
   int32 points = 9;
+  // The phase this verdict was produced by ("pretest" or "system"). Scoring
+  // and analytics consumers filter or branch on this.
+  string phase = 10;
+  // Region of origin (mirrors submission's region).
+  string region = 11;
+  // Event-time stamp the consumer should treat as authoritative for late-arrival
+  // correction in Flink scoring. Equals gateway_ts_ms in the happy path; an
+  // out-of-order verdict carries the same timestamp it had at the gateway.
+  int64 event_ts_ms = 12;
 }
 
 message AnalyticsEvent {
@@ -36,4 +52,6 @@ message AnalyticsEvent {
   int32 execution_time_ms = 7;
   int32 memory_used_mb = 8;
   int64 event_ts_ms = 9;
+  string region = 10;
+  string phase = 11;
 }

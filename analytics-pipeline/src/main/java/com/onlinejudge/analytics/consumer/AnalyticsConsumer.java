@@ -1,8 +1,7 @@
 package com.onlinejudge.analytics.consumer;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.analytics.service.ClickHouseWriter;
+import com.onlinejudge.common.events.Events.AnalyticsEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -30,7 +29,6 @@ import java.util.Map;
 public class AnalyticsConsumer {
 
     private final ClickHouseWriter clickHouseWriter;
-    private final ObjectMapper objectMapper;
 
     @KafkaListener(
         topics = "${app.kafka.topic.analytics}",
@@ -39,19 +37,18 @@ public class AnalyticsConsumer {
     )
     public void consume(ConsumerRecord<String, byte[]> record, Acknowledgment ack) {
         try {
-            JsonNode event = objectMapper.readTree(record.value());
+            AnalyticsEvent event = AnalyticsEvent.parseFrom(record.value());
 
             Map<String, Object> analyticsRecord = new HashMap<>();
-            analyticsRecord.put("submissionId",   event.get("submissionId").asText());
-            analyticsRecord.put("userId",         event.get("userId").asText());
-            analyticsRecord.put("problemId",      event.get("problemId").asText());
-            analyticsRecord.put("contestId",      event.has("contestId") && !event.get("contestId").isNull()
-                                                  ? event.get("contestId").asText() : "");
-            analyticsRecord.put("language",       event.get("language").asText());
-            analyticsRecord.put("verdict",        event.get("verdict").asText());
-            analyticsRecord.put("executionTimeMs", event.get("executionTimeMs").asInt());
-            analyticsRecord.put("memoryUsedMb",   event.get("memoryUsedMb").asInt());
-            analyticsRecord.put("eventTsMs",      event.get("eventTsMs").asLong());
+            analyticsRecord.put("submissionId",   event.getSubmissionId());
+            analyticsRecord.put("userId",         event.getUserId());
+            analyticsRecord.put("problemId",      event.getProblemId());
+            analyticsRecord.put("contestId",      event.getContestId());
+            analyticsRecord.put("language",       event.getLanguage());
+            analyticsRecord.put("verdict",        event.getVerdict());
+            analyticsRecord.put("executionTimeMs", event.getExecutionTimeMs());
+            analyticsRecord.put("memoryUsedMb",   event.getMemoryUsedMb());
+            analyticsRecord.put("eventTsMs",      event.getEventTsMs());
 
             clickHouseWriter.buffer(analyticsRecord);
             ack.acknowledge();

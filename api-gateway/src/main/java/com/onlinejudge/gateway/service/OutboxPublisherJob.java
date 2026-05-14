@@ -2,11 +2,13 @@ package com.onlinejudge.gateway.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.onlinejudge.common.events.Events.SubmissionEvent;
 import com.onlinejudge.gateway.model.OutboxEvent;
 import com.onlinejudge.gateway.repository.OutboxEventRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -15,22 +17,27 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 
 /**
- * Poll-based Transactional Outbox publisher.
+ * Poll-based Transactional Outbox publisher (development substitute for CDC).
  *
- * Every poll interval, reads a batch of unpublished outbox events,
- * publishes them to Kafka, and marks them as published.
+ * <p>Every poll interval, reads a batch of unpublished outbox events, publishes
+ * them to Kafka, and marks them as published.
  *
- * Production alternative: Debezium CDC reads the DB WAL and publishes
- * events to Kafka with near-zero latency and no polling overhead.
- * The poll approach adds ~1s of latency but requires no additional
- * infrastructure (no Kafka Connect cluster).
+ * <p>Production alternative: a CockroachDB native changefeed (see
+ * {@code database/changefeed-setup.sql}) tails the Raft log and emits the same
+ * outbox rows to Kafka directly — no application code in the hot path.
+ * To switch this local stack to changefeed mode, set
+ * {@code app.outbox.publisher.enabled=false} and run the SQL setup script;
+ * the execution-worker's {@code SubmissionConsumer} auto-detects the
+ * changefeed envelope.
  *
- * Partitioning: we key by userId so all submissions from the same user
- * land on the same Kafka partition and are consumed in order.
+ * <p>Partitioning: we key by {@code userId} so all submissions from the same
+ * user land on the same Kafka partition and are consumed in order. The
+ * changefeed configuration uses the same partition key for the same reason.
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
+@ConditionalOnProperty(name = "app.outbox.publisher.enabled", havingValue = "true", matchIfMissing = true)
 public class OutboxPublisherJob {
 
     private final OutboxEventRepository outboxEventRepository;
@@ -56,14 +63,34 @@ public class OutboxPublisherJob {
                 JsonNode payload = objectMapper.readTree(event.getPayload());
                 String userId = payload.get("userId").asText();
 
+                // Transcode the JSON-shaped outbox payload to a Protobuf
+                // SubmissionEvent so the Kafka wire format is proto (Part 2 of
+                // the blog). The outbox table itself stays JSON so the opt-in
+                // CockroachDB changefeed path (database/changefeed-setup.sql)
+                // also keeps working — changefeed mode bypasses this job and
+                // emits CRDB envelopes (JSON), which SubmissionConsumer's
+                // unwrapEnvelope() still handles.
+                byte[] protoBytes = SubmissionEvent.newBuilder()
+                        .setSubmissionId(payload.get("submissionId").asText(""))
+                        .setUserId(userId)
+                        .setProblemId(payload.path("problemId").asText(""))
+                        .setContestId(payload.path("contestId").asText(""))
+                        .setS3CodeUrl(payload.path("s3CodeUrl").asText(""))
+                        .setLanguage(payload.path("language").asText(""))
+                        .setGatewayTsMs(payload.path("gatewayTsMs").asLong(0))
+                        .setRegion(payload.path("region").asText(""))
+                        .setPhase("pretest")
+                        .build()
+                        .toByteArray();
+
                 // Key by userId for partition ordering guarantee
-                kafkaTemplate.send(pretestTopic, userId, event.getPayload().getBytes());
+                kafkaTemplate.send(pretestTopic, userId, protoBytes);
 
                 event.setPublished(true);
                 outboxEventRepository.save(event);
 
-                log.debug("[outbox] Published submission={} to topic={}",
-                        event.getSubmissionId(), pretestTopic);
+                log.debug("[outbox] Published submission={} to topic={} ({} bytes proto)",
+                        event.getSubmissionId(), pretestTopic, protoBytes.length);
 
             } catch (Exception ex) {
                 log.error("[outbox] Failed to publish event={}: {}", event.getId(), ex.getMessage());

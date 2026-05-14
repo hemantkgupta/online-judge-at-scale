@@ -1,5 +1,6 @@
 package com.onlinejudge.scoring;
 
+import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
 import com.onlinejudge.scoring.function.ScoringFunction;
 import com.onlinejudge.scoring.model.ScoreUpdate;
 import com.onlinejudge.scoring.sink.RedisLeaderboardSink;
@@ -71,15 +72,15 @@ public class ScoringJobApplication {
 
         // Event-time watermark: BoundedOutOfOrderness 5 minutes
         // Keeps scoring window open after contest close to absorb late-arriving verdicts
-        // from VMs that were executing at contest close time.
+        // from VMs that were executing at contest close time. The event timestamp
+        // is `gateway_ts_ms` from the VerdictEvent proto — the API Gateway T0 stamp
+        // that travels through the whole pipeline (Part 2 of the blog).
         WatermarkStrategy<byte[]> watermarkStrategy = WatermarkStrategy
                 .<byte[]>forBoundedOutOfOrderness(Duration.ofMinutes(5))
                 .withTimestampAssigner((eventBytes, recordTimestamp) -> {
-                    // Extract gatewayTsMs from JSON (event-time = API Gateway T0 stamp)
                     try {
-                        com.fasterxml.jackson.databind.JsonNode node =
-                                new com.fasterxml.jackson.databind.ObjectMapper().readTree(eventBytes);
-                        return node.get("gatewayTsMs").asLong();
+                        return com.onlinejudge.common.events.Events.VerdictEvent
+                                .parseFrom(eventBytes).getGatewayTsMs();
                     } catch (Exception e) {
                         return recordTimestamp;
                     }
@@ -88,21 +89,22 @@ public class ScoringJobApplication {
         DataStream<byte[]> verdictStream = env
                 .fromSource(kafkaSource, watermarkStrategy, "evaluated_results");
 
-        // keyBy userId, process with stateful ScoringFunction
+        // keyBy userId — proto-decoded from VerdictEvent — and process with stateful ScoringFunction.
         DataStream<ScoreUpdate> scoreUpdates = verdictStream
                 .keyBy(eventBytes -> {
                     try {
-                        com.fasterxml.jackson.databind.JsonNode node =
-                                new com.fasterxml.jackson.databind.ObjectMapper().readTree(eventBytes);
-                        return node.get("userId").asText();
+                        return com.onlinejudge.common.events.Events.VerdictEvent
+                                .parseFrom(eventBytes).getUserId();
                     } catch (Exception e) {
                         return "unknown";
                     }
                 })
                 .process(new ScoringFunction());
 
-        // Sink: Redis ZSET via atomic Lua script + Pub/Sub notification
-        scoreUpdates.addSink(new RedisLeaderboardSink(redisHost, redisPort))
+        // Sink: Redis ZSET via atomic Lua script + Pub/Sub notification,
+        // routed to score-range shards via the shared ScoreRangeShardRouter.
+        ScoreRangeShardRouter shardRouter = ScoreRangeShardRouter.defaultIcpcRouter();
+        scoreUpdates.addSink(new RedisLeaderboardSink(redisHost, redisPort, shardRouter))
                 .name("redis-leaderboard-sink");
 
         env.execute("Online Judge Scoring Pipeline");
