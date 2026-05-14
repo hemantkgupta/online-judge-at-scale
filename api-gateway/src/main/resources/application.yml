@@ -37,12 +37,34 @@ spring:
       port: 6379
 
 app:
+  # JWT (Part 3 of the blog). HS256 with a pre-shared secret for the demo;
+  # production uses an IdP that signs with RS256 and the gateway only verifies.
+  # The secret MUST be at least 32 bytes for HS256 — anything shorter is
+  # rejected at startup by JwtTokenProvider.
+  jwt:
+    secret: dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256
+    ttl-hours: 8
+    issuer: online-judge
+
+  # Region this gateway pod is pinned to. In production every pod is deployed
+  # into one region and writes carry this value (matched by CockroachDB's
+  # REGIONAL BY ROW locality so the row's replicas live in the same region).
+  # Locally there's only one node — this just stamps the submissions/outbox
+  # rows and propagates into the outbox payload. The `X-Region` request
+  # header overrides this per-request for multi-region simulation tests.
+  region: us-east-1
   kafka:
     topic:
       pretest: submissions.pretest
       system: submissions.system
   rate-limit:
     submissions-per-minute: 10
+    submissions-per-ip-per-minute: 60
   outbox:
+    # The polling outbox publisher is the default substitute for production CDC.
+    # Set this to false (or env APP_OUTBOX_PUBLISHER_ENABLED=false) to use a
+    # CockroachDB native changefeed instead — see database/changefeed-setup.sql.
+    publisher:
+      enabled: true
     poll-interval-ms: 1000
     batch-size: 50

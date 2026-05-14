@@ -35,13 +35,16 @@ public class SubmissionService {
      * the outbox event are durable, or neither is.
      */
     @Transactional
-    public SubmissionResponse accept(SubmissionRequest request) throws Exception {
+    public SubmissionResponse accept(SubmissionRequest request, String userId, String region) throws Exception {
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("userId must not be blank — should come from authenticated principal");
+        }
         long gatewayTsMs = System.currentTimeMillis(); // immutable T0 stamp
 
         // 1. Persist submission
         Submission submission = new Submission();
         submission.setId(UUID.randomUUID());
-        submission.setUserId(UUID.fromString(request.getUserId()));
+        submission.setUserId(UUID.fromString(userId));
         submission.setProblemId(UUID.fromString(request.getProblemId()));
         if (request.getContestId() != null) {
             submission.setContestId(UUID.fromString(request.getContestId()));
@@ -50,26 +53,29 @@ public class SubmissionService {
         submission.setS3CodeUrl(storeCode(submission.getId(), request.getCode()));
         submission.setGatewayTsMs(gatewayTsMs);
         submission.setStatus("PENDING");
+        submission.setRegion(region);
         submissionRepository.save(submission);
 
         // 2. Write outbox event in the same transaction
         Map<String, Object> eventPayload = new HashMap<>();
         eventPayload.put("submissionId", submission.getId().toString());
-        eventPayload.put("userId", request.getUserId());
+        eventPayload.put("userId", userId);
         eventPayload.put("problemId", request.getProblemId());
         eventPayload.put("contestId", request.getContestId());
         eventPayload.put("s3CodeUrl", submission.getS3CodeUrl());
         eventPayload.put("language", request.getLanguage());
         eventPayload.put("gatewayTsMs", gatewayTsMs);
+        eventPayload.put("region", region);
 
         OutboxEvent outboxEvent = new OutboxEvent();
         outboxEvent.setSubmissionId(submission.getId());
         outboxEvent.setEventType("SUBMISSION_RECEIVED");
         outboxEvent.setPayload(objectMapper.writeValueAsString(eventPayload));
+        outboxEvent.setRegion(region);
         outboxEventRepository.save(outboxEvent);
 
-        log.info("[gateway] Accepted submission={} user={} lang={} ts={}",
-                submission.getId(), request.getUserId(), request.getLanguage(), gatewayTsMs);
+        log.info("[gateway] Accepted submission={} user={} lang={} region={} ts={}",
+                submission.getId(), userId, request.getLanguage(), region, gatewayTsMs);
 
         return new SubmissionResponse(
                 submission.getId().toString(),

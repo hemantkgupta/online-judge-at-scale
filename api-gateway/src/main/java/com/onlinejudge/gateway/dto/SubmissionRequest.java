@@ -7,8 +7,10 @@ import lombok.Data;
 @Data
 public class SubmissionRequest {
 
-    @NotBlank
-    private String userId;
+    // No userId field — the authenticated identity is the JWT subject set by
+    // JwtAuthenticationFilter (Part 3 of the blog). The controller passes
+    // that principal to the service explicitly; trusting a userId in the
+    // request body would let any caller claim any account.
 
     @NotBlank
     private String problemId;

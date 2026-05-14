@@ -52,11 +52,14 @@ class SubmissionServiceTest {
     private ArgumentCaptor<OutboxEvent> outboxCaptor;
 
     private SubmissionRequest validRequest;
+    private String authenticatedUserId;
 
     @BeforeEach
     void setUp() {
+        // Simulates the JWT subject the JwtAuthenticationFilter would have
+        // installed into the SecurityContext — passed explicitly to accept().
+        authenticatedUserId = UUID.randomUUID().toString();
         validRequest = new SubmissionRequest();
-        validRequest.setUserId(UUID.randomUUID().toString());
         validRequest.setProblemId(UUID.randomUUID().toString());
         validRequest.setContestId(UUID.randomUUID().toString());
         validRequest.setLanguage("python");
@@ -72,7 +75,7 @@ class SubmissionServiceTest {
                 .thenAnswer(inv -> inv.getArgument(0));
 
         // Act
-        SubmissionResponse response = submissionService.accept(validRequest);
+        SubmissionResponse response = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         // Assert — both saved exactly once (in the same @Transactional method)
         verify(submissionRepository, times(1)).save(submissionCaptor.capture());
@@ -90,7 +93,7 @@ class SubmissionServiceTest {
         when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        SubmissionResponse response = submissionService.accept(validRequest);
+        SubmissionResponse response = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         assertThat(response.getSubmissionId()).isNotNull();
         assertThat(response.getStatus()).isEqualTo("PENDING");
@@ -104,7 +107,7 @@ class SubmissionServiceTest {
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         long beforeMs = System.currentTimeMillis();
-        SubmissionResponse response = submissionService.accept(validRequest);
+        SubmissionResponse response = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
         long afterMs = System.currentTimeMillis();
 
         verify(submissionRepository).save(submissionCaptor.capture());
@@ -121,12 +124,12 @@ class SubmissionServiceTest {
         when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        submissionService.accept(validRequest);
+        submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         verify(submissionRepository).save(submissionCaptor.capture());
         Submission saved = submissionCaptor.getValue();
 
-        assertThat(saved.getUserId()).isEqualTo(UUID.fromString(validRequest.getUserId()));
+        assertThat(saved.getUserId()).isEqualTo(UUID.fromString(authenticatedUserId));
         assertThat(saved.getProblemId()).isEqualTo(UUID.fromString(validRequest.getProblemId()));
         assertThat(saved.getContestId()).isEqualTo(UUID.fromString(validRequest.getContestId()));
         assertThat(saved.getLanguage()).isEqualTo("python");
@@ -140,7 +143,7 @@ class SubmissionServiceTest {
         when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        submissionService.accept(validRequest);
+        submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         verify(outboxEventRepository).save(outboxCaptor.capture());
         OutboxEvent outbox = outboxCaptor.getValue();
@@ -150,7 +153,7 @@ class SubmissionServiceTest {
 
         // Parse the JSON payload and verify fields
         JsonNode payload = objectMapper.readTree(outbox.getPayload());
-        assertThat(payload.get("userId").asText()).isEqualTo(validRequest.getUserId());
+        assertThat(payload.get("userId").asText()).isEqualTo(authenticatedUserId);
         assertThat(payload.get("problemId").asText()).isEqualTo(validRequest.getProblemId());
         assertThat(payload.get("contestId").asText()).isEqualTo(validRequest.getContestId());
         assertThat(payload.get("language").asText()).isEqualTo("python");
@@ -165,7 +168,7 @@ class SubmissionServiceTest {
         when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        SubmissionResponse response = submissionService.accept(validRequest);
+        SubmissionResponse response = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         verify(submissionRepository).save(submissionCaptor.capture());
         Submission saved = submissionCaptor.getValue();
@@ -179,9 +182,41 @@ class SubmissionServiceTest {
         when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        SubmissionResponse response1 = submissionService.accept(validRequest);
-        SubmissionResponse response2 = submissionService.accept(validRequest);
+        SubmissionResponse response1 = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
+        SubmissionResponse response2 = submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
 
         assertThat(response1.getSubmissionId()).isNotEqualTo(response2.getSubmissionId());
+    }
+
+    @Test
+    void accept_stampsRegionOnSubmissionAndOutbox() throws Exception {
+        when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        submissionService.accept(validRequest, authenticatedUserId, "eu-west-1");
+
+        verify(submissionRepository).save(submissionCaptor.capture());
+        verify(outboxEventRepository).save(outboxCaptor.capture());
+
+        // Submission row carries the region — REGIONAL BY ROW key in prod.
+        assertThat(submissionCaptor.getValue().getRegion()).isEqualTo("eu-west-1");
+        // Outbox row carries the same region so a regional changefeed reads
+        // its own region's events without scanning others.
+        assertThat(outboxCaptor.getValue().getRegion()).isEqualTo("eu-west-1");
+    }
+
+    @Test
+    void accept_propagatesRegionIntoOutboxPayload() throws Exception {
+        when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        submissionService.accept(validRequest, authenticatedUserId, "ap-south-1");
+
+        verify(outboxEventRepository).save(outboxCaptor.capture());
+        JsonNode payload = objectMapper.readTree(outboxCaptor.getValue().getPayload());
+
+        // Downstream consumers (analytics, scoring) read region off the
+        // payload — must match the column.
+        assertThat(payload.get("region").asText()).isEqualTo("ap-south-1");
     }
 }
