@@ -1,5 +1,7 @@
 # Online Judge at Scale — Parity Plan
 
+> **Status (2026-05-12): Largely executed.** Tasks 1–6 below are done. The doc is kept as the historical plan that drove the work. For the current state of the codebase see [`code-companion.md`](./code-companion.md); for current gaps see the **Gaps** section there and the **Gaps vs Production** table at the bottom of the blog. Remaining open items: per-phase code-maps in `implementation-plan.md` (Task 4 — partial), ADR (Task 1 — not yet written).
+
 Bring the Online Judge project to the same quality bar as the distributed-key-value-store project.
 
 ## Gold Standard (what KV store has)

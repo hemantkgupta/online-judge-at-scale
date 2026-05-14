@@ -91,7 +91,7 @@ All components run via a single `docker-compose up` plus gradle `bootRun` per se
 - `api-gateway/src/main/java/.../model/Submission.java` — JPA entity for `submissions` table: id, userId, problemId, contestId, language, s3CodeUrl, status, gatewayTsMs
 - `api-gateway/src/main/java/.../model/OutboxEvent.java` — JPA entity for `outbox_events` table: id, submissionId, eventType, payload (JSON), published flag
 - `api-gateway/src/main/java/.../service/OutboxPublisherJob.java` — `@Scheduled` poll-based CDC: reads unpublished rows, publishes to Kafka keyed by userId, marks published
-- `api-gateway/src/main/java/.../service/RateLimitService.java` — Redis sliding window rate limiter: `INCR` on minute-bucket key, 60s TTL, 10 req/min default
+- `api-gateway/src/main/java/.../service/RateLimitService.java` — Atomic Lua dual-bucket rate limiter: `INCR` + conditional `EXPIRE` over both `rate_limit:user:{userId}:{m}` AND `rate_limit:ip:{sourceIp}:{m}`. Returns `OK` / `USER_LIMIT` / `IP_LIMIT`. Defaults: 10/min/user, 60/min/IP, 70s TTL.
 - `api-gateway/src/main/java/.../dto/SubmissionRequest.java` — Request DTO: `@NotBlank` userId, problemId, language, code (`@Size(max=65536)`)
 - `api-gateway/src/main/java/.../dto/SubmissionResponse.java` — Response DTO: submissionId, status, gatewayTsMs, message
 - `api-gateway/src/main/java/.../repository/OutboxEventRepository.java` — JPA repo with `findUnpublished(limit)` query
@@ -104,8 +104,8 @@ All components run via a single `docker-compose up` plus gradle `bootRun` per se
 
 ### Phase 2 Code Map — Execution Worker (Kafka Consumer + Docker Execution)
 
-- `execution-worker/src/main/java/.../consumer/SubmissionConsumer.java` — `@KafkaListener` on `submissions.pretest`: idempotency check → Docker execution → verdict publish to `evaluated_results` + `analytics_events`. Manual `Acknowledgment.acknowledge()` after verdict.
-- `execution-worker/src/main/java/.../service/IdempotencyService.java` — `INSERT ... ON CONFLICT DO NOTHING` on `idempotency_keys` table. `claimSubmission()` returns false on duplicate. `markCompleted()` updates status to 'completed'.
+- `execution-worker/src/main/java/.../consumer/SubmissionConsumer.java` — Two `@KafkaListener` methods sharing one `processSubmission` helper: `consumePretest` on `submissions.pretest` (concurrency 4) and `consumeSystem` on `submissions.system` (concurrency 2). Idempotency is scoped per phase. Verdicts are tagged with a `phase` field. On `ACCEPTED` in Phase 1, the original submission event is republished to `submissions.system` to trigger Phase 2. Manual `Acknowledgment.acknowledge()` after verdict publish.
+- `execution-worker/src/main/java/.../service/IdempotencyService.java` — `INSERT ... ON CONFLICT DO NOTHING` on `idempotency_keys` with a composite key (`submissionId:phase`). `claimSubmission(submissionId, phase)` returns false on duplicate; `markCompleted(submissionId, phase)` updates status to 'completed'. The same submission can legitimately run twice — once per phase.
 - `execution-worker/src/main/java/.../service/DockerExecutionService.java` — Runs code in Docker: `--rm --network none --memory {limit}m --cpus 0.5 --pids-limit 64 --read-only --tmpfs /tmp:size=64m`. Returns `ExecutionResult(status, output, executionTimeMs, memoryUsedMb)`. Language configs for python, java, cpp.
 - `execution-worker/src/main/java/.../model/IdempotencyKey.java` — JPA entity: key (PK), submissionId, status, createdAt
 - `execution-worker/src/main/resources/application.yml` — Kafka consumer config, execution timeout/memory settings

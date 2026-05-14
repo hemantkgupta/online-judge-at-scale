@@ -31,11 +31,18 @@ spring:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
       acks: all
+    listener:
+      # SubmissionConsumer takes an Acknowledgment parameter and calls
+      # ack.acknowledge() only AFTER the verdict has been published. That
+      # requires MANUAL_IMMEDIATE ack mode — Spring Kafka's default (BATCH)
+      # would silently auto-commit and refuse to inject the Acknowledgment.
+      ack-mode: MANUAL_IMMEDIATE
 
 app:
   kafka:
     topic:
       pretest: submissions.pretest
+      system: submissions.system
       evaluated-results: evaluated_results
       analytics: analytics_events
   execution:
@@ -43,3 +50,35 @@ app:
     memory-limit-mb: 256
     # Production: Firecracker MicroVM. Local: Docker container with resource limits.
     mode: docker
+
+  # Sandbox runtime + Linux-only hardening (Part 7 of the blog).
+  #
+  #   backend=docker        Cross-platform default. Docker container + cgroup
+  #                         resource limits. macOS / Linux.
+  #   backend=firecracker   Per-submission Firecracker microVM via REST API.
+  #                         Linux ONLY (requires /dev/kvm). Operator notes in
+  #                         infra/firecracker/README.md.
+  #
+  # `linux-hardening.enabled=true` flips Seccomp-BPF + capability drop +
+  # `no-new-privileges` + private cgroup namespace on the Docker backend.
+  # These flags are skipped on non-Linux hosts at runtime, so the setting is
+  # safe to ship across the fleet.
+  sandbox:
+    backend: docker
+    linux-hardening:
+      enabled: false
+    seccomp-profile: /etc/seccomp/sandbox-seccomp.json
+    firecracker:
+      binary: /usr/local/bin/firecracker
+      kernel-image: /var/lib/firecracker/vmlinux
+      rootfs-image: /var/lib/firecracker/rootfs.ext4
+      vcpus: 1
+      # Where per-submission API sockets are created. /tmp works for any
+      # local user; production deployments using jailer override this to
+      # the jailer's chrooted runtime directory.
+      api-sock-dir: /tmp
+      # Kernel command-line. Default boots whatever init the rootfs provides
+      # (works with the Firecracker CI Ubuntu rootfs). Production deployments
+      # with a custom /init harness rootfs typically override:
+      #   boot-args: "console=ttyS0 reboot=k panic=1 pci=off init=/init"
+      boot-args: "console=ttyS0 reboot=k panic=1 pci=off"

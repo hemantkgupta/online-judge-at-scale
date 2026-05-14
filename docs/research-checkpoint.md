@@ -75,7 +75,7 @@ Phase 1 (pretests): 5-10 curated test cases, consumed from `submissions.pretest`
 
 Phase 2 (system tests): Hundreds of adversarial test cases, consumed from `submissions.system` topic, deferred until after contest close. The two-topic separation gives clean priority isolation — during the surge, all capacity goes to Phase 1.
 
-**Implementation:** Kafka topics `submissions.pretest` and `submissions.system` are defined in `KafkaConfig.java`. Currently only Phase 1 is consumed by `SubmissionConsumer`.
+**Implementation:** Kafka topics `submissions.pretest` and `submissions.system` are defined in `KafkaConfig.java`. `SubmissionConsumer` now consumes both via separate `@KafkaListener` methods (`consumePretest`, `consumeSystem`) with phase-scoped idempotency keys. On `ACCEPTED` pretest the original submission event is forwarded to `submissions.system` to trigger Phase 2.
 
 ### Event-Time Scoring
 
@@ -106,7 +106,7 @@ At 1M users, a single Redis ZSET becomes a hot shard. Score-range partitioning d
 
 Global rank = `ZCARD(higher shards) + ZREVRANK(user's shard, userId)`.
 
-**Local substitute:** Single Redis node, single ZSET per contest. Documented gap.
+**Local implementation:** The shared `ScoreRangeShardRouter` (in `common/`) is wired into both `RedisLeaderboardSink` (writes are routed to the correct `leaderboard:{contestId}:shard:{N}` key; a boundary-crossing user is `ZREM`'d from non-target shards inside the same Lua call) and `LeaderboardService` (reads walk shards highest-score-first; global rank sums `ZCARD` of higher shards + local `ZREVRANK`). The shard topology is the same as production; the substitution is that all three keys land on the same Redis node instead of three.
 
 ### Firecracker Warm Pools
 
