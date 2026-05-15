@@ -87,6 +87,16 @@ fi
 [ -d "$AGENT_SRC_DIR" ] || { echo "[build-rootfs] missing agent source dir $AGENT_SRC_DIR" >&2; exit 1; }
 
 AGENT_BUILD_DIR="$(mktemp -d /tmp/oj-agent-build.XXXXXX)"
+# Go needs a writable home for its module cache + build cache. When
+# build-rootfs.sh runs from the GCE startup-script systemd service, $HOME
+# is empty / unset, so Go errors out with "module cache not found".
+# Pin GOPATH + GOCACHE explicitly under /tmp so the build always has a
+# writable workspace and dependencies (mdlayher/vsock + transitives)
+# can be downloaded into it.
+export GOPATH="$AGENT_BUILD_DIR/gopath"
+export GOCACHE="$AGENT_BUILD_DIR/gocache"
+mkdir -p "$GOPATH" "$GOCACHE"
+
 echo "[build-rootfs] building Go execution agent into $AGENT_BUILD_DIR"
 (
     cd "$AGENT_SRC_DIR"
