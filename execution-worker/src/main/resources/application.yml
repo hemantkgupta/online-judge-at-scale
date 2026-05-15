@@ -68,17 +68,41 @@ app:
     linux-hardening:
       enabled: false
     seccomp-profile: /etc/seccomp/sandbox-seccomp.json
-    firecracker:
-      binary: /usr/local/bin/firecracker
-      kernel-image: /var/lib/firecracker/vmlinux
-      rootfs-image: /var/lib/firecracker/rootfs.ext4
-      vcpus: 1
-      # Where per-submission API sockets are created. /tmp works for any
-      # local user; production deployments using jailer override this to
-      # the jailer's chrooted runtime directory.
-      api-sock-dir: /tmp
-      # Kernel command-line. Default boots whatever init the rootfs provides
-      # (works with the Firecracker CI Ubuntu rootfs). Production deployments
-      # with a custom /init harness rootfs typically override:
-      #   boot-args: "console=ttyS0 reboot=k panic=1 pci=off init=/init"
-      boot-args: "console=ttyS0 reboot=k panic=1 pci=off"
+    # OCI runtime Docker hands the container to. `runc` is the default Linux
+    # runtime that ships with every Docker install. `runsc` is gVisor — must
+    # be installed on the host AND registered in /etc/docker/daemon.json
+    # (`runtimes: { runsc: { path: /usr/local/bin/runsc } }`). When set to a
+    # non-runc value the worker adds `--runtime=<name>` to `docker run`. On
+    # macOS dev machines leave this at the default — Docker for Mac ships
+    # only runc.
+    docker:
+      runtime: runc
+    # Where the Sandbox Manager service lives. Per Part 7 of the blog, the
+    # SM is a separate privileged daemon (one per host) that owns KVM, the
+    # Firecracker REST sockets, and vsock to the in-guest agent. The worker
+    # NEVER touches /dev/kvm or the firecracker binary directly anymore.
+    # Default matches the docker-compose service name on the compute VM.
+    manager-url: http://oj-sandbox-manager:9100
+
+  # The worker shells out to the same tiny Go bridge binary the SM uses
+  # (oj-vsock-client) to dial the in-guest Execution Agent over Firecracker's
+  # vsock. Workstream E moved this call out of the SM's data plane: the
+  # worker now talks directly to the agent using the vsockUdsPath + port
+  # the lease response carries. The binary is baked into the worker image
+  # by stage 2 of execution-worker/Dockerfile.
+  agent:
+    vsock-client: /usr/local/bin/oj-vsock-client
+
+  # Workstream B — GCS access for contestant source + test-case bytes.
+  # `source-bucket` is used as the default bucket for bare-key fetches
+  # (the API gateway writes gs://<bucket>/submissions/yyyy/MM/dd/<id>.txt).
+  # Credentials resolve via workload identity in GKE, or
+  # GOOGLE_APPLICATION_CREDENTIALS / gcloud creds in dev.
+  gcs:
+    source-bucket: ${GCS_SOURCE_BUCKET:oj-source-dev}
+    project-id:    ${GCS_PROJECT_ID:online-judge-hk}
+
+  # Workstream B — Problem Service base URL. Endpoint:
+  # GET /api/v1/problems/{id}/test-cases?pretestOnly=<bool>
+  problem-service:
+    url: ${PROBLEM_SERVICE_URL:http://oj-control-plane:8089}

@@ -1,64 +1,94 @@
 # =============================================================================
-# Compute VM compose stack.
+# Compute VM compose stack — Part 7's three trust zones split into two
+# containers (the third is inside the microVM):
 #
-# Runs on the oj-compute VM (n2-standard-2 SPOT, nested-virt enabled). Hosts
-# exactly one service — the execution-worker — but the container needs
-# enough access to spawn sibling sandbox processes on the host:
+#   * oj-sandbox-manager  Per-host privileged daemon. Owns /dev/kvm,
+#                         /var/run/docker.sock, the Firecracker binary
+#                         + rootfs + kernel, and the vsock UDS files
+#                         that talk to in-guest agents. Exposes the
+#                         lease/exec/release HTTP API on :9100 (intra-VM).
 #
-#   * `/var/run/docker.sock` mount  → DockerExecutionService can call
-#                                     `docker run` to start contestant
-#                                     containers (Docker backend / gVisor
-#                                     when `--runtime=runsc` is set).
-#   * `/dev/kvm` device             → FirecrackerExecutionService can open it.
-#   * `/usr/local/bin/firecracker`  → mounted read-only so the worker can
-#                                     exec the host's firecracker binary.
-#   * `/var/lib/firecracker/`       → vmlinux + rootfs the host provisions
-#                                     during the Stage 4 startup script.
-#   * `/tmp`                        → per-submission FC API sockets land
-#                                     here (matches app.sandbox.firecracker
-#                                     .api-sock-dir default).
+#   * oj-execution-worker Unprivileged-ish. Kafka consumer + verdict
+#                         publisher. Calls oj-sandbox-manager over HTTP
+#                         for everything sandbox-shaped. Loses /dev/kvm
+#                         and the Firecracker mounts entirely.
 #
-# All three backends — docker / firecracker / gvisor — are reachable just
-# by setting APP_SANDBOX_BACKEND + APP_SANDBOX_DOCKER_RUNTIME in the
-# environment. No image rebuild required.
+# Both containers share /tmp via volume mount so per-lease vsock UDS
+# files created by the SM are visible to anyone who *might* want to
+# bypass it — today nobody does, but the layout matches the blog's
+# direct Service↔Agent vsock pattern if we ever drop the HTTP hop.
 #
-# Environment file (set by compute.sh):
-#   AR_URL                       Artifact Registry repo URL
-#   CONTROL_PLANE_IP             internal IP of oj-control-plane (10.0.0.2)
-#   APP_SANDBOX_BACKEND          docker | firecracker  (default docker)
-#   APP_SANDBOX_DOCKER_RUNTIME   runc | runsc          (default runc; runsc = gVisor)
-#   APP_SANDBOX_LINUX_HARDENING_ENABLED  true | false  (Seccomp-BPF + caps + cgroupns)
+# Environment (set by compute.sh from /opt/oj/.env):
+#   AR_URL, CONTROL_PLANE_IP, REGION,
+#   APP_SANDBOX_BACKEND, APP_SANDBOX_DOCKER_RUNTIME,
+#   APP_SANDBOX_LINUX_HARDENING_ENABLED
 # =============================================================================
 
 services:
-  execution-worker:
-    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
-    container_name: oj-execution-worker
+
+  oj-sandbox-manager:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/sandbox-manager:latest
+    container_name: oj-sandbox-manager
     restart: unless-stopped
-    privileged: true             # required for /dev/kvm + nested cgroups
+    privileged: true                         # KVM, ptrace, kill
     devices:
       - /dev/kvm:/dev/kvm
     volumes:
-      # sibling-container access — the worker spawns Docker children on the host
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Firecracker binary + artifacts (provisioned by compute.sh startup)
+      # Firecracker binary + the harness rootfs + guest kernel live on the
+      # host and are bind-mounted in. compute.sh provisions them on first
+      # boot via build-rootfs.sh.
       - /usr/local/bin/firecracker:/usr/local/bin/firecracker:ro
       - /var/lib/firecracker:/var/lib/firecracker:ro
-      # per-submission FC API sockets
+      # Per-lease Firecracker API sockets + vsock UDS files land in /tmp.
       - /tmp:/tmp
-      # Seccomp-BPF profile for the Linux-hardening Docker backend
-      - /etc/seccomp:/etc/seccomp:ro
     environment:
-      # Kafka + DB live on the control-plane VM in the same VPC.
+      APP_FIRECRACKER_BINARY:        /usr/local/bin/firecracker
+      APP_FIRECRACKER_KERNEL_IMAGE:  /var/lib/firecracker/vmlinux
+      APP_FIRECRACKER_ROOTFS_IMAGE:  /var/lib/firecracker/rootfs.ext4
+      APP_FIRECRACKER_API_SOCK_DIR:  /tmp
+      APP_FIRECRACKER_VSOCK_UDS_DIR: /tmp
+      APP_AGENT_VSOCK_CLIENT:        /usr/local/bin/oj-vsock-client
+      APP_REGION:                    ${REGION:-asia-south1}
+      # ── OpenTelemetry (Workstream H) ─────────────────────────────
+      # Empty OTEL_ENDPOINT → agent auto-instrumentation still runs but
+      # has no collector to export to (no-op). Set OTEL_ENDPOINT in
+      # /opt/oj/.env to a reachable OTLP/gRPC endpoint (e.g. a SigNoz
+      # collector on the control-plane VM, or Cloud Trace via the OTel
+      # GCP exporter sidecar) to enable export. We do NOT spin up a
+      # collector on the compute VM here — that's a fleet decision.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
+      OTEL_SERVICE_NAME: oj-sandbox-manager
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
+
+  oj-execution-worker:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
+    container_name: oj-execution-worker
+    restart: unless-stopped
+    # The Docker backend (for macOS dev parity) still wants the host Docker
+    # socket so DockerExecutionService can `docker run` sibling containers.
+    # The Firecracker mounts are GONE — those are now the SM's responsibility.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp                              # shared with SM (mainly for FC's UDS files)
+      - /etc/seccomp:/etc/seccomp:ro
+    depends_on:
+      - oj-sandbox-manager
+    environment:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: ${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:9092
       SPRING_DATASOURCE_URL: jdbc:postgresql://${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:26257/defaultdb?sslmode=disable
       SPRING_DATASOURCE_USERNAME: root
-      # Backend selection. Default to docker; flip to firecracker by editing
-      # /opt/oj/.env and `docker compose up -d` again.
-      APP_SANDBOX_BACKEND:                   ${APP_SANDBOX_BACKEND:-docker}
+      APP_SANDBOX_BACKEND:                   ${APP_SANDBOX_BACKEND:-firecracker}
       APP_SANDBOX_DOCKER_RUNTIME:            ${APP_SANDBOX_DOCKER_RUNTIME:-runc}
       APP_SANDBOX_LINUX_HARDENING_ENABLED:   ${APP_SANDBOX_LINUX_HARDENING_ENABLED:-false}
-      APP_SANDBOX_FIRECRACKER_API_SOCK_DIR:  /tmp
-      APP_SANDBOX_FIRECRACKER_KERNEL_IMAGE:  /var/lib/firecracker/vmlinux
-      APP_SANDBOX_FIRECRACKER_ROOTFS_IMAGE:  /var/lib/firecracker/rootfs.ext4
+      # New: where to reach the sandbox-manager. Service-to-service inside
+      # the same compose network; no auth on the lease API yet (single-host
+      # trust boundary).
+      APP_SANDBOX_MANAGER_URL:               http://oj-sandbox-manager:9100
       APP_REGION:                            ${REGION:-asia-south1}
+      # ── OpenTelemetry (Workstream H) ─────────────────────────────
+      # See note on oj-sandbox-manager above. Same OTEL_ENDPOINT,
+      # different service name so traces/metrics segregate cleanly in
+      # the backend.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
+      OTEL_SERVICE_NAME: oj-execution-worker
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}

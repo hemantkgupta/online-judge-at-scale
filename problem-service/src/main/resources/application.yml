@@ -1,20 +1,49 @@
 server:
-  port: 8086
+  port: 8089
 
 spring:
+  application:
+    name: problem-service
   threads:
     virtual:
       enabled: true
 
   datasource:
-    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
-    username: root
-    password:
+    # CockroachDB on the oj-control-plane VM speaks the Postgres wire protocol.
+    # Override via env vars in production (DB_URL / DB_USER / DB_PASSWORD).
+    url: ${DB_URL:jdbc:postgresql://localhost:26257/onlinejudge?sslmode=disable}
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:}
     driver-class-name: org.postgresql.Driver
 
   jpa:
     hibernate:
-      ddl-auto: update
+      # Schema lives in database/init.sql (single source of truth across
+      # services). Hibernate must not auto-mutate it.
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+# --- GCS configuration --------------------------------------------------------
+# The Storage client picks up application-default credentials from the VM's
+# attached service account in production. Local dev falls back to NoCredentials.
+#
+# The signer needs an explicit private key on disk because URL signing happens
+# locally (no API call) and ADC on a GCE VM doesn't expose the private key.
+# Mount the JSON key file from Secret Manager and point GCS_SIGNER_KEY_PATH at
+# it (e.g. /var/secrets/gcs-signer.json).
+gcs:
+  project-id: ${GCS_PROJECT_ID:online-judge-hk}
+  bucket: ${GCS_BUCKET:oj-test-cases}
+  signer-credentials-path: ${GCS_SIGNER_KEY_PATH:}

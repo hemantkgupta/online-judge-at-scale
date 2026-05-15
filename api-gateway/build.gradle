@@ -15,6 +15,11 @@ dependencies {
     implementation 'org.postgresql:postgresql'
     implementation 'org.flywaydb:flyway-core'
 
+    // Google Cloud Storage client — used by GcsWriter to durably persist
+    // submission source bytes BEFORE the outbox/Kafka event references them
+    // (Part 6 of the blog: write-to-object-store-first invariant).
+    implementation 'com.google.cloud:google-cloud-storage:2.40.1'
+
     // JWT signing/verifying — JJWT (Apache 2.0), no vendor lock-in.
     implementation 'io.jsonwebtoken:jjwt-api:0.12.5'
     runtimeOnly    'io.jsonwebtoken:jjwt-impl:0.12.5'

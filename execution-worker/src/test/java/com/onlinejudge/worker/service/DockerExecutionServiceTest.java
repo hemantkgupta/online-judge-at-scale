@@ -1,8 +1,11 @@
 package com.onlinejudge.worker.service;
 
+import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -63,11 +66,18 @@ class DockerExecutionServiceTest {
     }
 
     @Test
-    void execute_handlesNullInput() {
+    void execute_handlesNullTestCases() {
         // This will attempt Docker execution which may fail without Docker,
-        // but should not throw NullPointerException on null input
+        // but should not throw NPE on null test-case list.
         var result = executionService.execute("test-id", "python", "print(1)", null);
-        // The result will be either OK (if Docker is available) or INTERNAL_ERROR
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isIn("OK", "INTERNAL_ERROR", "RUNTIME_ERROR", "TIME_LIMIT_EXCEEDED");
+    }
+
+    @Test
+    void execute_handlesEmptyTestCases() {
+        var result = executionService.execute("test-id", "python", "print(1)",
+                List.<TestCaseSpec>of());
         assertThat(result).isNotNull();
         assertThat(result.status()).isIn("OK", "INTERNAL_ERROR", "RUNTIME_ERROR", "TIME_LIMIT_EXCEEDED");
     }
@@ -151,5 +161,48 @@ class DockerExecutionServiceTest {
         assertThat(cmd).containsSubsequence("gcc:13", "sh", "-c",
                 "g++ -O2 -pipe -o /tmp/a.out /code/solution.cpp && /tmp/a.out");
         assertThat(cmd).doesNotContain("/code/a.out");
+    }
+
+    @Test
+    void buildDockerCommand_omitsRuntimeFlagForRunc() {
+        // Default runtime — Docker for Mac and stock Linux Docker only have
+        // runc, so `--runtime` must not appear or `docker run` errors out.
+        ReflectionTestUtils.setField(executionService, "dockerRuntime", "runc");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).doesNotContain("--runtime");
+    }
+
+    @Test
+    void buildDockerCommand_injectsRuntimeFlagForRunsc() {
+        // gVisor variant — must surface as `--runtime runsc` in the argv.
+        ReflectionTestUtils.setField(executionService, "dockerRuntime", "runsc");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).containsSubsequence("--runtime", "runsc");
+    }
+
+    @Test
+    void buildDockerCommand_omitsRuntimeFlagForBlankConfig() {
+        // Empty / null runtime is treated as default — defensive: nobody
+        // wants `docker run --runtime ""` if the env var is missing.
+        ReflectionTestUtils.setField(executionService, "dockerRuntime", "");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).doesNotContain("--runtime");
+    }
+
+    @Test
+    void buildDockerCommand_runtimeFlagIsCaseInsensitiveForRunc() {
+        // Tolerate `RunC` / `RUNC` typos in YAML / env var values — Docker
+        // itself is case-sensitive but the operator intent is unambiguous.
+        ReflectionTestUtils.setField(executionService, "dockerRuntime", "RUNC");
+
+        var cmd = executionService.buildDockerCommand("python:3.12-slim", "python", "/tmp/x");
+
+        assertThat(cmd).doesNotContain("--runtime");
     }
 }

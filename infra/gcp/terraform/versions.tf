@@ -15,6 +15,13 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 6.0"
     }
+    # Stage 4 generates the api-gateway JWT secret in-state so it survives
+    # tofu destroy + apply cycles. No CSPRNG roundtrip to a KMS needed for
+    # a dev-grade setup.
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
+    }
   }
 }
 

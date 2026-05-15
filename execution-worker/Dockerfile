@@ -42,19 +42,57 @@ COPY execution-worker/src execution-worker/src/
 RUN gradle :execution-worker:bootJar --no-daemon -x test
 
 
-# ---- Stage 2: runtime ------------------------------------------------------
+# ---- Stage 2: build the host-side vsock-client ----------------------------
+# Per Workstream E of the production rollout: the worker now dials the
+# in-guest Execution Agent directly over Firecracker's vsock so the
+# Sandbox Manager stays out of the data plane carrying contestant code.
+# The JVM has no native AF_VSOCK; the same tiny Go bridge binary the SM
+# uses (oj-vsock-client) is baked into this image so the worker can
+# ProcessBuilder it and pipe JSON over its stdio.
+FROM golang:1.22 AS go-builder
+
+WORKDIR /agent
+COPY infra/firecracker/agent/go.mod infra/firecracker/agent/go.sum ./
+RUN go mod download
+COPY infra/firecracker/agent/cmd ./cmd
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /out/oj-vsock-client ./cmd/vsock-client
+
+
+# ---- Stage 3: runtime ------------------------------------------------------
 FROM eclipse-temurin:17-jre-jammy
 
-# docker.io ships the CLI (no daemon). curl + ca-certificates for HTTPS and
-# the Firecracker REST socket dance.
+# docker.io ships the CLI for the local Docker backend (sibling-container
+# spawning on the host). curl + ca-certificates for the actuator/probe and
+# any outbound HTTPS. NOTE: Firecracker / mke2fs / debugfs are GONE from
+# this image — the privileged sandbox lifecycle moved out into the
+# sandbox-manager container per Part 7's trust-zone split.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         docker.io curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# OpenTelemetry Java agent (Workstream H). The agent auto-instruments
+# Spring Boot / Kafka / JDBC / HTTP client on JVM startup and exports
+# OTLP/gRPC to whatever OTEL_EXPORTER_OTLP_ENDPOINT is set to at runtime.
+# When that env var is unset the agent still loads but exports nowhere —
+# i.e. a fully no-op deployment if no collector is provisioned.
+#
+# OTEL_SERVICE_NAME + OTEL_RESOURCE_ATTRIBUTES are set per-service via
+# compose (see infra/gcp/compose/compute-compose.yml).
+RUN curl -fsSL -o /opt/opentelemetry-javaagent.jar \
+    https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.10.0/opentelemetry-javaagent.jar
+
+ENV JAVA_TOOL_OPTIONS="-javaagent:/opt/opentelemetry-javaagent.jar"
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+# We don't ship logs via OTel yet (logs go to stdout → docker logs).
+ENV OTEL_LOGS_EXPORTER=none
+
 WORKDIR /app
 
-COPY --from=builder /build/execution-worker/build/libs/execution-worker-*.jar /app/app.jar
+COPY --from=builder    /build/execution-worker/build/libs/execution-worker-*.jar /app/app.jar
+COPY --from=go-builder /out/oj-vsock-client                                      /usr/local/bin/oj-vsock-client
 
 ENV JAVA_OPTS="-XX:MaxRAMPercentage=60 -XX:InitialRAMPercentage=30 -XX:+ExitOnOutOfMemoryError"
 

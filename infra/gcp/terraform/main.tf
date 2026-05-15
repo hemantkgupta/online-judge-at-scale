@@ -131,15 +131,34 @@ resource "google_project_iam_member" "compute_log_writer" {
 
 locals {
   ssh_key_entry = "${var.ssh_user}:${file(pathexpand(var.ssh_public_key_path))}"
+
+  # Full AR repo URL — passed into startup scripts so docker-compose can pull
+  # `${AR_URL}/api-gateway:latest` without hard-coding the project ID.
+  ar_url = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo_name}"
+}
+
+# ---------- JWT secret for api-gateway --------------------------------------
+# Generated once and held in terraform state. `tofu destroy` + `tofu apply`
+# will mint a fresh one — that's fine for a dev-grade setup; production
+# would route this through Secret Manager.
+resource "random_password" "jwt_secret" {
+  length      = 48
+  special     = false # keep it shell-safe; the .env file is sourced as-is
+  min_lower   = 8
+  min_upper   = 8
+  min_numeric = 8
 }
 
 # ---------- Control-plane VM ------------------------------------------------
 
 resource "google_compute_instance" "control_plane" {
-  name           = "oj-control-plane"
-  machine_type   = var.control_plane_machine_type
-  zone           = var.zone
-  desired_status = "TERMINATED" # provisioned in stopped state — `up.sh` starts it
+  name         = "oj-control-plane"
+  machine_type = var.control_plane_machine_type
+  zone         = var.zone
+  # NOTE: desired_status intentionally omitted. Power state is driven by the
+  # operator (gcloud compute instances start/stop) and the auto-shutdown
+  # scheduler — not by terraform. Otherwise `tofu apply` after a startup
+  # would silently re-stop the VM you just brought up to test.
 
   boot_disk {
     initialize_params {
@@ -160,30 +179,35 @@ resource "google_compute_instance" "control_plane" {
   }
 
   metadata = {
-    ssh-keys           = local.ssh_key_entry
-    enable-oslogin     = "FALSE" # we use injected SSH keys for parity with the Pi setup
-    block-project-ssh-keys = "TRUE" # only the key we put here is accepted
+    ssh-keys               = local.ssh_key_entry
+    enable-oslogin         = "FALSE" # we use injected SSH keys for parity with the Pi setup
+    block-project-ssh-keys = "TRUE"  # only the key we put here is accepted
+
+    # Stage 4: bring up Kafka/CRDB/Redis/api-gateway via docker-compose on
+    # every boot. Compose YAML + init.sql are base64-injected so we don't
+    # need a GCS bucket for them.
+    startup-script = templatefile("${path.module}/../startup/control-plane.sh.tpl", {
+      ar_url           = local.ar_url
+      region           = var.region
+      jwt_secret       = random_password.jwt_secret.result
+      compose_yaml_b64 = base64encode(file("${path.module}/../compose/control-plane-compose.yml"))
+      init_sql_b64     = base64encode(file("${path.module}/../../../database/init.sql"))
+    })
   }
 
   tags = ["oj-vm", "oj-control-plane"]
 
   allow_stopping_for_update = true
-
-  # Stage 4 will set metadata.startup-script. Until then the VM boots blank.
-  lifecycle {
-    ignore_changes = [
-      metadata["startup-script"],
-    ]
-  }
 }
 
 # ---------- Compute VM (nested-virt + spot) ---------------------------------
 
 resource "google_compute_instance" "compute" {
-  name           = "oj-compute"
-  machine_type   = var.compute_machine_type
-  zone           = var.zone
-  desired_status = "TERMINATED"
+  name         = "oj-compute"
+  machine_type = var.compute_machine_type
+  zone         = var.zone
+  # See note on the control_plane resource — power state is operator-driven,
+  # not terraform-driven.
 
   boot_disk {
     initialize_params {
@@ -221,17 +245,30 @@ resource "google_compute_instance" "compute" {
     ssh-keys               = local.ssh_key_entry
     enable-oslogin         = "FALSE"
     block-project-ssh-keys = "TRUE"
+
+    # Stage 4: install Docker + Firecracker + gVisor on first boot, then
+    # bring up the execution-worker container. The control-plane VM's
+    # internal IP is wired in so the worker knows where to find Kafka/CRDB.
+    startup-script = templatefile("${path.module}/../startup/compute.sh.tpl", {
+      ar_url                   = local.ar_url
+      region                   = var.region
+      control_plane_ip         = google_compute_instance.control_plane.network_interface[0].network_ip
+      compose_yaml_b64         = base64encode(file("${path.module}/../compose/compute-compose.yml"))
+      seccomp_profile_b64      = base64encode(file("${path.module}/../../../infra/seccomp/sandbox-seccomp.json"))
+      # The custom Firecracker harness rootfs is built on the compute VM on
+      # first boot using these two scripts (init = PID-1 inside the microVM,
+      # build-rootfs = host-side debootstrap+pack script).
+      rootfs_init_b64          = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/init.sh"))
+      rootfs_builder_b64       = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/build-rootfs.sh"))
+      sandbox_backend          = var.sandbox_backend
+      sandbox_docker_runtime   = var.sandbox_docker_runtime
+      linux_hardening_enabled  = var.linux_hardening_enabled
+    })
   }
 
   tags = ["oj-vm", "oj-compute"]
 
   allow_stopping_for_update = true
-
-  lifecycle {
-    ignore_changes = [
-      metadata["startup-script"],
-    ]
-  }
 }
 
 # ---------- Auto-shutdown via Cloud Scheduler -------------------------------

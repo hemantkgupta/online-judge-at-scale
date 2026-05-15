@@ -32,9 +32,10 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "${SCRIPT_DIR}/../../.." && pwd )"
 TERRAFORM_DIR="${REPO_ROOT}/infra/gcp/terraform"
 
-# Services to build. Add more here (e.g. leaderboard-service) if you need them
-# in the cloud-side compose later.
-SERVICES=("api-gateway" "execution-worker")
+# Services to build. The compute VM runs the worker AND the sandbox-manager
+# side-by-side; the control-plane VM runs api-gateway. Add more services here
+# (e.g. leaderboard-service) when you need them in the cloud-side compose.
+SERVICES=("api-gateway" "execution-worker" "sandbox-manager")
 
 # ---------- discover the AR URL ---------------------------------------------
 

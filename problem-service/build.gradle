@@ -11,6 +11,11 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'org.postgresql:postgresql'
 
+    // GCS V4 signed-URL generation. 2.x is the line used by Spring Boot 3.x
+    // BOMs in this repo's other modules; pin a concrete patch so the multi-stage
+    // Docker build keeps a deterministic layer hash.
+    implementation 'com.google.cloud:google-cloud-storage:2.40.1'
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 

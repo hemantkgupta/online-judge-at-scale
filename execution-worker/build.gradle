@@ -16,6 +16,15 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-databind'
     implementation 'org.postgresql:postgresql'
 
+    // Workstream B: GCS client for fetching contestant source + test-case
+    // inputs/expected-outputs. Matches the version Workstreams A + G use.
+    implementation 'com.google.cloud:google-cloud-storage:2.40.1'
+
+    // OpenTelemetry API only — agent bundles its own SDK at runtime.
+    // See sandbox-manager/build.gradle for the rationale.
+    compileOnly      'io.opentelemetry:opentelemetry-api:1.43.0'
+    testImplementation 'io.opentelemetry:opentelemetry-api:1.43.0'
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.testcontainers:junit-jupiter'
     testImplementation 'org.testcontainers:kafka'

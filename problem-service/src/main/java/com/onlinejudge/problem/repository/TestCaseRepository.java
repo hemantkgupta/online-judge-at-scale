@@ -1,6 +1,6 @@
 package com.onlinejudge.problem.repository;
 
-import com.onlinejudge.problem.model.TestCase;
+import com.onlinejudge.problem.entity.TestCase;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.List;

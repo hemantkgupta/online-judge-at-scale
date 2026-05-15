@@ -1,5 +1,6 @@
 package com.onlinejudge.worker.service;
 
+import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -49,6 +50,21 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>For full hardware isolation see {@link FirecrackerExecutionService}.
  *
+ * <p><b>Runtime selection (gVisor).</b> The OCI runtime Docker hands the
+ * container to is configurable via {@code app.sandbox.docker.runtime}:
+ * <ul>
+ *   <li>{@code runc} (default) — the standard runtime; relies on namespaces +
+ *       cgroups + (when hardening is on) Seccomp-BPF.</li>
+ *   <li>{@code runsc} — Google's gVisor; intercepts guest syscalls in
+ *       user-space and replays a tiny vetted subset against the host kernel.
+ *       Stronger isolation than runc, modest perf hit. Requires runsc to be
+ *       registered with the Docker daemon via {@code /etc/docker/daemon.json}.</li>
+ * </ul>
+ * When the configured runtime is not {@code runc}, a {@code --runtime=<name>}
+ * flag is added to the {@code docker run} argv. The flag is omitted for
+ * {@code runc} so unit tests + the macOS dev loop don't break (Docker for
+ * Mac ships only runc).
+ *
  * <p>Language images: lightweight official images (python:3.12-slim, gcc:13, etc.)
  * Destroy-never-reuse: {@code --rm} flag removes the container after execution.
  */
@@ -72,6 +88,15 @@ public class DockerExecutionService implements ExecutionBackend {
     @Value("${app.sandbox.seccomp-profile:/etc/seccomp/sandbox-seccomp.json}")
     private String seccompProfilePath;
 
+    /**
+     * OCI runtime Docker should use for the contestant container. Default
+     * {@code runc}; set to {@code runsc} on a Linux host with gVisor installed
+     * + registered in {@code /etc/docker/daemon.json}. Any non-{@code runc}
+     * value is passed verbatim as {@code --runtime=<value>}.
+     */
+    @Value("${app.sandbox.docker.runtime:runc}")
+    private String dockerRuntime;
+
     private record LanguageConfig(String image, String sourceFile, List<String> command) {}
 
     private static final Map<String, LanguageConfig> LANGUAGE_CONFIGS = Map.of(
@@ -83,7 +108,17 @@ public class DockerExecutionService implements ExecutionBackend {
                 List.of("sh", "-c", "g++ -O2 -pipe -o /tmp/a.out /code/solution.cpp && /tmp/a.out"))
     );
 
-    public ExecutionResult execute(String submissionId, String language, String code, String input) {
+    @Override
+    public ExecutionResult execute(String submissionId, String language, String code,
+                                   List<TestCaseSpec> testCases) {
+        // Docker backend runs the first test case only — it's the dev / smoke
+        // fallback when Firecracker isn't available. Multi-test orchestration
+        // lives in the Firecracker path (which ships all cases over vsock in a
+        // single agent round-trip).
+        String input = (testCases == null || testCases.isEmpty())
+                ? ""
+                : (testCases.get(0).input() == null ? "" : testCases.get(0).input());
+
         LanguageConfig cfg = languageConfig(language);
 
         Path tempDir = null;
@@ -92,7 +127,7 @@ public class DockerExecutionService implements ExecutionBackend {
             Path codeFile = tempDir.resolve(cfg.sourceFile());
             Files.writeString(codeFile, code);
             Path inputFile = tempDir.resolve("input.txt");
-            Files.writeString(inputFile, input != null ? input : "");
+            Files.writeString(inputFile, input);
 
             List<String> cmd = buildDockerCommand(cfg.image(), language, tempDir.toString());
             long startMs = System.currentTimeMillis();
@@ -147,6 +182,17 @@ public class DockerExecutionService implements ExecutionBackend {
             "--read-only",                         // immutable filesystem
             "--tmpfs", "/tmp:size=64m"
         ));
+
+        // OCI runtime selection. Omitted for runc so dev machines without
+        // gVisor (Docker for Mac, CI runners) keep working unchanged. Any
+        // non-runc value is passed verbatim — Docker rejects unknown runtimes
+        // with a clear error if the daemon hasn't registered it.
+        if (dockerRuntime != null && !dockerRuntime.isBlank()
+                && !"runc".equalsIgnoreCase(dockerRuntime)) {
+            cmd.add("--runtime");
+            cmd.add(dockerRuntime);
+            log.debug("[sandbox] Docker runtime override: --runtime={}", dockerRuntime);
+        }
 
         if (linuxHardeningEnabled && isLinuxHost()) {
             cmd.addAll(List.of(

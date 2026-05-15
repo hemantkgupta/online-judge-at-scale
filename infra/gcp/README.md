@@ -41,8 +41,8 @@ during the GCP $300 free trial and after.
 | 1 | GCP project + APIs + Terraform SA (pre-reqs done in your shell) | external |
 | **2** | **VPC + 2 VMs (stopped) + Artifact Registry + auto-shutdown scheduler** | **this directory** |
 | **3** | **Service Dockerfiles + image push pipeline → Artifact Registry** | **this directory** |
-| 4 | VM startup scripts (compose-up + Firecracker / gVisor install) | pending |
-| 5 | `app.sandbox.docker.runtime` Java config → pass `--runtime=runsc` to Docker | pending |
+| **4** | **VM startup scripts (compose-up + Firecracker / gVisor install)** | **this directory** |
+| **5** | **`app.sandbox.docker.runtime` Java config → pass `--runtime=runsc` to Docker** | **execution-worker/** |
 | 6 | `up.sh` / `down.sh` / `teardown.sh` wrappers | pending |
 | 7 | First deploy: terraform apply → push images → start → smoke test | pending |
 
@@ -237,6 +237,114 @@ VM with the same env vars pointed at the in-VPC service names.
 - Doesn't install Firecracker or gVisor binaries. Also Stage 4 — those
   live on the compute VM's host filesystem, mounted into the worker
   container.
+
+---
+
+## Stage 4 — VM startup scripts
+
+Goal: every time a VM boots, it installs the host-side tooling it needs
+(Docker engine, optionally Firecracker + gVisor on the compute VM),
+authenticates to Artifact Registry, drops the compose YAML + `.env`, and
+brings up the stack via systemd. Re-running is idempotent.
+
+### What's where
+
+| File | Purpose |
+|---|---|
+| [`startup/control-plane.sh.tpl`](startup/control-plane.sh.tpl) | Installs Docker + gcloud, drops `control-plane-compose.yml` + `init.sql` + `.env`, enables `oj-control-plane.service`. |
+| [`startup/compute.sh.tpl`](startup/compute.sh.tpl) | Installs Docker + Firecracker v1.10.1 + guest kernel + rootfs + gVisor (runsc, registered as a Docker runtime), drops compose + seccomp profile + `.env`, enables `oj-compute.service`. |
+| `terraform/main.tf` | Wires both scripts into VM metadata via `templatefile()`. Compose YAML + init.sql + seccomp JSON are base64-encoded into the metadata (no GCS bucket required). |
+| `terraform/variables.tf` | New knobs: `sandbox_backend` (docker / firecracker), `sandbox_docker_runtime` (runc / runsc), `linux_hardening_enabled`. Flip these to compare backends without rebuilding images. |
+| `random_password.jwt_secret` | 48-char shell-safe secret minted in terraform state. Injected as `APP_JWT_SECRET` into the api-gateway container. |
+
+### How the injection works
+
+Terraform reads the compose YAML / init.sql / seccomp profile off disk at
+plan time, base64-encodes them, and stuffs them into the VM's
+`startup-script` metadata. On boot, GCE runs the script as root; it
+`base64 -d`s the payloads back to `/opt/oj/`. No external object store, no
+chicken-and-egg auth bootstrap — the only network call before docker-compose
+runs is the `gcloud auth configure-docker` helper, which uses the VM's
+attached service account.
+
+### Re-apply
+
+```sh
+cd infra/gcp/terraform
+tofu plan          # should report: 1 to add (jwt_secret), 2 to change (both VMs)
+tofu apply
+```
+
+Apply takes ~30 seconds — both VMs are stopped, so the metadata update
+applies in-place without a reboot. The scripts will run on the next
+`gcloud compute instances start …`.
+
+### First boot
+
+The first boot on each VM downloads packages, so it's slow:
+
+- **control-plane**: ~2–3 min (Docker install + AR auth + image pull + compose-up).
+- **compute**: ~5–7 min (Docker + 80 MB Firecracker tarball + 50 MB kernel
+  + 250 MB rootfs + gVisor + AR pull). Watch progress in `/var/log/oj-startup.log`.
+
+Subsequent boots are ~30 sec — everything is cached on the persistent disk.
+
+### Verify it worked
+
+After `gcloud compute instances start oj-control-plane`, give it ~3 min then:
+
+```sh
+gcloud compute ssh hemant@oj-control-plane --zone=asia-south1-a --tunnel-through-iap
+
+# Inside the VM:
+sudo tail -50 /var/log/oj-startup.log     # should end with "control-plane.sh done"
+sudo systemctl status oj-control-plane    # should be active (exited)
+sudo docker compose -f /opt/oj/control-plane-compose.yml ps   # 5 services Up
+curl -s localhost:8088/actuator/health    # api-gateway: {"status":"UP"}
+```
+
+Compute VM equivalent:
+
+```sh
+gcloud compute instances start oj-compute --zone=asia-south1-a
+# wait ~7 min for first-boot install
+gcloud compute ssh hemant@oj-compute --zone=asia-south1-a --tunnel-through-iap
+
+sudo tail -50 /var/log/oj-startup.log     # ends with "compute.sh done"
+ls /dev/kvm                                # should exist; nested virt is on
+/usr/local/bin/firecracker --version       # 1.10.1
+runsc --version                            # release-20240826.0
+sudo docker info | grep -A2 Runtimes       # runc + runsc both listed
+sudo docker logs oj-execution-worker --tail 30
+```
+
+### Flipping backends
+
+The whole point of this exercise is comparing Docker / gVisor / Firecracker.
+Three knobs in `terraform.tfvars`:
+
+```hcl
+sandbox_backend         = "docker"      # or "firecracker"
+sandbox_docker_runtime  = "runc"        # or "runsc" (gVisor)
+linux_hardening_enabled = false         # or true (seccomp + caps + cgroupns)
+```
+
+After editing, `tofu apply` updates the metadata, then on the compute VM:
+
+```sh
+sudo systemctl restart oj-compute.service   # picks up new /opt/oj/.env
+```
+
+No VM reboot, no rebuild.
+
+### What this stage does NOT do
+
+- Doesn't run a smoke test — that's Stage 7. The services will be up but
+  nothing's submitted a problem yet.
+- Doesn't include the `up.sh` / `down.sh` wrappers — Stage 6.
+- Doesn't add the gVisor runtime *selection* in Java. The compute VM offers
+  both `runc` and `runsc` to Docker; Java picks via `app.sandbox.docker.runtime`.
+  Stage 5 wires that property through to `DockerExecutionService`.
 
 ---
 

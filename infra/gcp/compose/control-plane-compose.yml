@@ -69,7 +69,10 @@ services:
       - "8080:8080"   # admin UI (web)
     volumes:
       - cockroachdb-data:/cockroach/cockroach-data
-      - ../../../database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # On GCP the startup script materialises init.sql at /opt/oj/init.sql
+      # (terraform templatefile injection). On a dev machine you can point this
+      # at the repo copy via `-f docker-compose.override.yml`.
+      - /opt/oj/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   redis:
     image: redis:7.2
@@ -100,6 +103,20 @@ services:
       SPRING_DATA_REDIS_PORT: 6379
       APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
       APP_REGION: ${REGION:-asia-south1}
+      # ── OpenTelemetry (Workstream H) ─────────────────────────────
+      # The api-gateway image bakes the OTel Java agent (added by the
+      # same Dockerfile changes that landed for execution-worker /
+      # sandbox-manager — see those Dockerfiles for the canonical recipe).
+      # Empty OTEL_ENDPOINT → agent is a no-op. Set it in /opt/oj/.env
+      # when a collector is provisioned.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
+      OTEL_SERVICE_NAME: oj-api-gateway
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
+
+  # NOTE (Workstream H): when Workstream A lands its `problem-service`
+  # compose entry on this VM, copy the same OTEL_* trio above with
+  # OTEL_SERVICE_NAME=oj-problem-service. Workstream A owns the
+  # service definition; this file just needs the env-var block.
 
 volumes:
   zookeeper-data:

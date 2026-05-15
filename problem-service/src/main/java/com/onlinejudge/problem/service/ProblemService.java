@@ -1,7 +1,10 @@
 package com.onlinejudge.problem.service;
 
-import com.onlinejudge.problem.model.Problem;
-import com.onlinejudge.problem.model.TestCase;
+import com.onlinejudge.problem.dto.CreateProblemRequest;
+import com.onlinejudge.problem.dto.CreateTestCaseRequest;
+import com.onlinejudge.problem.dto.TestCaseUrlsDto;
+import com.onlinejudge.problem.entity.Problem;
+import com.onlinejudge.problem.entity.TestCase;
 import com.onlinejudge.problem.repository.ProblemRepository;
 import com.onlinejudge.problem.repository.TestCaseRepository;
 import lombok.RequiredArgsConstructor;
@@ -9,161 +12,97 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
- * Problem lifecycle management.
+ * Problem lifecycle + test-case URL generation.
  *
- * The Problem Service is read-heavy, write-rare:
- * - Reads: every execution worker fetches test cases for every submission
- * - Writes: admin creates problems during contest setup (rare)
- *
- * This asymmetry drives two design decisions:
- * 1. CockroachDB GLOBAL locality: sub-10ms reads from every region
- * 2. Test case delivery via pre-signed R2 URLs: workers fetch directly
- *    from object storage, not through this service
- *
- * Pre-signed URL flow:
- *   1. Execution worker receives a submission event from Kafka
- *   2. Event contains the problem_id
- *   3. Worker calls ProblemService.getTestCaseUrls(problemId)
- *   4. Service returns pre-signed R2 URLs (valid for 5 minutes)
- *   5. Worker fetches test case data directly from R2
- *
- * This keeps the Problem Service out of the hot path — it generates
- * URLs, not data. The actual data transfer is between the worker and R2.
+ * <p>The {@code /test-cases} endpoint is the hot read path: every execution
+ * worker hits it once per submission. Cost per call is:
+ * <ol>
+ *   <li>One indexed scan on {@code test_cases (problem_id, ordinal)} — 5–50 rows.</li>
+ *   <li>One {@link GcsSigner#sign} call per row, per URL (2 URLs/row, both V4 HMAC).</li>
+ * </ol>
+ * No GCS RPCs — signing is local crypto. CockroachDB GLOBAL locality keeps
+ * the read sub-10ms from every region.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class ProblemService {
 
+    /** Ordinals 1–10 are pretests. Matches the contract in the blog post. */
+    public static final int PRETEST_MAX_ORDINAL = 10;
+
     private final ProblemRepository problemRepository;
     private final TestCaseRepository testCaseRepository;
+    private final GcsSigner gcsSigner;
 
-    /**
-     * Creates a new problem with its test cases.
-     */
-    @Transactional
-    public Problem createProblem(String title, int timeLimitMs, int memoryLimitMb,
-                                  int points, List<TestCaseInput> testCases) {
-        Problem problem = new Problem();
-        problem.setId(UUID.randomUUID());
-        problem.setTitle(title);
-        problem.setTimeLimitMs(timeLimitMs);
-        problem.setMemoryLimitMb(memoryLimitMb);
-        problem.setPoints(points);
-        problem.setTestCaseCount(testCases.size());
-
-        // In production: upload problem statement to R2, get the key
-        problem.setStatementR2Key("problems/" + problem.getId() + "/statement.encrypted");
-        problemRepository.save(problem);
-
-        // Create test cases
-        for (int i = 0; i < testCases.size(); i++) {
-            TestCaseInput tc = testCases.get(i);
-            TestCase testCase = new TestCase();
-            testCase.setId(UUID.randomUUID());
-            testCase.setProblemId(problem.getId());
-            testCase.setOrdinal(i + 1);
-            testCase.setMaxScore(tc.maxScore());
-
-            // In production: upload input/output to R2
-            String prefix = "problems/" + problem.getId() + "/tests/" + (i + 1);
-            testCase.setInputR2Key(prefix + "/input.txt");
-            testCase.setExpectedOutputR2Key(prefix + "/expected.txt");
-            testCaseRepository.save(testCase);
-        }
-
-        log.info("[problem] Created problem={} title='{}' tests={} points={}",
-                problem.getId(), title, testCases.size(), points);
-
-        return problem;
-    }
-
-    /**
-     * Returns pre-signed URLs for a problem's test cases.
-     *
-     * The Execution Service calls this to get download URLs for test data.
-     * URLs are pre-signed with a 5-minute TTL — the worker must fetch
-     * within that window.
-     *
-     * @param problemId the problem to get test cases for
-     * @param pretestOnly if true, return only pretests (ordinal <= 10)
-     * @return list of test case URL entries
-     */
-    public List<TestCaseUrls> getTestCaseUrls(UUID problemId, boolean pretestOnly) {
-        Problem problem = problemRepository.findById(problemId)
-                .orElseThrow(() -> new NoSuchElementException("Problem not found: " + problemId));
-
-        List<TestCase> testCases = pretestOnly
-                ? testCaseRepository.findByProblemIdAndOrdinalLessThanEqualOrderByOrdinal(problemId, 10)
-                : testCaseRepository.findByProblemIdOrderByOrdinal(problemId);
-
-        List<TestCaseUrls> urls = new ArrayList<>();
-        for (TestCase tc : testCases) {
-            // In production: generate pre-signed R2/S3 URLs with 5-minute expiry
-            // Locally: return the R2 keys directly (no signing needed)
-            urls.add(new TestCaseUrls(
-                    tc.getOrdinal(),
-                    generatePresignedUrl(tc.getInputR2Key()),
-                    generatePresignedUrl(tc.getExpectedOutputR2Key()),
-                    tc.getMaxScore(),
-                    tc.isPretest()
-            ));
-        }
-
-        log.debug("[problem] Generated {} test case URLs for problem={} pretestOnly={}",
-                urls.size(), problemId, pretestOnly);
-
-        return urls;
-    }
-
-    /**
-     * Returns problem metadata (without test case data).
-     */
-    public Optional<Problem> getProblem(UUID problemId) {
-        return problemRepository.findById(problemId);
-    }
-
-    /**
-     * Returns all problems for display (admin panel, problem listing).
-     */
-    public List<Problem> getAllProblems() {
+    public List<Problem> listProblems() {
         return problemRepository.findAll();
     }
 
-    /**
-     * Generates a pre-signed URL for an R2/S3 object.
-     *
-     * In production: uses the R2/S3 SDK to generate a URL signed with
-     * the service's credentials, valid for 5 minutes. The Execution
-     * Service can download the object without authentication — the
-     * signature IS the authentication.
-     *
-     * Pre-signed URLs are the standard mechanism for granting temporary
-     * read access to private objects without exposing credentials.
-     *
-     * Locally: returns the key as a local:// URL.
-     */
-    private String generatePresignedUrl(String r2Key) {
-        // Production: s3Client.presign(GetObjectRequest.builder()
-        //     .bucket("onlinejudge-testcases")
-        //     .key(r2Key)
-        //     .build(), Duration.ofMinutes(5));
-        return "local://" + r2Key + "?expires=" + Instant.now().plusSeconds(300).getEpochSecond();
+    public Optional<Problem> getProblem(UUID id) {
+        return problemRepository.findById(id);
     }
 
-    // --- DTOs ---
+    @Transactional
+    public Problem createProblem(CreateProblemRequest req) {
+        Problem p = new Problem();
+        p.setId(UUID.randomUUID());
+        p.setTitle(req.title());
+        p.setTimeLimitMs(req.timeLimitMs());
+        p.setMemoryLimitMb(req.memoryLimitMb());
+        p.setPoints(req.points());
+        Problem saved = problemRepository.save(p);
+        log.info("[problem] created id={} title='{}'", saved.getId(), saved.getTitle());
+        return saved;
+    }
 
-    public record TestCaseInput(String input, String expectedOutput, int maxScore) {}
+    @Transactional
+    public void registerTestCases(UUID problemId, CreateTestCaseRequest req) {
+        Problem problem = problemRepository.findById(problemId)
+                .orElseThrow(() -> new NoSuchElementException("Problem not found: " + problemId));
+        for (CreateTestCaseRequest.TestCaseEntry e : req.testCases()) {
+            TestCase tc = new TestCase();
+            tc.setId(UUID.randomUUID());
+            tc.setProblemId(problem.getId());
+            tc.setOrdinal(e.ordinal());
+            tc.setInputGcsKey(e.inputGcsKey());
+            tc.setExpectedOutputGcsKey(e.expectedOutputGcsKey());
+            testCaseRepository.save(tc);
+        }
+        log.info("[problem] registered {} test cases for problem={}", req.testCases().size(), problemId);
+    }
 
-    public record TestCaseUrls(
-            int ordinal,
-            String inputUrl,
-            String expectedOutputUrl,
-            int maxScore,
-            boolean isPretest
-    ) {}
+    /**
+     * Returns ordered test-case URLs for the given problem. Each URL is a V4-
+     * signed GCS download URL valid for 5 minutes.
+     *
+     * @throws NoSuchElementException if the problem does not exist
+     */
+    public List<TestCaseUrlsDto> getTestCaseUrls(UUID problemId, boolean pretestOnly) {
+        if (!problemRepository.existsById(problemId)) {
+            throw new NoSuchElementException("Problem not found: " + problemId);
+        }
+        List<TestCase> rows = pretestOnly
+                ? testCaseRepository.findByProblemIdAndOrdinalLessThanEqualOrderByOrdinal(problemId, PRETEST_MAX_ORDINAL)
+                : testCaseRepository.findByProblemIdOrderByOrdinal(problemId);
+
+        List<TestCaseUrlsDto> out = new ArrayList<>(rows.size());
+        for (TestCase tc : rows) {
+            out.add(new TestCaseUrlsDto(
+                    tc.getOrdinal(),
+                    gcsSigner.sign(tc.getInputGcsKey()),
+                    gcsSigner.sign(tc.getExpectedOutputGcsKey())
+            ));
+        }
+        log.debug("[problem] signed {} test-case URLs for problem={} pretestOnly={}",
+                out.size(), problemId, pretestOnly);
+        return out;
+    }
 }

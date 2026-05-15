@@ -48,6 +48,16 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# OpenTelemetry Java agent (Workstream H). See execution-worker/Dockerfile
+# for the canonical comment block. OTEL_EXPORTER_OTLP_ENDPOINT +
+# OTEL_SERVICE_NAME are set per-service via compose.
+RUN curl -fsSL -o /opt/opentelemetry-javaagent.jar \
+    https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.10.0/opentelemetry-javaagent.jar
+
+ENV JAVA_TOOL_OPTIONS="-javaagent:/opt/opentelemetry-javaagent.jar"
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+ENV OTEL_LOGS_EXPORTER=none
+
 WORKDIR /app
 
 # Copy the boot jar (its name includes version; rename for predictability).

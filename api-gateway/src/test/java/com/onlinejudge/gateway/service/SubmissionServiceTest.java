@@ -17,6 +17,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -24,6 +25,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -66,6 +68,10 @@ class SubmissionServiceTest {
         validRequest.setContestId(UUID.randomUUID().toString());
         validRequest.setLanguage("python");
         validRequest.setCode("print(42)");
+        // Default to legacy data-url mode — @Value isn't applied in unit tests,
+        // so the field stays null without this. The Workstream G test below
+        // overrides this to "gcs" explicitly.
+        ReflectionTestUtils.setField(submissionService, "sourceMode", "data-url");
     }
 
     @Test
@@ -209,6 +215,62 @@ class SubmissionServiceTest {
         // Outbox row carries the same region so a regional changefeed reads
         // its own region's events without scanning others.
         assertThat(outboxCaptor.getValue().getRegion()).isEqualTo("eu-west-1");
+    }
+
+    @Test
+    void accept_gcsMode_persistsGcsUriOnSubmissionAndOutbox() throws Exception {
+        // Workstream G — source-mode=gcs writes to GCS BEFORE the outbox row
+        // is created and the persisted s3CodeUrl is a gs:// URI (not a data: URL).
+        GcsWriter gcsWriter = mock(GcsWriter.class);
+        when(gcsWriter.bucket()).thenReturn("oj-source-test");
+        when(gcsWriter.write(any(), eq(validRequest.getCode())))
+                .thenReturn("submissions/2026/05/15/sub.txt");
+
+        ReflectionTestUtils.setField(submissionService, "gcsWriter", gcsWriter);
+        ReflectionTestUtils.setField(submissionService, "sourceMode", "gcs");
+
+        when(submissionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(outboxEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
+
+        verify(gcsWriter, times(1)).write(any(), eq(validRequest.getCode()));
+
+        verify(submissionRepository).save(submissionCaptor.capture());
+        verify(outboxEventRepository).save(outboxCaptor.capture());
+
+        Submission saved = submissionCaptor.getValue();
+        // Event carries the GCS URI — not a data: URL. The downstream
+        // execution-worker resolves the bytes by fetching this object.
+        assertThat(saved.getS3CodeUrl()).isEqualTo("gs://oj-source-test/submissions/2026/05/15/sub.txt");
+
+        JsonNode payload = objectMapper.readTree(outboxCaptor.getValue().getPayload());
+        assertThat(payload.get("s3CodeUrl").asText())
+                .isEqualTo("gs://oj-source-test/submissions/2026/05/15/sub.txt");
+        assertThat(payload.get("s3CodeUrl").asText()).doesNotStartWith("data:");
+    }
+
+    @Test
+    void accept_gcsMode_writesToGcsBeforePersisting() throws Exception {
+        // Part 6 invariant: GCS write must happen BEFORE the row hits the DB
+        // (and therefore before the outbox event is observable). If the
+        // mock's write() throws, no row should be saved.
+        GcsWriter gcsWriter = mock(GcsWriter.class);
+        when(gcsWriter.write(any(), any()))
+                .thenThrow(new RuntimeException("simulated GCS outage"));
+
+        ReflectionTestUtils.setField(submissionService, "gcsWriter", gcsWriter);
+        ReflectionTestUtils.setField(submissionService, "sourceMode", "gcs");
+
+        try {
+            submissionService.accept(validRequest, authenticatedUserId, "us-east-1");
+        } catch (SubmissionService.GcsWriteException expected) {
+            // good
+        }
+
+        // Neither the submission nor the outbox event should have been saved.
+        verify(submissionRepository, times(0)).save(any());
+        verify(outboxEventRepository, times(0)).save(any());
     }
 
     @Test

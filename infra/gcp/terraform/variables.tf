@@ -87,3 +87,35 @@ variable "artifact_repo_name" {
   type        = string
   default     = "oj-images"
 }
+
+# ---------- Sandbox backend selection (compute VM) --------------------------
+# Flip these without rebuilding images. The compute VM startup script writes
+# them to /opt/oj/.env which docker-compose picks up. After `tofu apply` the
+# VM will need a restart (or `systemctl restart oj-compute.service`) for the
+# new values to take effect.
+
+variable "sandbox_backend" {
+  description = "Which sandbox backend the execution-worker uses: docker or firecracker."
+  type        = string
+  default     = "docker"
+  validation {
+    condition     = contains(["docker", "firecracker"], var.sandbox_backend)
+    error_message = "sandbox_backend must be one of: docker, firecracker."
+  }
+}
+
+variable "sandbox_docker_runtime" {
+  description = "Docker OCI runtime: runc (default Linux) or runsc (gVisor)."
+  type        = string
+  default     = "runc"
+  validation {
+    condition     = contains(["runc", "runsc"], var.sandbox_docker_runtime)
+    error_message = "sandbox_docker_runtime must be one of: runc, runsc."
+  }
+}
+
+variable "linux_hardening_enabled" {
+  description = "Apply Seccomp-BPF + capability drop + cgroupns to the Docker backend."
+  type        = bool
+  default     = false
+}

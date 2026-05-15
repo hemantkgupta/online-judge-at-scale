@@ -19,6 +19,15 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
 
+/**
+ * Submission ingress.
+ *
+ * <p>Per Part 6 of the blog (Submission Service durability invariant), the
+ * source is written to GCS BEFORE the Kafka event is published. This eliminates
+ * the failure mode where the event lands on a Kafka topic referencing a GCS
+ * key that doesn't yet exist (consumer 404s on R2/GCS, dead-letters
+ * submission, contestant never gets a verdict).
+ */
 @Slf4j
 @RestController
 @RequestMapping("/api/v1/submissions")
@@ -82,6 +91,16 @@ public class SubmissionController {
             SubmissionResponse response = submissionService.accept(request, userId, region);
             idempotencyFilter.recordSubmission(idempotencyKey, response.getSubmissionId(), response.getGatewayTsMs());
             return ResponseEntity.accepted().body(response);
+        } catch (SubmissionService.GcsWriteException ex) {
+            // Durability invariant: never publish an event referencing a
+            // non-existent GCS object. We surface a 503 and let the client
+            // retry — DO NOT silently fall back to the data-url path.
+            idempotencyFilter.releaseClaim(idempotencyKey);
+            log.error("[gateway] GCS write failed for user={} — returning 503: {}", userId, ex.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of(
+                    "status", "UNAVAILABLE",
+                    "message", "Source storage temporarily unavailable. Please retry."
+            ));
         } catch (Exception ex) {
             idempotencyFilter.releaseClaim(idempotencyKey);
             throw ex;

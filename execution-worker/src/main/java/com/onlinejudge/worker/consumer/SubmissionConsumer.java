@@ -6,9 +6,13 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import com.onlinejudge.common.events.Events.AnalyticsEvent;
 import com.onlinejudge.common.events.Events.SubmissionEvent;
 import com.onlinejudge.common.events.Events.VerdictEvent;
+import com.onlinejudge.worker.observability.WorkerMetrics;
 import com.onlinejudge.worker.service.DockerExecutionService;
 import com.onlinejudge.worker.service.ExecutionBackend;
+import com.onlinejudge.worker.service.GcsClient;
 import com.onlinejudge.worker.service.IdempotencyService;
+import com.onlinejudge.worker.service.TestCaseFetcher;
+import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -22,6 +26,7 @@ import java.io.ByteArrayOutputStream;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
@@ -65,6 +70,12 @@ public class SubmissionConsumer {
     private final ExecutionBackend executionService;
     private final KafkaTemplate<String, byte[]> kafkaTemplate;
     private final ObjectMapper objectMapper;
+    /** Workstream H: worker.verdicts.published_total + adjacent metrics. */
+    private final WorkerMetrics metrics;
+    /** Workstream B: pulls source code from GCS by gs:// URI. Nullable in tests. */
+    private final GcsClient gcsClient;
+    /** Workstream B: resolves test-case URLs and SHA-256s expected outputs. Nullable in tests. */
+    private final TestCaseFetcher testCaseFetcher;
 
     @Value("${app.kafka.topic.evaluated-results}")
     private String evaluatedResultsTopic;
@@ -130,10 +141,29 @@ public class SubmissionConsumer {
                 return;
             }
 
-            String sourceCode  = resolveSourceCode(event.getS3CodeUrl());
-            String sampleInput = "5\n3 1 4 1 5";
+            String sourceCode = resolveSourceCode(event.getS3CodeUrl());
+
+            // Workstream B: fetch the real test-case suite from Problem Service +
+            // GCS. When testCaseFetcher is null (legacy smoke harness / unit tests
+            // without a problem service), fall back to a single empty-stdin spec
+            // with an empty expected_hash. The agent will report WA on that case
+            // — fine for a smoke test, the run itself completes.
+            List<TestCaseSpec> testCases;
+            if (testCaseFetcher != null) {
+                try {
+                    testCases = testCaseFetcher.fetch(event.getProblemId(), phase);
+                } catch (Exception ex) {
+                    log.error("[worker:{}] test-case fetch failed submission={} problem={}: {}",
+                            phase, submissionId, event.getProblemId(), ex.getMessage());
+                    ack.nack(Duration.ofSeconds(5));
+                    return;
+                }
+            } else {
+                testCases = List.of(new TestCaseSpec(1, "", ""));
+            }
+
             DockerExecutionService.ExecutionResult result =
-                    executionService.execute(submissionId, language, sourceCode, sampleInput);
+                    executionService.execute(submissionId, language, sourceCode, testCases);
 
             String verdict = determineVerdict(result, 2000);
             int points = verdict.equals("ACCEPTED") ? 100 : 0;
@@ -157,6 +187,10 @@ public class SubmissionConsumer {
                     .setEventTsMs(gatewayTsMs)
                     .build();
             sendAndWait(evaluatedResultsTopic, userId, verdictEvent.toByteArray());
+            // Workstream H: count the verdict once the broker has ack'd.
+            // sendAndWait throws on failure, so reaching this line means
+            // the send genuinely succeeded.
+            metrics.incVerdictsPublished(verdict, language, phase);
 
             // Analytics (fire-and-forget, separate consumer group).
             AnalyticsEvent analyticsEvent = AnalyticsEvent.newBuilder()
@@ -262,9 +296,22 @@ public class SubmissionConsumer {
         }
 
         String lower = s3CodeUrl.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("gs://")) {
+            // Workstream B: the API gateway (Workstream G) writes contestant
+            // source to GCS and stamps a gs://<bucket>/<key> URI on the event.
+            if (gcsClient == null) {
+                throw new UnsupportedOperationException(
+                        "gs:// code URL but GcsClient not wired (running without GcsConfig?)");
+            }
+            try {
+                return new String(gcsClient.fetch(s3CodeUrl), StandardCharsets.UTF_8);
+            } catch (java.io.IOException ex) {
+                throw new RuntimeException("GCS source fetch failed: " + s3CodeUrl, ex);
+            }
+        }
+
         if (lower.startsWith("s3://") || lower.startsWith("r2://") ||
-                lower.startsWith("gs://") || lower.startsWith("http://") ||
-                lower.startsWith("https://")) {
+                lower.startsWith("http://") || lower.startsWith("https://")) {
             throw new UnsupportedOperationException(
                     "TODO: object-store code fetch is not wired in execution-worker yet");
         }

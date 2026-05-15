@@ -1,0 +1,63 @@
+server:
+  port: 9100
+
+spring:
+  threads:
+    virtual:
+      enabled: true
+
+app:
+  # Firecracker binary + guest kernel + harness rootfs paths (defaults match
+  # what compute.sh.tpl provisions). Override via env vars.
+  firecracker:
+    binary: /usr/local/bin/firecracker
+    kernel-image: /var/lib/firecracker/vmlinux
+    rootfs-image: /var/lib/firecracker/rootfs.ext4
+    # Where per-lease Firecracker API sockets land.
+    api-sock-dir: /tmp
+    # Where per-lease vsock UDS files land (Firecracker writes these on
+    # startup; host-side clients connect with the CONNECT protocol).
+    vsock-uds-dir: /tmp
+    # Kernel cmdline. init=/init is the entry into our harness, which exec's
+    # the Go agent listening on vsock.
+    boot-args: "console=ttyS0 reboot=k panic=1 pci=off init=/init"
+    vcpus: 1
+    # Default per-VM memory budget. The lease request can override per
+    # submission (Phase C: applies per-problem limits).
+    default-memory-mib: 256
+    # Wall-clock cap on a single lease before the host pulls the plug.
+    # This is the host-side watchdog the blog calls a security boundary —
+    # implemented as a coarse timeout on the Firecracker process wait.
+    # (Real per-VM scheduling will be Phase E.)
+    lease-wall-seconds: 30
+
+  # Warm-pool configuration (Phase C). Each language target is the
+  # READY pool depth the replenishment loop tries to maintain. The
+  # replenisher runs every 500ms; max-parallel-boot caps how many VMs
+  # one tick may spawn so a deep deficit can't saturate KVM.
+  pool:
+    targets:
+      python: 3
+      cpp: 2
+      java: 2
+    max-parallel-boot: 4
+    # 503 retry_after_ms hint to clients when the pool is empty.
+    retry-after-ms: 250
+
+  # cgroup v2 defaults (Phase D). Per-submission cpu.max can be
+  # overridden via LeaseRequest.cpuQuotaUs / cpuPeriodUs.
+  cgroup:
+    default-cpu-period-us: 100000
+    default-cpu-quota-us:  100000
+
+  agent:
+    # Vsock port the in-guest agent listens on. Hard-coded into both the
+    # Go agent (cmd/agent/main.go) and the host-side client.
+    port: 1234
+    # Path to the host-side vsock bridge binary. Compiled from
+    # infra/firecracker/agent/cmd/vsock-client; baked into the SM image.
+    vsock-client: /usr/local/bin/oj-vsock-client
+    # How long to wait for the in-guest agent's first byte over vsock.
+    # The guest kernel + agent come up in ~125ms with the CI vmlinux;
+    # 5s is comfortable headroom.
+    connect-timeout-seconds: 5

@@ -3,6 +3,12 @@ rootProject.name = 'online-judge-at-scale'
 include 'common'
 include 'api-gateway'
 include 'execution-worker'
+// sandbox-manager — Part 7 of the blog. Per-host daemon: owns the
+// Firecracker REST sockets, KVM access, and the lease/release HTTP API
+// that the execution-worker calls. Trust-zone-isolated from the worker
+// so privileged operations (KVM, cgroups, killing VMM processes) don't
+// share a process with Kafka consumers.
+include 'sandbox-manager'
 include 'scoring-pipeline'
 include 'leaderboard-service'
 include 'analytics-pipeline'

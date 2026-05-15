@@ -27,7 +27,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SubmissionEnvelopeTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final SubmissionConsumer consumer = new SubmissionConsumer(null, null, null, objectMapper);
+    private final SubmissionConsumer consumer = new SubmissionConsumer(
+            null, null, null, objectMapper, null, null, null);
 
     @Test
     void protoBytes_areParsedDirectly() throws Exception {

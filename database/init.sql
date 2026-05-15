@@ -12,8 +12,27 @@ CREATE TABLE problems (
     title STRING NOT NULL,
     time_limit_ms INT NOT NULL,
     memory_limit_mb INT NOT NULL,
-    points INT NOT NULL
+    points INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP NOT NULL DEFAULT now()
 );
+
+-- Per-problem ordered catalogue of test cases. Owned by the Problem Service
+-- (Workstream A). Input/expected-output bytes live in GCS — this table stores
+-- only the keys. The Execution Service reads via
+-- `GET /problems/{id}/test-cases?pretestOnly={bool}` and receives V4-signed
+-- GCS download URLs (5-min TTL). Workers never read this table directly.
+CREATE TABLE test_cases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    problem_id UUID NOT NULL REFERENCES problems(id),
+    ordinal INT NOT NULL,
+    input_gcs_key STRING NOT NULL,
+    expected_output_gcs_key STRING NOT NULL,
+    UNIQUE (problem_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_cases_problem_ordinal
+    ON test_cases (problem_id, ordinal);
 
 -- `region` is added to the write-path tables so a multi-region cluster can
 -- enable LOCALITY REGIONAL BY ROW on them (see database/multi-region-setup.sql).

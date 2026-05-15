@@ -68,3 +68,17 @@ app:
       enabled: true
     poll-interval-ms: 1000
     batch-size: 50
+
+  # Workstream G — Submission source persistence.
+  #   source-mode=gcs     → write source bytes to GCS BEFORE the outbox event
+  #                         is created (Part 6 durability invariant). Production
+  #                         default once GCS is provisioned.
+  #   source-mode=data-url → embed source inline as a data: URL. Legacy /
+  #                          local-dev default — no object store required.
+  # Kept env-var-driven so the same image rolls forward/back without a rebuild.
+  submission:
+    source-mode: ${APP_SUBMISSION_SOURCE_MODE:data-url}
+
+  gcs:
+    project-id: ${GCS_PROJECT_ID:online-judge-hk}
+    source-bucket: ${GCS_SOURCE_BUCKET:oj-source-dev}

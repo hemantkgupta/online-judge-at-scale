@@ -1,0 +1,24 @@
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    implementation project(':common')
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-json'
+
+    // OpenTelemetry API only — the OTel Java agent bundles its own SDK at
+    // runtime (see Dockerfile). compileOnly because we don't ship the API
+    // jar; the agent's bundled classes win on the classpath at runtime.
+    // testRuntimeOnly gives us a real SDK noop during unit tests so
+    // GlobalOpenTelemetry.get() doesn't NPE on a missing provider.
+    compileOnly      'io.opentelemetry:opentelemetry-api:1.43.0'
+    testImplementation 'io.opentelemetry:opentelemetry-api:1.43.0'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+springBoot {
+    mainClass = 'com.onlinejudge.sandbox.SandboxManagerApplication'
+}
