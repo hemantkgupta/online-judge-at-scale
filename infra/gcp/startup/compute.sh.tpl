@@ -99,11 +99,13 @@ fi
 echo "[oj-startup] firecracker: $(/usr/local/bin/firecracker --version | head -1)"
 
 # Guest kernel from the Firecracker CI bucket — generic, no customization
-# needed (we only swap the rootfs).
+# needed (we only swap the rootfs). Kernel files live directly under
+# v<X.Y>/<arch>/ in the CI bucket (no /kernels/ subdir, despite what stale
+# docs may suggest).
 if [[ ! -s /var/lib/firecracker/vmlinux ]]; then
   echo "[oj-startup] downloading guest kernel (vmlinux-5.10.223)"
   curl -fsSL -o /var/lib/firecracker/vmlinux \
-    "$FIRECRACKER_CI_BASE/kernels/vmlinux-5.10.223"
+    "$FIRECRACKER_CI_BASE/vmlinux-5.10.223"
 fi
 
 # ---------- Custom OJ harness rootfs (replaces the generic CI rootfs) -------
