@@ -170,7 +170,21 @@ resource "google_compute_instance" "control_plane" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.oj_subnet.id
-    # No access_config block → no public IP. SSH happens via IAP tunnel.
+
+    # Ephemeral external IP for OUTBOUND only. The compute VM's startup
+    # script fetches Docker, apt packages, the OTel agent jar, and the
+    # CI vmlinux from the public internet; the control-plane VM fetches
+    # Docker + Kafka images at first boot. Without this block the VM has
+    # no internet egress (no Cloud NAT, no public IP) and apt + docker
+    # GPG curls hang for ~5 min before the startup-script gives up.
+    #
+    # INBOUND remains IAP-only: oj-allow-iap-ssh firewall restricts
+    # source range to 35.235.240.0/20, and no other ingress rule is open.
+    # A random internet host pinging the public IP can't reach :22, the
+    # actuator ports, or anything else — same security posture as the
+    # no-public-IP design. Trade: ~$0.005/hr per running VM ($3.65/mo if
+    # 24/7, much less with the 23:00 IST auto-shutdown).
+    access_config {}
   }
 
   service_account {
