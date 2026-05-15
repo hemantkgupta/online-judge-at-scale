@@ -16,3 +16,7 @@ terraform.tfvars
 
 # Plan output is sometimes saved to a file for `apply` later; treat as private.
 *.tfplan
+
+# Build artifact produced by the archive_file data source — zip of the
+# Execution Agent source tree, regenerated on every terraform plan/apply.
+.terraform-agent-src.zip

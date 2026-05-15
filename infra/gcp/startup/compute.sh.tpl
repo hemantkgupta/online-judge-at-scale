@@ -113,19 +113,30 @@ fi
 # there. For real code execution we need a rootfs whose PID 1 mounts the
 # code drive, runs the contestant program, writes output, and powers off.
 # build-rootfs.sh produces that.
-echo "[oj-startup] installing rootfs build deps (debootstrap, e2fsprogs)"
-apt-get install -y --no-install-recommends debootstrap e2fsprogs
+echo "[oj-startup] installing rootfs build deps (debootstrap, e2fsprogs, unzip)"
+apt-get install -y --no-install-recommends debootstrap e2fsprogs unzip
 
 install -d -m 0755 /opt/oj/rootfs-builder
 echo '${rootfs_init_b64}'    | base64 -d > /opt/oj/rootfs-builder/init.sh
 echo '${rootfs_builder_b64}' | base64 -d > /opt/oj/rootfs-builder/build-rootfs.sh
 chmod +x /opt/oj/rootfs-builder/init.sh /opt/oj/rootfs-builder/build-rootfs.sh
 
+# Unzip the Execution Agent Go source tree into /opt/oj/agent/ so
+# build-rootfs.sh can find it and compile the in-guest binary. The
+# tarball is injected as base64 by terraform via the archive_file data
+# source over the in-repo infra/firecracker/agent/ directory.
+echo "[oj-startup] staging Execution Agent source for build-rootfs"
+install -d -m 0755 /opt/oj/agent
+echo '${agent_src_zip_b64}' | base64 -d > /tmp/oj-agent-src.zip
+unzip -q -o /tmp/oj-agent-src.zip -d /opt/oj/agent
+rm -f /tmp/oj-agent-src.zip
+
 # Run the builder. It self-skips if the existing rootfs already has the
 # correct version marker, so re-running compute.sh on subsequent boots is
-# a no-op once the rootfs is built.
+# a no-op once the rootfs is built. Point build-rootfs.sh at the unzipped
+# agent source via the AGENT_SRC_DIR env var.
 echo "[oj-startup] building harness rootfs (first time ~10 min, then cached)"
-/opt/oj/rootfs-builder/build-rootfs.sh
+AGENT_SRC_DIR=/opt/oj/agent /opt/oj/rootfs-builder/build-rootfs.sh
 
 # ---------- gVisor (runsc) registered as a Docker runtime -------------------
 if ! command -v runsc >/dev/null 2>&1; then

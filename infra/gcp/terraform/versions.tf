@@ -22,6 +22,15 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.5"
     }
+    # archive_file zips the in-repo `infra/firecracker/agent/` source tree
+    # so terraform can inject it into the compute VM's startup-script
+    # metadata. `build-rootfs.sh` on the VM unpacks it and runs `go build`
+    # to compile the Execution Agent for the guest before packing the
+    # rootfs. Avoids a git clone or extra GCS bucket dependency at boot.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
 

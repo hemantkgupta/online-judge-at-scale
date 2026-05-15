@@ -137,6 +137,19 @@ locals {
   ar_url = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo_name}"
 }
 
+# ---------- Execution Agent source tarball ---------------------------------
+# Zips the in-repo `infra/firecracker/agent/` directory and injects it as a
+# base64 string into the compute VM's startup-script metadata. The VM
+# unzips it under /opt/oj/agent and `build-rootfs.sh` does `go build`
+# against it to produce the static linux/amd64 binary that goes into the
+# Firecracker harness rootfs. Roughly 12 KB base64-encoded — well under
+# the 256 KB per-metadata-entry limit.
+data "archive_file" "agent_src" {
+  type        = "zip"
+  output_path = "${path.module}/.terraform-agent-src.zip"
+  source_dir  = "${path.module}/../../../infra/firecracker/agent"
+}
+
 # ---------- JWT secret for api-gateway --------------------------------------
 # Generated once and held in terraform state. `tofu destroy` + `tofu apply`
 # will mint a fresh one — that's fine for a dev-grade setup; production
@@ -281,6 +294,10 @@ resource "google_compute_instance" "compute" {
       # build-rootfs = host-side debootstrap+pack script).
       rootfs_init_b64          = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/init.sh"))
       rootfs_builder_b64       = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/build-rootfs.sh"))
+      # Zipped Execution Agent source — unzipped on the VM and compiled
+      # by build-rootfs.sh into a static linux/amd64 binary that goes
+      # into the harness rootfs.
+      agent_src_zip_b64        = filebase64(data.archive_file.agent_src.output_path)
       sandbox_backend          = var.sandbox_backend
       sandbox_docker_runtime   = var.sandbox_docker_runtime
       linux_hardening_enabled  = var.linux_hardening_enabled
