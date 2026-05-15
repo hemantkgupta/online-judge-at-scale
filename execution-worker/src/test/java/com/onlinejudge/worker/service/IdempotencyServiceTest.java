@@ -10,6 +10,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -36,6 +38,9 @@ class IdempotencyServiceTest {
     @Mock
     private Query updateQuery;
 
+    @Mock
+    private Query selectQuery;
+
     @InjectMocks
     private IdempotencyService idempotencyService;
 
@@ -47,37 +52,91 @@ class IdempotencyServiceTest {
     }
 
     @Test
-    void claimSubmission_returnsTrue_whenFirstClaim() {
+    void claimSubmission_returnsClaimed_whenFirstClaim() {
         when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenReturn(1); // 1 row inserted
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
 
-        assertThat(claimed).isTrue();
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.CLAIMED);
+        assertThat(decision.leaseStartedAt()).isNotNull();
     }
 
     @Test
-    void claimSubmission_returnsFalse_whenDuplicate() {
-        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
+    void claimSubmission_returnsCompleted_whenDuplicateAlreadyCompleted() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery)
+                .thenReturn(selectQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenReturn(0);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(0);
+        when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
+        when(selectQuery.getResultList()).thenReturn(List.of("completed"));
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
 
-        assertThat(claimed).isFalse();
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.COMPLETED);
     }
 
     @Test
-    void claimSubmission_returnsFalse_onConcurrentRace() {
-        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
+    void claimSubmission_returnsInProgress_whenDuplicateStillProcessing() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery)
+                .thenReturn(selectQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(0);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(0);
+        when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
+        when(selectQuery.getResultList()).thenReturn(List.of("processing"));
+
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
+
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.IN_PROGRESS);
+    }
+
+    @Test
+    void claimSubmission_reclaimsStaleProcessingLease() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(0);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(1);
+
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
+
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.CLAIMED);
+        verify(entityManager).createNativeQuery(contains("created_at < :staleBefore"));
+    }
+
+    @Test
+    void claimSubmission_returnsInProgress_onConcurrentRace() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery)
+                .thenReturn(selectQuery);
         when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
         when(insertQuery.executeUpdate()).thenThrow(
                 new DataIntegrityViolationException("duplicate key"));
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(0);
+        when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
+        when(selectQuery.getResultList()).thenReturn(List.of("processing"));
 
-        boolean claimed = idempotencyService.claimSubmission(submissionId, "pretest");
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
 
-        assertThat(claimed).isFalse();
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.IN_PROGRESS);
     }
 
     @Test
@@ -106,48 +165,30 @@ class IdempotencyServiceTest {
     }
 
     @Test
-    void claimSubmission_sameSubmissionDifferentPhase_isAllowed() {
-        // The two phases use distinct composite keys, so both can claim the same
-        // submissionId — exactly what the Phase 1 → Phase 2 promotion needs.
-        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
-        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
-        when(insertQuery.executeUpdate()).thenReturn(1);
-
-        boolean pretestClaim = idempotencyService.claimSubmission(submissionId, "pretest");
-        boolean systemClaim  = idempotencyService.claimSubmission(submissionId, "system");
-
-        assertThat(pretestClaim).isTrue();
-        assertThat(systemClaim).isTrue();
-        verify(insertQuery).setParameter("key", submissionId + ":pretest");
-        verify(insertQuery).setParameter("key", submissionId + ":system");
-    }
-
-    @Test
     void markCompleted_updatesStatusToCompleted() {
         when(entityManager.createNativeQuery(anyString())).thenReturn(updateQuery);
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
         when(updateQuery.executeUpdate()).thenReturn(1);
+        Instant leaseStartedAt = Instant.now();
 
-        idempotencyService.markCompleted(submissionId, "pretest");
+        boolean completed = idempotencyService.markCompleted(submissionId, "pretest", leaseStartedAt);
 
+        assertThat(completed).isTrue();
         verify(entityManager).createNativeQuery(argThat(sql ->
-                sql.contains("UPDATE") && sql.contains("completed")
+                sql.contains("UPDATE") && sql.contains("completed") && sql.contains("created_at")
         ));
         verify(updateQuery).setParameter("key", submissionId + ":pretest");
+        verify(updateQuery).setParameter("leaseStartedAt", leaseStartedAt);
     }
 
     @Test
-    void claimSubmission_duplicateDetectionPreventsDoubleExecution() {
-        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
-        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
-        when(insertQuery.executeUpdate())
-                .thenReturn(1)
-                .thenReturn(0);
+    void markCompleted_returnsFalseWhenLeaseWasLost() {
+        when(entityManager.createNativeQuery(anyString())).thenReturn(updateQuery);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(0);
 
-        boolean first  = idempotencyService.claimSubmission(submissionId, "pretest");
-        boolean second = idempotencyService.claimSubmission(submissionId, "pretest");
+        boolean completed = idempotencyService.markCompleted(submissionId, "pretest", Instant.now());
 
-        assertThat(first).isTrue();
-        assertThat(second).isFalse();
+        assertThat(completed).isFalse();
     }
 }

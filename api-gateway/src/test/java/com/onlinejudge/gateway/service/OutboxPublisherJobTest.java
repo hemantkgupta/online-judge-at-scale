@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.*;
@@ -53,6 +54,8 @@ class OutboxPublisherJobTest {
     void setUp() {
         ReflectionTestUtils.setField(outboxPublisherJob, "pretestTopic", "submissions.pretest");
         ReflectionTestUtils.setField(outboxPublisherJob, "batchSize", 50);
+        lenient().when(kafkaTemplate.send(anyString(), anyString(), any(byte[].class)))
+                .thenReturn(CompletableFuture.completedFuture(null));
     }
 
     private OutboxEvent createTestEvent(String userId) {
@@ -158,7 +161,7 @@ class OutboxPublisherJobTest {
         when(outboxEventRepository.findUnpublished(50)).thenReturn(List.of(event1, event2));
         // First event fails to publish
         when(kafkaTemplate.send(eq("submissions.pretest"), eq("user-1"), any(byte[].class)))
-                .thenThrow(new RuntimeException("Kafka unavailable"));
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("Kafka unavailable")));
 
         outboxPublisherJob.publishPendingEvents();
 

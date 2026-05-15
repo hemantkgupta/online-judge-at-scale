@@ -18,6 +18,8 @@ import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -135,7 +137,10 @@ class SubmissionServiceTest {
         assertThat(saved.getLanguage()).isEqualTo("python");
         assertThat(saved.getStatus()).isEqualTo("PENDING");
         assertThat(saved.getId()).isNotNull();
-        assertThat(saved.getS3CodeUrl()).startsWith("local://submissions/");
+        assertThat(saved.getS3CodeUrl()).startsWith("data:text/plain;charset=utf-8;base64,");
+        String encoded = saved.getS3CodeUrl().substring(saved.getS3CodeUrl().indexOf(',') + 1);
+        assertThat(new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8))
+                .isEqualTo(validRequest.getCode());
     }
 
     @Test
@@ -157,6 +162,7 @@ class SubmissionServiceTest {
         assertThat(payload.get("problemId").asText()).isEqualTo(validRequest.getProblemId());
         assertThat(payload.get("contestId").asText()).isEqualTo(validRequest.getContestId());
         assertThat(payload.get("language").asText()).isEqualTo("python");
+        assertThat(payload.get("s3CodeUrl").asText()).startsWith("data:text/plain;charset=utf-8;base64,");
         assertThat(payload.get("gatewayTsMs").asLong()).isGreaterThan(0);
         assertThat(payload.get("submissionId").asText()).isNotBlank();
     }

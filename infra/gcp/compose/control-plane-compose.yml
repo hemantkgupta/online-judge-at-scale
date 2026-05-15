@@ -1,0 +1,109 @@
+# =============================================================================
+# Control-plane VM compose stack.
+#
+# Runs on the oj-control-plane VM (10.0.0.2) and provides every regional
+# service that is NOT the execution-worker:
+#   * zookeeper :2181      (kafka coordinator)
+#   * kafka     :9092      (off-VM clients) + :29092 (in-VPC, internal)
+#   * cockroachdb :26257
+#   * redis     :6379
+#   * api-gateway :8088
+#
+# Stage 4's control-plane.sh startup script:
+#   1. installs Docker on the VM,
+#   2. authenticates docker to Artifact Registry,
+#   3. drops this file at /opt/oj/control-plane-compose.yml,
+#   4. drops an /opt/oj/.env with KAFKA_HOST_EXTERNAL=10.0.0.2 + AR_URL,
+#   5. systemd unit `oj-control-plane.service` runs `docker compose -f ... up -d`
+#      on every boot.
+#
+# Environment file (set by control-plane.sh):
+#   KAFKA_HOST_EXTERNAL     control-plane internal IP (e.g. 10.0.0.2)
+#   AR_URL                  Artifact Registry repo URL
+#   JWT_SECRET              32+ byte secret for api-gateway
+# =============================================================================
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: oj-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: oj-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"  # exposed on host's interface so the compute VM can reach it
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: one for in-VM clients (api-gateway via the docker
+      # network), one for off-VM clients (the compute VM via the host LAN IP).
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://${KAFKA_HOST_EXTERNAL:-127.0.0.1}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  cockroachdb:
+    # Same version we used on the Pi & Mac smoke tests so the schema
+    # migrations apply identically.
+    image: cockroachdb/cockroach:v24.1.10
+    container_name: oj-cockroachdb
+    restart: unless-stopped
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+      - "8080:8080"   # admin UI (web)
+    volumes:
+      - cockroachdb-data:/cockroach/cockroach-data
+      - ../../../database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  redis:
+    image: redis:7.2
+    container_name: oj-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  api-gateway:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/api-gateway:latest
+    container_name: oj-api-gateway
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - cockroachdb
+      - redis
+    ports:
+      - "8088:8088"
+    environment:
+      SERVER_PORT: 8088
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://cockroachdb:26257/defaultdb?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
+      APP_REGION: ${REGION:-asia-south1}
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  cockroachdb-data:
+  redis-data:

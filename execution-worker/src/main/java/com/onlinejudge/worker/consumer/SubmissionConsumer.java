@@ -18,6 +18,13 @@ import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
+import java.io.ByteArrayOutputStream;
+import java.time.Duration;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+
 /**
  * Execution worker: polls the regional Kafka submission topics and executes code.
  *
@@ -109,16 +116,24 @@ public class SubmissionConsumer {
             log.info("[worker:{}] Received submission={} user={} lang={} region={}",
                     phase, submissionId, userId, language, region);
 
-            // Idempotency check: skip if this submission was already processed FOR THIS PHASE.
-            if (!idempotencyService.claimSubmission(submissionId, phase)) {
+            // Idempotency check: ack only terminal completed duplicates. A fresh
+            // in-progress duplicate is left unacked so Kafka can redeliver it
+            // after the processing lease expires.
+            IdempotencyService.ClaimDecision claim =
+                    idempotencyService.claimSubmission(submissionId, phase);
+            if (claim.status() == IdempotencyService.ClaimStatus.COMPLETED) {
                 ack.acknowledge();
                 return;
             }
+            if (claim.status() == IdempotencyService.ClaimStatus.IN_PROGRESS) {
+                ack.nack(Duration.ofSeconds(5));
+                return;
+            }
 
-            String sampleCode  = getSampleCode(language);
+            String sourceCode  = resolveSourceCode(event.getS3CodeUrl());
             String sampleInput = "5\n3 1 4 1 5";
             DockerExecutionService.ExecutionResult result =
-                    executionService.execute(submissionId, language, sampleCode, sampleInput);
+                    executionService.execute(submissionId, language, sourceCode, sampleInput);
 
             String verdict = determineVerdict(result, 2000);
             int points = verdict.equals("ACCEPTED") ? 100 : 0;
@@ -141,7 +156,7 @@ public class SubmissionConsumer {
                     .setRegion(region)
                     .setEventTsMs(gatewayTsMs)
                     .build();
-            kafkaTemplate.send(evaluatedResultsTopic, userId, verdictEvent.toByteArray());
+            sendAndWait(evaluatedResultsTopic, userId, verdictEvent.toByteArray());
 
             // Analytics (fire-and-forget, separate consumer group).
             AnalyticsEvent analyticsEvent = AnalyticsEvent.newBuilder()
@@ -165,18 +180,20 @@ public class SubmissionConsumer {
             // in tracing/logs even before the consumer's own phase label kicks in.
             if (phase.equals(PHASE_PRETEST) && verdict.equals("ACCEPTED")) {
                 SubmissionEvent system = event.toBuilder().setPhase(PHASE_SYSTEM).build();
-                kafkaTemplate.send(systemTestTopic, userId, system.toByteArray());
+                sendAndWait(systemTestTopic, userId, system.toByteArray());
                 log.info("[worker:pretest] Submission {} accepted; enqueued to {} for Phase 2",
                         submissionId, systemTestTopic);
             }
 
-            idempotencyService.markCompleted(submissionId, phase);
+            if (!idempotencyService.markCompleted(submissionId, phase, claim.leaseStartedAt())) {
+                throw new IllegalStateException("Lost idempotency claim before completion");
+            }
             ack.acknowledge();
 
         } catch (Exception ex) {
             log.error("[worker:{}] Error processing submission={}: {}",
                     phase, submissionId, ex.getMessage(), ex);
-            // Do NOT ack — Kafka will redeliver. Idempotency key prevents double execution.
+            ack.nack(Duration.ofSeconds(5));
         }
     }
 
@@ -235,12 +252,73 @@ public class SubmissionConsumer {
         };
     }
 
-    // Placeholder: real worker fetches code from S3/R2 using s3CodeUrl from event
-    private String getSampleCode(String language) {
-        return switch (language) {
-            case "python" -> "import sys\ndata = sys.stdin.read().split()\nprint(sum(int(x) for x in data[1:]))";
-            case "java"   -> "import java.util.*; public class Solution { public static void main(String[] a) { Scanner sc = new Scanner(System.in); int n=sc.nextInt(); long s=0; for(int i=0;i<n;i++) s+=sc.nextInt(); System.out.println(s); } }";
-            default       -> "print(42)";
-        };
+    String resolveSourceCode(String s3CodeUrl) {
+        if (s3CodeUrl == null || s3CodeUrl.isBlank()) {
+            throw new IllegalArgumentException("SubmissionEvent.s3CodeUrl is required");
+        }
+
+        if (s3CodeUrl.startsWith("data:")) {
+            return decodeDataUrl(s3CodeUrl);
+        }
+
+        String lower = s3CodeUrl.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("s3://") || lower.startsWith("r2://") ||
+                lower.startsWith("gs://") || lower.startsWith("http://") ||
+                lower.startsWith("https://")) {
+            throw new UnsupportedOperationException(
+                    "TODO: object-store code fetch is not wired in execution-worker yet");
+        }
+
+        if (lower.startsWith("local://")) {
+            throw new UnsupportedOperationException(
+                    "local:// code URLs do not embed source; local mode must emit data: URLs");
+        }
+
+        throw new UnsupportedOperationException("Unsupported code URL scheme");
+    }
+
+    private static String decodeDataUrl(String dataUrl) {
+        int comma = dataUrl.indexOf(',');
+        if (comma < 0) {
+            throw new IllegalArgumentException("Malformed data URL: missing comma separator");
+        }
+
+        String metadata = dataUrl.substring(5, comma).toLowerCase(Locale.ROOT);
+        String payload = dataUrl.substring(comma + 1);
+        if (metadata.contains(";base64")) {
+            try {
+                return new String(Base64.getDecoder().decode(payload), StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException ex) {
+                throw new IllegalArgumentException("Malformed data URL: invalid base64 payload", ex);
+            }
+        }
+
+        return percentDecode(payload);
+    }
+
+    private static String percentDecode(String payload) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(payload.length());
+        for (int i = 0; i < payload.length(); i++) {
+            char c = payload.charAt(i);
+            if (c == '%') {
+                if (i + 2 >= payload.length()) {
+                    throw new IllegalArgumentException("Malformed data URL: incomplete percent escape");
+                }
+                int hi = Character.digit(payload.charAt(i + 1), 16);
+                int lo = Character.digit(payload.charAt(i + 2), 16);
+                if (hi < 0 || lo < 0) {
+                    throw new IllegalArgumentException("Malformed data URL: invalid percent escape");
+                }
+                out.write((hi << 4) + lo);
+                i += 2;
+            } else {
+                out.writeBytes(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        return out.toString(StandardCharsets.UTF_8);
+    }
+
+    private void sendAndWait(String topic, String key, byte[] payload) throws Exception {
+        kafkaTemplate.send(topic, key, payload).get(10, TimeUnit.SECONDS);
     }
 }

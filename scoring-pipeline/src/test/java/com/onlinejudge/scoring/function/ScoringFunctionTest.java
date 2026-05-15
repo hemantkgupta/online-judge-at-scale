@@ -47,8 +47,13 @@ class ScoringFunctionTest {
     /** Test helper: apply an event via the real Scorer and capture any emit. */
     private void processEvent(String userId, String problemId, String contestId,
                               String result, int points, long gatewayTsMs) {
+        processEvent(userId, problemId, contestId, result, points, gatewayTsMs, "system");
+    }
+
+    private void processEvent(String userId, String problemId, String contestId,
+                              String result, int points, long gatewayTsMs, String phase) {
         Optional<ScoreUpdate> update = Scorer.apply(
-                state, userId, contestId, problemId, result, points, gatewayTsMs);
+                state, userId, contestId, problemId, result, points, gatewayTsMs, phase);
         update.ifPresent(emitted::add);
     }
 
@@ -146,6 +151,45 @@ class ScoringFunctionTest {
         // the Scorer just takes the contestId argument verbatim.
         processEvent("user-1", "prob-1", "global", "ACCEPTED", 100, 1000L);
         assertThat(emitted.get(0).contestId()).isEqualTo("global");
+    }
+
+    @Test
+    void pretestAccepted_isIgnoredForLeaderboard() {
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L, "pretest");
+
+        assertThat(emitted).isEmpty();
+        assertThat(state.totalScore).isZero();
+        assertThat(state.totalPenaltyMinutes).isZero();
+        assertThat(state.problems).isEmpty();
+    }
+
+    @Test
+    void pretestAcceptedThenSystemWrong_doesNotLeaveProvisionalScore() {
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L, "pretest");
+        processEvent("user-1", "prob-1", "contest-1", "WRONG_ANSWER", 0, 2000L, "system");
+
+        assertThat(emitted).isEmpty();
+        assertThat(state.totalScore).isZero();
+        assertThat(state.totalPenaltyMinutes).isZero();
+        assertThat(state.problems.get("prob-1").wrongAttemptTimes).containsExactly(2000L);
+    }
+
+    @Test
+    void systemAccepted_scoresAfterIgnoredPretestAccepted() {
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L, "pretest");
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 2000L, "system");
+
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).totalScore()).isEqualTo(100);
+        assertThat(state.problems.get("prob-1").acceptedAtMs).isEqualTo(2000L);
+    }
+
+    @Test
+    void finalPhase_isScoreable() {
+        processEvent("user-1", "prob-1", "contest-1", "ACCEPTED", 100, 1000L, "final");
+
+        assertThat(emitted).hasSize(1);
+        assertThat(emitted.get(0).totalScore()).isEqualTo(100);
     }
 
     @Test

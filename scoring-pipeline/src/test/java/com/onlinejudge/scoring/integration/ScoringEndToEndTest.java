@@ -126,6 +126,15 @@ class ScoringEndToEndTest {
     }
 
     @Test
+    void pretestAccepted_thenSystemFailure_doesNotReachFinalLeaderboard() throws Exception {
+        processVerdict("user-1", "prob-1", "ACCEPTED", 100, 1000, "pretest");
+        processVerdict("user-1", "prob-1", "WRONG_ANSWER", 0, 2000, "system");
+
+        assertThat(allUpdates).isEmpty();
+        assertFinalScore("user-1", 0, 0);
+    }
+
+    @Test
     void multiUser_isolation() throws Exception {
         // Users process verdicts interleaved
         processVerdict("user-a", "prob-1", "WRONG_ANSWER", 0, 1000);
@@ -171,9 +180,14 @@ class ScoringEndToEndTest {
 
     private void processVerdict(String userId, String problemId, String result,
                                  int points, long gatewayTsMs) {
+        processVerdict(userId, problemId, result, points, gatewayTsMs, "system");
+    }
+
+    private void processVerdict(String userId, String problemId, String result,
+                                int points, long gatewayTsMs, String phase) {
         ScoringState state = userStates.computeIfAbsent(userId, k -> new ScoringState());
         com.onlinejudge.scoring.function.Scorer
-                .apply(state, userId, "contest-1", problemId, result, points, gatewayTsMs)
+                .apply(state, userId, "contest-1", problemId, result, points, gatewayTsMs, phase)
                 .ifPresent(allUpdates::add);
     }
 

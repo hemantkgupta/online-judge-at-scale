@@ -14,8 +14,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * ExecutionResult record carries correct fields.
  *
  * Note: These tests exercise the service's logic without actually running Docker.
- * They validate the internal behavior of execute(), languageExtension(), and
- * the ExecutionResult record structure. Integration tests that run Docker
+ * They validate the internal behavior of execute(), Docker argv construction,
+ * and the ExecutionResult record structure. Integration tests that run Docker
  * containers require Docker to be available on the test machine.
  */
 class DockerExecutionServiceTest {
@@ -133,5 +133,23 @@ class DockerExecutionServiceTest {
 
         assertThat(cmd).contains("--memory", "--cpus", "--pids-limit",
                 "--network", "none", "--read-only", "--rm");
+    }
+
+    @Test
+    void buildDockerCommand_javaCompilesIntoWritableTmpAndPassesShellCommandSeparately() {
+        var cmd = executionService.buildDockerCommand("openjdk:21-slim", "java", "/tmp/x");
+
+        assertThat(cmd).containsSubsequence("openjdk:21-slim", "sh", "-c",
+                "javac -d /tmp /code/Solution.java && java -cp /tmp Solution");
+        assertThat(cmd).noneMatch(arg -> arg.contains("-c javac"));
+    }
+
+    @Test
+    void buildDockerCommand_cppCompilesIntoWritableTmp() {
+        var cmd = executionService.buildDockerCommand("gcc:13", "cpp", "/tmp/x");
+
+        assertThat(cmd).containsSubsequence("gcc:13", "sh", "-c",
+                "g++ -O2 -pipe -o /tmp/a.out /code/solution.cpp && /tmp/a.out");
+        assertThat(cmd).doesNotContain("/code/a.out");
     }
 }

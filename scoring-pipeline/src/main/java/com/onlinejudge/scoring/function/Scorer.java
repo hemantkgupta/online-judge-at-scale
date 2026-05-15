@@ -5,6 +5,7 @@ import com.onlinejudge.scoring.model.ScoreUpdate;
 import com.onlinejudge.scoring.model.ScoringState;
 import com.onlinejudge.scoring.util.ScoreEncoder;
 
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 
@@ -43,6 +44,8 @@ public class Scorer {
 
     private static final Set<String> WRONG_VERDICTS =
             Set.of("WRONG_ANSWER", "RUNTIME_ERROR", "TIME_LIMIT_EXCEEDED");
+    private static final Set<String> SCOREABLE_PHASES =
+            Set.of("system", "final");
 
     /**
      * Applies a verdict event to the user's scoring state, mutating it in place.
@@ -57,6 +60,43 @@ public class Scorer {
                                               String result,
                                               int points,
                                               long gatewayTsMs) {
+        return applyScoreable(state, userId, contestId, problemId, result, points, gatewayTsMs);
+    }
+
+    /**
+     * Applies a verdict only when it belongs to a phase that should affect the
+     * leaderboard. Pretest verdicts are intentionally ignored: a pretest
+     * ACCEPTED is provisional and must not become final score if the later
+     * system-test verdict fails.
+     */
+    public static Optional<ScoreUpdate> apply(ScoringState state,
+                                              String userId,
+                                              String contestId,
+                                              String problemId,
+                                              String result,
+                                              int points,
+                                              long eventTsMs,
+                                              String phase) {
+        if (!isScoreablePhase(phase)) {
+            return Optional.empty();
+        }
+        return applyScoreable(state, userId, contestId, problemId, result, points, eventTsMs);
+    }
+
+    public static boolean isScoreablePhase(String phase) {
+        if (phase == null) {
+            return false;
+        }
+        return SCOREABLE_PHASES.contains(phase.trim().toLowerCase(Locale.ROOT));
+    }
+
+    private static Optional<ScoreUpdate> applyScoreable(ScoringState state,
+                                                        String userId,
+                                                        String contestId,
+                                                        String problemId,
+                                                        String result,
+                                                        int points,
+                                                        long eventTsMs) {
 
         ProblemScoreState p = state.problems.computeIfAbsent(problemId, k -> new ProblemScoreState());
 
@@ -64,15 +104,15 @@ public class Scorer {
         int oldPenalty = p.currentPenaltyMinutes();
 
         if ("ACCEPTED".equals(result)) {
-            if (gatewayTsMs < p.acceptedAtMs) {
+            if (eventTsMs < p.acceptedAtMs) {
                 // First or earlier acceptance — record it.
-                p.acceptedAtMs = gatewayTsMs;
+                p.acceptedAtMs = eventTsMs;
                 p.points = points;
             }
         } else if (WRONG_VERDICTS.contains(result)) {
             // Always record the WA event-time. Penalty recomputation handles whether
             // it falls before the accepted time.
-            p.wrongAttemptTimes.add(gatewayTsMs);
+            p.wrongAttemptTimes.add(eventTsMs);
         }
 
         int newPoints  = p.contributedPoints();
@@ -92,6 +132,6 @@ public class Scorer {
         return Optional.of(new ScoreUpdate(
                 userId, contestId,
                 state.totalScore, state.totalPenaltyMinutes,
-                zsetScore, gatewayTsMs));
+                zsetScore, eventTsMs));
     }
 }

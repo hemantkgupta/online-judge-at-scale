@@ -1,0 +1,19 @@
+# Copy this file to `terraform.tfvars` (which is gitignored) and override
+# whatever you need. Defaults from variables.tf match the blog-grade setup:
+# Mumbai region, e2-medium control-plane, n2-standard-2 spot compute,
+# 25 GB disks, auto-shutdown at 23:00 IST.
+
+project_id          = "online-judge-hk"
+region              = "asia-south1"
+zone                = "asia-south1-a"
+ssh_user            = "hemant"
+ssh_public_key_path = "~/.ssh/id_rsa.pub"
+
+# Cost-knob overrides (uncomment to change defaults)
+# compute_use_spot           = false              # turn off if preemption is annoying
+# compute_machine_type       = "n2-standard-4"    # bigger compute box
+# control_plane_machine_type = "e2-small"         # smaller control plane (1 vCPU / 2 GB)
+# disk_size_gb               = 50                 # larger boot disk
+
+# auto_shutdown_cron     = "0 22 * * *"           # 10 PM IST instead of 11 PM
+# auto_shutdown_timezone = "Asia/Kolkata"

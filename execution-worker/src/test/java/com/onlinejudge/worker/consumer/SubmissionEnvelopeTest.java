@@ -4,7 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.common.events.Events.SubmissionEvent;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for {@link SubmissionConsumer#parseSubmissionEvent} — the small adapter that
@@ -80,5 +84,21 @@ class SubmissionEnvelopeTest {
         assertThat(decoded.getSubmissionId()).isEqualTo("sub-bare");
         assertThat(decoded.getUserId()).isEqualTo("u-bare");
         assertThat(decoded.getRegion()).isEqualTo("ap-south-1");
+    }
+
+    @Test
+    void dataUrlSourceCode_isDecoded() {
+        String source = "print(42)\n";
+        String dataUrl = "data:text/plain;charset=utf-8;base64," +
+                Base64.getEncoder().encodeToString(source.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(consumer.resolveSourceCode(dataUrl)).isEqualTo(source);
+    }
+
+    @Test
+    void localUrlWithoutEmbeddedSource_isRejected() {
+        assertThatThrownBy(() -> consumer.resolveSourceCode("local://submissions/1/code"))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("data: URLs");
     }
 }

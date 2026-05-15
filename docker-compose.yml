@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
 
   zookeeper:
@@ -121,7 +119,7 @@ services:
     command: start-single-node --insecure
     ports:
       - "26257:26257"
-      - "8080:8080"
+      - "18080:8080"
     volumes:
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
 
@@ -140,12 +138,19 @@ services:
   # Flink cluster for scoring-pipeline job
   jobmanager:
     image: flink:1.18-java17
+    depends_on:
+      - kafka-global
+      - redis
     ports:
-      - "8081:8081"
+      - "18081:8081"
     command: jobmanager
     environment:
-      - |
-        FLINK_PROPERTIES=
+      KAFKA_BOOTSTRAP_SERVERS: kafka-global:29093
+      SCORING_INPUT_TOPIC: regional.evaluated_results
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CHECKPOINT_DIR: file:///tmp/flink-checkpoints
+      FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         state.backend: filesystem
         state.checkpoints.dir: file:///tmp/flink-checkpoints
@@ -154,10 +159,16 @@ services:
     image: flink:1.18-java17
     depends_on:
       - jobmanager
+      - kafka-global
+      - redis
     command: taskmanager
     environment:
-      - |
-        FLINK_PROPERTIES=
+      KAFKA_BOOTSTRAP_SERVERS: kafka-global:29093
+      SCORING_INPUT_TOPIC: regional.evaluated_results
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CHECKPOINT_DIR: file:///tmp/flink-checkpoints
+      FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 4
         state.backend: filesystem

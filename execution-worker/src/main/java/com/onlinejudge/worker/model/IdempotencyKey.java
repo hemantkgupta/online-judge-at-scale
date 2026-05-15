@@ -23,6 +23,6 @@ public class IdempotencyKey {
     @Column(nullable = false, length = 32)
     private String status;
 
-    @Column(name = "created_at", nullable = false, updatable = false)
+    @Column(name = "created_at", nullable = false)
     private Instant createdAt = Instant.now();
 }

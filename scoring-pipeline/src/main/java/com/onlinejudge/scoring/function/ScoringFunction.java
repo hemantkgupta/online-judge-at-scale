@@ -60,7 +60,14 @@ public class ScoringFunction extends KeyedProcessFunction<String, byte[], ScoreU
         String contestId = event.getContestId().isEmpty() ? "global" : event.getContestId();
         String result    = event.getResult();
         int    points    = event.getPoints();
-        long   gatewayTs = event.getGatewayTsMs();
+        String phase     = event.getPhase();
+        long   eventTs   = event.getEventTsMs() > 0 ? event.getEventTsMs() : event.getGatewayTsMs();
+
+        if (!Scorer.isScoreablePhase(phase)) {
+            log.debug("[scoring] ignored non-scoreable verdict submission={} user={} contest={} problem={} phase={} result={}",
+                    event.getSubmissionId(), userId, contestId, problemId, phase, result);
+            return;
+        }
 
         ScoringState state = scoringState.value();
         if (state == null) {
@@ -68,7 +75,7 @@ public class ScoringFunction extends KeyedProcessFunction<String, byte[], ScoreU
         }
 
         Optional<ScoreUpdate> update =
-                Scorer.apply(state, userId, contestId, problemId, result, points, gatewayTs);
+                Scorer.apply(state, userId, contestId, problemId, result, points, eventTs, phase);
 
         // Always persist — wrong-attempt times for not-yet-accepted problems
         // are recorded even when no ScoreUpdate is emitted.

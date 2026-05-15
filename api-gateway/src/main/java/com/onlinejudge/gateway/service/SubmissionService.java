@@ -12,6 +12,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -90,7 +92,8 @@ public class SubmissionService {
      * Locally: store code inline as a data-URI so we don't need an object store.
      */
     private String storeCode(UUID submissionId, String code) {
-        return "local://submissions/" + submissionId + "/code";
+        byte[] bytes = (code == null ? "" : code).getBytes(StandardCharsets.UTF_8);
+        return "data:text/plain;charset=utf-8;base64," + Base64.getEncoder().encodeToString(bytes);
         // Production: s3Client.putObject(bucket, key, code); return "s3://bucket/key";
     }
 }

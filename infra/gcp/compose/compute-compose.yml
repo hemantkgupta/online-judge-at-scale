@@ -1,0 +1,64 @@
+# =============================================================================
+# Compute VM compose stack.
+#
+# Runs on the oj-compute VM (n2-standard-2 SPOT, nested-virt enabled). Hosts
+# exactly one service — the execution-worker — but the container needs
+# enough access to spawn sibling sandbox processes on the host:
+#
+#   * `/var/run/docker.sock` mount  → DockerExecutionService can call
+#                                     `docker run` to start contestant
+#                                     containers (Docker backend / gVisor
+#                                     when `--runtime=runsc` is set).
+#   * `/dev/kvm` device             → FirecrackerExecutionService can open it.
+#   * `/usr/local/bin/firecracker`  → mounted read-only so the worker can
+#                                     exec the host's firecracker binary.
+#   * `/var/lib/firecracker/`       → vmlinux + rootfs the host provisions
+#                                     during the Stage 4 startup script.
+#   * `/tmp`                        → per-submission FC API sockets land
+#                                     here (matches app.sandbox.firecracker
+#                                     .api-sock-dir default).
+#
+# All three backends — docker / firecracker / gvisor — are reachable just
+# by setting APP_SANDBOX_BACKEND + APP_SANDBOX_DOCKER_RUNTIME in the
+# environment. No image rebuild required.
+#
+# Environment file (set by compute.sh):
+#   AR_URL                       Artifact Registry repo URL
+#   CONTROL_PLANE_IP             internal IP of oj-control-plane (10.0.0.2)
+#   APP_SANDBOX_BACKEND          docker | firecracker  (default docker)
+#   APP_SANDBOX_DOCKER_RUNTIME   runc | runsc          (default runc; runsc = gVisor)
+#   APP_SANDBOX_LINUX_HARDENING_ENABLED  true | false  (Seccomp-BPF + caps + cgroupns)
+# =============================================================================
+
+services:
+  execution-worker:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
+    container_name: oj-execution-worker
+    restart: unless-stopped
+    privileged: true             # required for /dev/kvm + nested cgroups
+    devices:
+      - /dev/kvm:/dev/kvm
+    volumes:
+      # sibling-container access — the worker spawns Docker children on the host
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Firecracker binary + artifacts (provisioned by compute.sh startup)
+      - /usr/local/bin/firecracker:/usr/local/bin/firecracker:ro
+      - /var/lib/firecracker:/var/lib/firecracker:ro
+      # per-submission FC API sockets
+      - /tmp:/tmp
+      # Seccomp-BPF profile for the Linux-hardening Docker backend
+      - /etc/seccomp:/etc/seccomp:ro
+    environment:
+      # Kafka + DB live on the control-plane VM in the same VPC.
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: ${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:26257/defaultdb?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      # Backend selection. Default to docker; flip to firecracker by editing
+      # /opt/oj/.env and `docker compose up -d` again.
+      APP_SANDBOX_BACKEND:                   ${APP_SANDBOX_BACKEND:-docker}
+      APP_SANDBOX_DOCKER_RUNTIME:            ${APP_SANDBOX_DOCKER_RUNTIME:-runc}
+      APP_SANDBOX_LINUX_HARDENING_ENABLED:   ${APP_SANDBOX_LINUX_HARDENING_ENABLED:-false}
+      APP_SANDBOX_FIRECRACKER_API_SOCK_DIR:  /tmp
+      APP_SANDBOX_FIRECRACKER_KERNEL_IMAGE:  /var/lib/firecracker/vmlinux
+      APP_SANDBOX_FIRECRACKER_ROOTFS_IMAGE:  /var/lib/firecracker/rootfs.ext4
+      APP_REGION:                            ${REGION:-asia-south1}

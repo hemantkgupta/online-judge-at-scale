@@ -1,5 +1,6 @@
 package com.onlinejudge.gateway.controller;
 
+import com.onlinejudge.gateway.security.IdempotencyFilter;
 import com.onlinejudge.gateway.service.RateLimitService;
 import com.onlinejudge.gateway.service.RegionResolver;
 import com.onlinejudge.gateway.service.SubmissionService;
@@ -38,6 +39,7 @@ class SubmissionControllerVerdictTest {
     @Mock private RateLimitService rateLimitService;
     @Mock private StringRedisTemplate redisTemplate;
     @Mock private ValueOperations<String, String> valueOps;
+    @Mock private IdempotencyFilter idempotencyFilter;
 
     private SubmissionController controller;
 
@@ -45,7 +47,7 @@ class SubmissionControllerVerdictTest {
     void setUp() {
         controller = new SubmissionController(
                 submissionService, rateLimitService, redisTemplate,
-                new RegionResolver("us-east-1"));
+                new RegionResolver("us-east-1"), idempotencyFilter);
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
     }
 

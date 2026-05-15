@@ -1,0 +1,18 @@
+# OpenTofu / Terraform local state and operator-specific overrides.
+# Never commit any of these — they contain cloud resource IDs, IP addresses,
+# and (potentially) credentials.
+
+.terraform/
+.terraform.lock.hcl
+
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+
+# Operator's local overrides — the .example file is committed instead.
+terraform.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Plan output is sometimes saved to a file for `apply` later; treat as private.
+*.tfplan

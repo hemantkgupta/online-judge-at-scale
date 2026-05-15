@@ -15,6 +15,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Poll-based Transactional Outbox publisher (development substitute for CDC).
@@ -83,8 +84,10 @@ public class OutboxPublisherJob {
                         .build()
                         .toByteArray();
 
-                // Key by userId for partition ordering guarantee
-                kafkaTemplate.send(pretestTopic, userId, protoBytes);
+                // Key by userId for partition ordering guarantee. Wait for the
+                // broker ack before marking the outbox row as published.
+                kafkaTemplate.send(pretestTopic, userId, protoBytes)
+                        .get(10, TimeUnit.SECONDS);
 
                 event.setPublished(true);
                 outboxEventRepository.save(event);

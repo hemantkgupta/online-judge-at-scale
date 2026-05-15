@@ -6,7 +6,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
-import java.util.Optional;
 
 /**
  * Client-side idempotency guard at the HTTP boundary.
@@ -41,19 +40,42 @@ public class IdempotencyFilter {
     private final StringRedisTemplate redisTemplate;
 
     private static final String KEY_PREFIX = "idempotency:";
+    private static final String PENDING_VALUE = "pending";
+    private static final String COMPLETED_PREFIX = "completed:";
     private static final Duration KEY_TTL = Duration.ofHours(24);
+
+    public enum ClaimStatus {
+        PROCEED,
+        IN_PROGRESS,
+        COMPLETED
+    }
+
+    public record ClaimResult(ClaimStatus status, String submissionId, long gatewayTsMs) {
+        public static ClaimResult proceed() {
+            return new ClaimResult(ClaimStatus.PROCEED, null, 0L);
+        }
+
+        public static ClaimResult inProgress() {
+            return new ClaimResult(ClaimStatus.IN_PROGRESS, null, 0L);
+        }
+
+        public static ClaimResult completed(String submissionId, long gatewayTsMs) {
+            return new ClaimResult(ClaimStatus.COMPLETED, submissionId, gatewayTsMs);
+        }
+    }
 
     /**
      * Checks if an idempotency key has already been used.
-     * If yes, returns the original submission ID.
-     * If no, claims the key atomically and returns empty.
+     * If completed, returns the original submission ID.
+     * If in progress, tells the caller not to create another submission.
+     * If absent, claims the key atomically and allows the caller to proceed.
      *
      * @param idempotencyKey the client-provided UUID
-     * @return the existing submission ID if this is a retry, or empty if first request
+     * @return the claim state for this request
      */
-    public Optional<String> checkAndClaim(String idempotencyKey) {
+    public ClaimResult checkAndClaim(String idempotencyKey) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
-            return Optional.empty(); // No idempotency key → proceed normally
+            return ClaimResult.proceed(); // No idempotency key -> proceed normally
         }
 
         String key = KEY_PREFIX + idempotencyKey;
@@ -63,32 +85,70 @@ public class IdempotencyFilter {
         if (existing != null) {
             log.info("[idempotency] Duplicate request detected: key={} existing={}",
                     idempotencyKey, existing);
-            return Optional.of(existing);
+            return resultFor(existing);
         }
 
         // Not found — claim it atomically with setIfAbsent (NX + EX)
         Boolean claimed = redisTemplate.opsForValue()
-                .setIfAbsent(key, "pending", KEY_TTL);
+                .setIfAbsent(key, PENDING_VALUE, KEY_TTL);
+
+        if (Boolean.TRUE.equals(claimed)) {
+            return ClaimResult.proceed(); // First request — proceed with submission
+        }
 
         if (Boolean.FALSE.equals(claimed)) {
             // Race condition: another request claimed it between our GET and SETNX
             String raceWinner = redisTemplate.opsForValue().get(key);
-            if (raceWinner != null && !"pending".equals(raceWinner)) {
-                return Optional.of(raceWinner);
+            if (raceWinner != null) {
+                return resultFor(raceWinner);
             }
         }
 
-        return Optional.empty(); // First request — proceed with submission
+        return ClaimResult.inProgress();
     }
 
     /**
      * Records the submission ID for an idempotency key after the submission succeeds.
      * Future retries with the same key will get this submission ID.
      */
-    public void recordSubmission(String idempotencyKey, String submissionId) {
+    public void recordSubmission(String idempotencyKey, String submissionId, long gatewayTsMs) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) return;
 
         String key = KEY_PREFIX + idempotencyKey;
-        redisTemplate.opsForValue().set(key, submissionId, KEY_TTL);
+        redisTemplate.opsForValue().set(key, COMPLETED_PREFIX + submissionId + ":" + gatewayTsMs, KEY_TTL);
+    }
+
+    public void recordSubmission(String idempotencyKey, String submissionId) {
+        recordSubmission(idempotencyKey, submissionId, 0L);
+    }
+
+    /**
+     * Releases a pending claim when the request fails before a submission is created.
+     */
+    public void releaseClaim(String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) return;
+
+        String key = KEY_PREFIX + idempotencyKey;
+        String existing = redisTemplate.opsForValue().get(key);
+        if (PENDING_VALUE.equals(existing)) {
+            redisTemplate.delete(key);
+        }
+    }
+
+    private static ClaimResult resultFor(String value) {
+        if (PENDING_VALUE.equals(value)) {
+            return ClaimResult.inProgress();
+        }
+        if (value.startsWith(COMPLETED_PREFIX)) {
+            String[] parts = value.split(":", 3);
+            if (parts.length == 3) {
+                try {
+                    return ClaimResult.completed(parts[1], Long.parseLong(parts[2]));
+                } catch (NumberFormatException ignored) {
+                    return ClaimResult.completed(parts[1], 0L);
+                }
+            }
+        }
+        return ClaimResult.completed(value, 0L);
     }
 }

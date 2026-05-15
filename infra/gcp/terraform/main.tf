@@ -1,0 +1,288 @@
+# =============================================================================
+# Online Judge — GCP deployment substrate.
+#
+# Provisions, in stopped state:
+#   * A custom VPC + subnet (asia-south1 by default)
+#   * Firewall rules: IAP SSH (no public IPs) + internal traffic between VMs
+#   * Artifact Registry repository for the service Docker images
+#   * Two service accounts (one per VM, AR-reader scoped)
+#   * Two VMs:
+#       - oj-control-plane: e2-medium, runs Kafka/CRDB/Redis/api-gateway in
+#         docker-compose
+#       - oj-compute:       n2-standard-2 spot, nested virt enabled, runs
+#         the execution-worker with Firecracker / Docker / gVisor backends
+#   * A scheduler service account
+#   * Two Cloud Scheduler jobs that stop the VMs at 23:00 IST daily
+#
+# All Stage-2 resources are infrastructural only. Docker images and startup
+# scripts come in Stages 3 + 4.
+# =============================================================================
+
+# ---------- VPC + subnet ----------------------------------------------------
+
+resource "google_compute_network" "oj_vpc" {
+  name                    = "oj-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+}
+
+resource "google_compute_subnetwork" "oj_subnet" {
+  name          = "oj-subnet"
+  ip_cidr_range = "10.0.0.0/24"
+  region        = var.region
+  network       = google_compute_network.oj_vpc.id
+
+  # Lets Cloud NAT / Identity-Aware Proxy reach the VMs without exposing
+  # public IPs. Logging stays off (free) since this is a dev-grade setup.
+  private_ip_google_access = true
+}
+
+# ---------- Firewall rules --------------------------------------------------
+
+# Allow Identity-Aware Proxy to SSH into both VMs. Source range is the fixed
+# block GCP publishes for IAP TCP forwarding; no public IP needed on the VMs.
+resource "google_compute_firewall" "allow_iap_ssh" {
+  name      = "oj-allow-iap-ssh"
+  network   = google_compute_network.oj_vpc.id
+  direction = "INGRESS"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["35.235.240.0/20"] # IAP TCP forwarding range
+  target_tags   = ["oj-vm"]
+}
+
+# Allow all intra-VPC traffic so the compute VM can reach Kafka :9092,
+# CockroachDB :26257, Redis :6379 on the control-plane VM.
+resource "google_compute_firewall" "allow_internal" {
+  name      = "oj-allow-internal"
+  network   = google_compute_network.oj_vpc.id
+  direction = "INGRESS"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/24"]
+  target_tags   = ["oj-vm"]
+}
+
+# ---------- Artifact Registry ----------------------------------------------
+
+resource "google_artifact_registry_repository" "oj_images" {
+  location      = var.region
+  repository_id = var.artifact_repo_name
+  format        = "DOCKER"
+  description   = "Docker images for online-judge services (api-gateway, execution-worker, etc.)"
+}
+
+# ---------- VM service accounts --------------------------------------------
+
+resource "google_service_account" "control_plane_sa" {
+  account_id   = "oj-control-plane"
+  display_name = "Online Judge — control-plane VM"
+}
+
+resource "google_service_account" "compute_sa" {
+  account_id   = "oj-compute"
+  display_name = "Online Judge — compute VM (Firecracker / gVisor)"
+}
+
+# Both VMs need to pull from Artifact Registry.
+resource "google_artifact_registry_repository_iam_member" "control_plane_ar_reader" {
+  location   = google_artifact_registry_repository.oj_images.location
+  repository = google_artifact_registry_repository.oj_images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.control_plane_sa.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "compute_ar_reader" {
+  location   = google_artifact_registry_repository.oj_images.location
+  repository = google_artifact_registry_repository.oj_images.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.compute_sa.email}"
+}
+
+# Both VMs write logs to Cloud Logging (free up to 50 GiB/mo).
+resource "google_project_iam_member" "control_plane_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
+}
+
+resource "google_project_iam_member" "compute_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.compute_sa.email}"
+}
+
+# ---------- SSH key injection ----------------------------------------------
+
+locals {
+  ssh_key_entry = "${var.ssh_user}:${file(pathexpand(var.ssh_public_key_path))}"
+}
+
+# ---------- Control-plane VM ------------------------------------------------
+
+resource "google_compute_instance" "control_plane" {
+  name           = "oj-control-plane"
+  machine_type   = var.control_plane_machine_type
+  zone           = var.zone
+  desired_status = "TERMINATED" # provisioned in stopped state — `up.sh` starts it
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = var.disk_size_gb
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.oj_subnet.id
+    # No access_config block → no public IP. SSH happens via IAP tunnel.
+  }
+
+  service_account {
+    email  = google_service_account.control_plane_sa.email
+    scopes = ["cloud-platform"]
+  }
+
+  metadata = {
+    ssh-keys           = local.ssh_key_entry
+    enable-oslogin     = "FALSE" # we use injected SSH keys for parity with the Pi setup
+    block-project-ssh-keys = "TRUE" # only the key we put here is accepted
+  }
+
+  tags = ["oj-vm", "oj-control-plane"]
+
+  allow_stopping_for_update = true
+
+  # Stage 4 will set metadata.startup-script. Until then the VM boots blank.
+  lifecycle {
+    ignore_changes = [
+      metadata["startup-script"],
+    ]
+  }
+}
+
+# ---------- Compute VM (nested-virt + spot) ---------------------------------
+
+resource "google_compute_instance" "compute" {
+  name           = "oj-compute"
+  machine_type   = var.compute_machine_type
+  zone           = var.zone
+  desired_status = "TERMINATED"
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = var.disk_size_gb
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.oj_subnet.id
+  }
+
+  service_account {
+    email  = google_service_account.compute_sa.email
+    scopes = ["cloud-platform"]
+  }
+
+  # The thing that makes Firecracker viable on a cloud VM: nested KVM.
+  advanced_machine_features {
+    enable_nested_virtualization = true
+  }
+
+  # Spot pricing for ~70% off. Compute work here is stateless (microVMs are
+  # ephemeral, Kafka offsets are on the control plane) so preemption is
+  # acceptable.
+  scheduling {
+    provisioning_model          = var.compute_use_spot ? "SPOT" : "STANDARD"
+    preemptible                 = var.compute_use_spot
+    automatic_restart           = var.compute_use_spot ? false : true
+    instance_termination_action = var.compute_use_spot ? "STOP" : null
+  }
+
+  metadata = {
+    ssh-keys               = local.ssh_key_entry
+    enable-oslogin         = "FALSE"
+    block-project-ssh-keys = "TRUE"
+  }
+
+  tags = ["oj-vm", "oj-compute"]
+
+  allow_stopping_for_update = true
+
+  lifecycle {
+    ignore_changes = [
+      metadata["startup-script"],
+    ]
+  }
+}
+
+# ---------- Auto-shutdown via Cloud Scheduler -------------------------------
+
+resource "google_service_account" "scheduler_sa" {
+  account_id   = "oj-scheduler"
+  display_name = "Online Judge — auto-shutdown scheduler"
+}
+
+resource "google_project_iam_member" "scheduler_instance_admin" {
+  project = var.project_id
+  role    = "roles/compute.instanceAdmin.v1"
+  member  = "serviceAccount:${google_service_account.scheduler_sa.email}"
+}
+
+# Cloud Scheduler used to require an App Engine app in the project (the
+# notorious "appengine.applications.create" precondition). That requirement
+# was retired in 2022 for HTTP-target jobs — which is what we use — so we
+# create the scheduler jobs directly. The appengine.googleapis.com API can
+# stay disabled.
+
+resource "google_cloud_scheduler_job" "auto_shutdown_control_plane" {
+  name        = "oj-auto-shutdown-control-plane"
+  description = "Nightly stop of the control-plane VM (safety net)"
+  schedule    = var.auto_shutdown_cron
+  time_zone   = var.auto_shutdown_timezone
+  region      = var.region
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.zone}/instances/${google_compute_instance.control_plane.name}/stop"
+
+    oauth_token {
+      service_account_email = google_service_account.scheduler_sa.email
+    }
+  }
+}
+
+resource "google_cloud_scheduler_job" "auto_shutdown_compute" {
+  name        = "oj-auto-shutdown-compute"
+  description = "Nightly stop of the compute VM (safety net)"
+  schedule    = var.auto_shutdown_cron
+  time_zone   = var.auto_shutdown_timezone
+  region      = var.region
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.zone}/instances/${google_compute_instance.compute.name}/stop"
+
+    oauth_token {
+      service_account_email = google_service_account.scheduler_sa.email
+    }
+  }
+}

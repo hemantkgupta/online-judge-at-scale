@@ -72,25 +72,29 @@ public class DockerExecutionService implements ExecutionBackend {
     @Value("${app.sandbox.seccomp-profile:/etc/seccomp/sandbox-seccomp.json}")
     private String seccompProfilePath;
 
-    private static final Map<String, String[]> LANGUAGE_CONFIGS = Map.of(
-        "python", new String[]{"python:3.12-slim", "python3", "/code/solution.py"},
-        "java",   new String[]{"openjdk:21-slim",  "sh", "-c", "cd /code && javac Solution.java && java Solution"},
-        "cpp",    new String[]{"gcc:13",            "sh", "-c", "g++ -O2 -o /code/a.out /code/solution.cpp && /code/a.out"}
+    private record LanguageConfig(String image, String sourceFile, List<String> command) {}
+
+    private static final Map<String, LanguageConfig> LANGUAGE_CONFIGS = Map.of(
+        "python", new LanguageConfig("python:3.12-slim", "solution.py",
+                List.of("python3", "/code/solution.py")),
+        "java", new LanguageConfig("openjdk:21-slim", "Solution.java",
+                List.of("sh", "-c", "javac -d /tmp /code/Solution.java && java -cp /tmp Solution")),
+        "cpp", new LanguageConfig("gcc:13", "solution.cpp",
+                List.of("sh", "-c", "g++ -O2 -pipe -o /tmp/a.out /code/solution.cpp && /tmp/a.out"))
     );
 
     public ExecutionResult execute(String submissionId, String language, String code, String input) {
-        String image = LANGUAGE_CONFIGS.getOrDefault(language, LANGUAGE_CONFIGS.get("python"))[0];
-        String ext   = languageExtension(language);
+        LanguageConfig cfg = languageConfig(language);
 
         Path tempDir = null;
         try {
             tempDir = Files.createTempDirectory("oj-" + submissionId);
-            Path codeFile = tempDir.resolve("solution." + ext);
+            Path codeFile = tempDir.resolve(cfg.sourceFile());
             Files.writeString(codeFile, code);
             Path inputFile = tempDir.resolve("input.txt");
             Files.writeString(inputFile, input != null ? input : "");
 
-            List<String> cmd = buildDockerCommand(image, language, tempDir.toString());
+            List<String> cmd = buildDockerCommand(cfg.image(), language, tempDir.toString());
             long startMs = System.currentTimeMillis();
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -132,7 +136,7 @@ public class DockerExecutionService implements ExecutionBackend {
      * elsewhere is to skip the flag rather than risk a mis-configured container.
      */
     List<String> buildDockerCommand(String image, String language, String hostDir) {
-        String[] langCfg = LANGUAGE_CONFIGS.getOrDefault(language, LANGUAGE_CONFIGS.get("python"));
+        LanguageConfig langCfg = languageConfig(language);
         List<String> cmd = new ArrayList<>(List.of(
             "docker", "run",
             "--rm",                                // destroy-never-reuse
@@ -159,9 +163,9 @@ public class DockerExecutionService implements ExecutionBackend {
 
         cmd.addAll(List.of(
             "-v", hostDir + ":/code:ro",
-            image,
-            langCfg[1], langCfg.length > 3 ? langCfg[2] + " " + langCfg[3] : langCfg[2]
+            image
         ));
+        cmd.addAll(langCfg.command());
         return cmd;
     }
 
@@ -170,13 +174,8 @@ public class DockerExecutionService implements ExecutionBackend {
         return os.contains("linux");
     }
 
-    private String languageExtension(String language) {
-        return switch (language) {
-            case "python" -> "py";
-            case "java"   -> "java";
-            case "cpp"    -> "cpp";
-            default       -> "txt";
-        };
+    private static LanguageConfig languageConfig(String language) {
+        return LANGUAGE_CONFIGS.getOrDefault(language, LANGUAGE_CONFIGS.get("python"));
     }
 
     private void cleanup(Path dir) {

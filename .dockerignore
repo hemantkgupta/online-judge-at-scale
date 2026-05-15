@@ -1,0 +1,29 @@
+# Don't ship build artifacts, IDE config, or local state into the build
+# context. Keeps `docker buildx build` fast and the image small.
+
+**/build/
+**/.gradle/
+**/.idea/
+**/.vscode/
+**/*.iml
+**/.DS_Store
+
+# Existing repo Docker / compose configs (the build doesn't need them)
+docker-compose.yml
+docker-compose.override.yml
+
+# Tests run inside the Dockerfile via `-x test`, so don't bother including
+# any test report output.
+**/build/reports/
+**/build/test-results/
+
+# Heavy / unrelated subdirs we don't want pulled into a service build.
+scoring-pipeline/build/
+docs/
+infra/firecracker/
+infra/end-to-end-mac-pi.md
+
+# Local OpenTofu state — never want this in a build context.
+infra/gcp/terraform/.terraform/
+infra/gcp/terraform/terraform.tfstate*
+infra/gcp/terraform/terraform.tfvars

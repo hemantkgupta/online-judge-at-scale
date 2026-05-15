@@ -2,6 +2,7 @@ package com.onlinejudge.gateway.controller;
 
 import com.onlinejudge.gateway.dto.SubmissionRequest;
 import com.onlinejudge.gateway.dto.SubmissionResponse;
+import com.onlinejudge.gateway.security.IdempotencyFilter;
 import com.onlinejudge.gateway.service.RateLimitService;
 import com.onlinejudge.gateway.service.RegionResolver;
 import com.onlinejudge.gateway.service.SubmissionService;
@@ -16,6 +17,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Map;
+
 @Slf4j
 @RestController
 @RequestMapping("/api/v1/submissions")
@@ -29,6 +32,7 @@ public class SubmissionController {
     private final RateLimitService rateLimitService;
     private final StringRedisTemplate redisTemplate;
     private final RegionResolver regionResolver;
+    private final IdempotencyFilter idempotencyFilter;
 
     /**
      * POST /api/v1/submissions
@@ -44,20 +48,44 @@ public class SubmissionController {
                                     @AuthenticationPrincipal String userId,
                                     HttpServletRequest httpRequest) throws Exception {
 
+        String idempotencyKey = httpRequest.getHeader("Idempotency-Key");
+        IdempotencyFilter.ClaimResult claim = idempotencyFilter.checkAndClaim(idempotencyKey);
+        if (claim.status() == IdempotencyFilter.ClaimStatus.COMPLETED) {
+            return ResponseEntity.accepted().body(new SubmissionResponse(
+                    claim.submissionId(),
+                    "PENDING",
+                    claim.gatewayTsMs(),
+                    "Submission accepted. Verdict will be delivered via WebSocket."
+            ));
+        }
+        if (claim.status() == IdempotencyFilter.ClaimStatus.IN_PROGRESS) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "status", "IN_PROGRESS",
+                    "message", "A submission with this Idempotency-Key is already being accepted"
+            ));
+        }
+
         String sourceIp = clientIp(httpRequest);
 
         // Dual-scoped rate limit: per-user AND per-IP, checked atomically.
         // The userId here is the JWT subject (not anything in the request body)
         // so a single compromised account can't rotate userIds to dodge the limit.
         if (!rateLimitService.isAllowed(userId, sourceIp)) {
+            idempotencyFilter.releaseClaim(idempotencyKey);
             log.warn("[gateway] Rate limit exceeded for user={} ip={}", userId, sourceIp);
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                     .body("Rate limit exceeded");
         }
 
-        String region = regionResolver.resolve(httpRequest);
-        SubmissionResponse response = submissionService.accept(request, userId, region);
-        return ResponseEntity.accepted().body(response);
+        try {
+            String region = regionResolver.resolve(httpRequest);
+            SubmissionResponse response = submissionService.accept(request, userId, region);
+            idempotencyFilter.recordSubmission(idempotencyKey, response.getSubmissionId(), response.getGatewayTsMs());
+            return ResponseEntity.accepted().body(response);
+        } catch (Exception ex) {
+            idempotencyFilter.releaseClaim(idempotencyKey);
+            throw ex;
+        }
     }
 
     /**
