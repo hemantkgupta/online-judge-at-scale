@@ -29,8 +29,11 @@ if ! command -v docker >/dev/null 2>&1; then
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
   install -m 0755 -d /etc/apt/keyrings
+  # --batch --no-tty: gpg 2.x in systemd-run startup scripts has no
+  # controlling terminal; without these flags it tries to open /dev/tty
+  # for status messages and dies with "cannot open '/dev/tty'".
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    gpg --batch --no-tty --yes --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
     > /etc/apt/sources.list.d/docker.list
@@ -46,7 +49,7 @@ fi
 if ! command -v gcloud >/dev/null 2>&1; then
   echo "[oj-startup] installing google-cloud-cli"
   curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
-    gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+    gpg --batch --no-tty --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg
   echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
     > /etc/apt/sources.list.d/google-cloud-sdk.list
   apt-get update -y
