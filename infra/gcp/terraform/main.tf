@@ -233,6 +233,13 @@ resource "google_compute_instance" "compute" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.oj_subnet.id
+
+    # Ephemeral external IP for OUTBOUND — same justification as the
+    # control-plane VM. Without this the startup script can't fetch
+    # Docker, the Firecracker binary, the guest kernel, or the OTel agent
+    # jar from the public internet. Inbound stays IAP-only via the
+    # oj-allow-iap-ssh firewall rule.
+    access_config {}
   }
 
   service_account {
