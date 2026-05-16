@@ -29,47 +29,4 @@ export HOME=/root
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
-# ============================================================================
-# Diagnostic dump (rootfs-v4-debug-init). Goes to ttyS0 → captured in
-# Firecracker's stdout → /tmp/fc-output.log on the host. Lets us inspect
-# the VM's environment + verify python3 / g++ actually run before handing
-# control to the agent. Strip this block after the diagnostic is finished.
-# ============================================================================
-echo ""
-echo "=== /init diagnostic dump (v4-debug) ==="
-echo "kernel: $(uname -a)"
-echo "PATH=$PATH"
-echo "HOME=$HOME"
-echo ""
-echo "-- /usr/bin contents (first 30): --"
-ls /usr/bin 2>&1 | head -30
-echo ""
-echo "-- file /usr/bin/python3 --"
-file /usr/bin/python3 2>&1 || echo "(no 'file' command in rootfs; expected ELF symlink)"
-ls -la /usr/bin/python3 2>&1
-echo ""
-echo "-- /usr/bin/python3 -V --"
-/usr/bin/python3 -V 2>&1
-echo "  exit=$?"
-echo ""
-echo "-- /usr/bin/python3 -c print --"
-/usr/bin/python3 -c "print('hello from init')" 2>&1
-echo "  exit=$?"
-echo ""
-echo "-- /usr/bin/g++ --version --"
-/usr/bin/g++ --version 2>&1 | head -2
-echo "  exit=$?"
-echo ""
-echo "-- ld.so.cache check --"
-ls -la /etc/ld.so.cache 2>&1
-echo ""
-echo "-- libpython location --"
-find /usr/lib /lib -maxdepth 4 -name 'libpython3*' 2>&1 | head -5
-echo ""
-echo "-- ldd /usr/bin/python3 --"
-ldd /usr/bin/python3 2>&1 | head -10
-echo ""
-echo "=== /init diagnostic dump end ==="
-echo ""
-
 exec /usr/local/bin/oj-execution-agent

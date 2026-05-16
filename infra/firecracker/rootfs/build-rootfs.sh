@@ -34,7 +34,7 @@ SUITE="${SUITE:-jammy}"            # Ubuntu 22.04 LTS
 MIRROR="${MIRROR:-http://archive.ubuntu.com/ubuntu}"
 
 # Bump this whenever init.sh or the Go agent change.
-OJ_HARNESS_VERSION="oj-rootfs-v4-debug-init"
+OJ_HARNESS_VERSION="oj-rootfs-v5-prod-init"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 INIT_SRC="$HERE/init.sh"
