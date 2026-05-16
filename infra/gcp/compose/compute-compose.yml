@@ -50,13 +50,18 @@ services:
       APP_AGENT_VSOCK_CLIENT:        /usr/local/bin/oj-vsock-client
       APP_REGION:                    ${REGION:-asia-south1}
       # ── OpenTelemetry (Workstream H) ─────────────────────────────
-      # Empty OTEL_ENDPOINT → agent auto-instrumentation still runs but
-      # has no collector to export to (no-op). Set OTEL_ENDPOINT in
-      # /opt/oj/.env to a reachable OTLP/gRPC endpoint (e.g. a SigNoz
-      # collector on the control-plane VM, or Cloud Trace via the OTel
-      # GCP exporter sidecar) to enable export. We do NOT spin up a
-      # collector on the compute VM here — that's a fleet decision.
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
+      # OTEL_ENDPOINT unset → all exporters disabled (auto-instrumentation
+      # still loads but never tries to push). Empty-string endpoint can't
+      # work — the OtlpConfigUtil validator parses it as a URL and crashes
+      # the agent during JVM premain. So when OTEL_ENDPOINT is empty we
+      # set the exporter trio to "none" rather than pass it through.
+      OTEL_TRACES_EXPORTER:        ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER:       ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER:          ${OTEL_LOGS_EXPORTER:-none}
+      # When OTEL_ENDPOINT IS set, operator should also set the three
+      # exporter values to "otlp" (or whatever they want) AND OTEL_ENDPOINT
+      # itself. compose substitutes both pieces from /opt/oj/.env.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
       OTEL_SERVICE_NAME: oj-sandbox-manager
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
 
@@ -85,10 +90,10 @@ services:
       # trust boundary).
       APP_SANDBOX_MANAGER_URL:               http://oj-sandbox-manager:9100
       APP_REGION:                            ${REGION:-asia-south1}
-      # ── OpenTelemetry (Workstream H) ─────────────────────────────
-      # See note on oj-sandbox-manager above. Same OTEL_ENDPOINT,
-      # different service name so traces/metrics segregate cleanly in
-      # the backend.
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
+      # ── OpenTelemetry (Workstream H) — same shape as SM above. ──
+      OTEL_TRACES_EXPORTER:        ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER:       ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER:          ${OTEL_LOGS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
       OTEL_SERVICE_NAME: oj-execution-worker
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
