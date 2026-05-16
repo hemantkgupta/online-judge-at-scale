@@ -104,6 +104,12 @@ services:
       # publishes the verdict; only the WA/AC determination becomes degenerate
       # (always WA against the empty expected_hash).
       APP_PROBLEM_SERVICE_REQUIRED:          ${APP_PROBLEM_SERVICE_REQUIRED:-false}
+      # Where to reach problem-service. Defaults to the control-plane VM's
+      # internal IP on port 8089 (the compose entry on control-plane-compose.yml
+      # publishes 8089:8089). DNS "oj-control-plane" is not resolvable across
+      # VMs without a shared docker network or a VPC DNS zone, so we hard-code
+      # the internal IP via the CONTROL_PLANE_IP env var.
+      APP_PROBLEM_SERVICE_URL:               ${APP_PROBLEM_SERVICE_URL:-http://${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:8089}
       # ── OpenTelemetry (Workstream H) — same shape as SM above. ──
       OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}

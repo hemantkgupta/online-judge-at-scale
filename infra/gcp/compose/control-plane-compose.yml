@@ -113,10 +113,52 @@ services:
       OTEL_SERVICE_NAME:           oj-api-gateway
       OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
 
-  # NOTE (Workstream H): when Workstream A lands its `problem-service`
-  # compose entry on this VM, copy the same OTEL_* trio above with
-  # OTEL_SERVICE_NAME=oj-problem-service. Workstream A owns the
-  # service definition; this file just needs the env-var block.
+  # problem-service: signs V4 GCS download URLs for test-case inputs/expected-
+  # outputs. The execution-worker reaches it over HTTP via ProblemServiceClient
+  # (env APP_PROBLEM_SERVICE_URL=http://<control-plane-ip>:8089). The signer
+  # SA's JSON key is mounted from /opt/oj/gcs-signer.json, which control-plane.sh
+  # fetches from Secret Manager on every boot.
+  #
+  # MEMORY: e2-medium has 4 GB total; with kafka + zookeeper + cockroachdb +
+  # redis + api-gateway already running we cap problem-service's JVM heap to
+  # 384 MB to leave headroom. -XX:MaxRAMPercentage is ignored when
+  # JAVA_TOOL_OPTIONS is set explicitly.
+  problem-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/problem-service:latest
+    container_name: oj-problem-service
+    restart: unless-stopped
+    depends_on:
+      - cockroachdb
+    ports:
+      - "8089:8089"
+    volumes:
+      # Signer SA JSON key — fetched from Secret Manager by control-plane.sh
+      # on every boot. Mode 0400 on the host, ro mount in the container.
+      - /opt/oj/gcs-signer.json:/var/secrets/gcs-signer.json:ro
+    environment:
+      SERVER_PORT: 8089
+      # problem-service's JPA schema lives in init.sql under the `onlinejudge`
+      # database — that's the only place `problems` and `test_cases` exist.
+      # (api-gateway connects to `defaultdb` for historical Flyway reasons;
+      # the two services do not share the same database.)
+      DB_URL: jdbc:postgresql://cockroachdb:26257/onlinejudge?sslmode=disable
+      DB_USER: root
+      # CRDB's `INT` is BIGINT (8-byte) while problem-service's JPA entities
+      # declare Java `int` (INTEGER). Hibernate's default ddl-auto=validate
+      # rejects the type mismatch and bails the ApplicationContext at boot.
+      # init.sql is the source of truth for schema, so problem-service has
+      # no business validating column types against its entities. Disable.
+      SPRING_JPA_HIBERNATE_DDL_AUTO: none
+      GCS_PROJECT_ID: ${PROJECT_ID:-online-judge-hk}
+      GCS_BUCKET: ${GCS_BUCKET:?must set GCS_BUCKET via /opt/oj/.env}
+      GCS_SIGNER_KEY_PATH: /var/secrets/gcs-signer.json
+      APP_REGION: ${REGION:-asia-south1}
+      JAVA_TOOL_OPTIONS: "-Xmx384m -XX:+ExitOnOutOfMemoryError"
+      # ── OpenTelemetry (Workstream H) ─────────────────────────────
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
+      OTEL_SERVICE_NAME:           oj-problem-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
 
 volumes:
   zookeeper-data:

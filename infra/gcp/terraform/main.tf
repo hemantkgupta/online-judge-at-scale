@@ -214,11 +214,16 @@ resource "google_compute_instance" "control_plane" {
     # every boot. Compose YAML + init.sql are base64-injected so we don't
     # need a GCS bucket for them.
     startup-script = templatefile("${path.module}/../startup/control-plane.sh.tpl", {
-      ar_url           = local.ar_url
-      region           = var.region
-      jwt_secret       = random_password.jwt_secret.result
-      compose_yaml_b64 = base64encode(file("${path.module}/../compose/control-plane-compose.yml"))
-      init_sql_b64     = base64encode(file("${path.module}/../../../database/init.sql"))
+      ar_url             = local.ar_url
+      region             = var.region
+      jwt_secret         = random_password.jwt_secret.result
+      compose_yaml_b64   = base64encode(file("${path.module}/../compose/control-plane-compose.yml"))
+      init_sql_b64       = base64encode(file("${path.module}/../../../database/init.sql"))
+      # problem-service V4-signer wiring (see GCS bucket / SA / Secret Manager
+      # resources at the top of main.tf). The startup script fetches the JSON
+      # key into /opt/oj/gcs-signer.json on every boot.
+      gcs_bucket_name    = google_storage_bucket.oj_test_cases.name
+      gcs_signer_secret  = google_secret_manager_secret.problem_service_signer_key.secret_id
     })
   }
 
@@ -307,6 +312,95 @@ resource "google_compute_instance" "compute" {
   tags = ["oj-vm", "oj-compute"]
 
   allow_stopping_for_update = true
+}
+
+# ---------- problem-service: GCS bucket + signer SA + Secret Manager --------
+#
+# The problem-service signs short-lived V4 GCS download URLs and hands them
+# to the execution-worker. V4 signing happens client-side in the JVM (no API
+# call), which means the JCA needs the SA's private key in PEM/JSON form on
+# disk — ADC on a GCE VM CANNOT serve the private key, only access tokens.
+#
+# Pipeline:
+#   1. `google_storage_bucket "oj_test_cases"` holds input/expected-output
+#      bytes (one object per ordinal per problem).
+#   2. `google_service_account "problem_service_signer"` is the SA whose
+#      private key signs the V4 URLs. It needs `roles/storage.objectViewer`
+#      on the bucket — that's the scope embedded in the signed URLs.
+#   3. `google_service_account_key` mints a JSON key; the raw JSON is
+#      base64-decoded into a Secret Manager secret so the VM can fetch it on
+#      every boot. (The plaintext key sits in tfstate too — acceptable for
+#      this dev-grade setup; production should mint via Workload Identity
+#      Federation or use the IAM Signer API.)
+#   4. The control-plane VM's existing SA gets
+#      `roles/secretmanager.secretAccessor` so its startup script can pull
+#      the key into /opt/oj/gcs-signer.json (mode 0400).
+#
+# The compose file mounts /opt/oj/gcs-signer.json into problem-service at
+# /var/secrets/gcs-signer.json (ro), and GCS_SIGNER_KEY_PATH points at it.
+
+resource "google_storage_bucket" "oj_test_cases" {
+  # GCS bucket names are GLOBAL. Suffixing with project ID keeps the name
+  # collision-free across forks of this terraform.
+  name                        = "oj-test-cases-${var.project_id}"
+  location                    = upper(var.region)
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+  force_destroy               = true # dev-grade: let `tofu destroy` wipe contents
+
+  lifecycle_rule {
+    condition {
+      age = 365
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+resource "google_service_account" "problem_service_signer" {
+  account_id   = "oj-problem-signer"
+  display_name = "Online Judge — problem-service V4 URL signer"
+  description  = "Whose private key signs short-lived GCS download URLs handed to the execution-worker."
+}
+
+# Signer needs READ on the bucket — that's the scope embedded in the signed
+# URLs. We do not give it object-create; uploads happen via the operator's
+# own credentials (`gcloud storage cp ...`) during problem seeding.
+resource "google_storage_bucket_iam_member" "signer_object_viewer" {
+  bucket = google_storage_bucket.oj_test_cases.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.problem_service_signer.email}"
+}
+
+# JSON key. Stored in tfstate (acceptable for this dev-grade setup; rotate by
+# tainting + re-applying). Tofu marks `private_key` as sensitive so it never
+# echoes to plan output.
+resource "google_service_account_key" "problem_service_signer_key" {
+  service_account_id = google_service_account.problem_service_signer.name
+  key_algorithm      = "KEY_ALG_RSA_2048"
+  public_key_type    = "TYPE_X509_PEM_FILE"
+  private_key_type   = "TYPE_GOOGLE_CREDENTIALS_FILE"
+}
+
+resource "google_secret_manager_secret" "problem_service_signer_key" {
+  secret_id = "oj-problem-signer-key"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "problem_service_signer_key_v1" {
+  secret      = google_secret_manager_secret.problem_service_signer_key.id
+  secret_data = base64decode(google_service_account_key.problem_service_signer_key.private_key)
+}
+
+# Control-plane SA can pull the signer JSON on every boot.
+resource "google_secret_manager_secret_iam_member" "control_plane_signer_accessor" {
+  secret_id = google_secret_manager_secret.problem_service_signer_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.control_plane_sa.email}"
 }
 
 # ---------- Auto-shutdown via Cloud Scheduler -------------------------------

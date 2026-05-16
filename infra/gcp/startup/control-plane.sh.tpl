@@ -6,11 +6,13 @@
 # Idempotent: each step is a no-op if already done. Safe to re-run.
 #
 # Template variables interpolated by terraform:
-#   ${ar_url}            e.g. asia-south1-docker.pkg.dev/online-judge-hk/oj-images
-#   ${region}            e.g. asia-south1
-#   ${jwt_secret}        48-byte random secret (terraform random_password)
-#   ${compose_yaml_b64}  base64-encoded control-plane-compose.yml
-#   ${init_sql_b64}      base64-encoded database/init.sql (CRDB schema bootstrap)
+#   ${ar_url}              e.g. asia-south1-docker.pkg.dev/online-judge-hk/oj-images
+#   ${region}              e.g. asia-south1
+#   ${jwt_secret}          48-byte random secret (terraform random_password)
+#   ${compose_yaml_b64}    base64-encoded control-plane-compose.yml
+#   ${init_sql_b64}        base64-encoded database/init.sql (CRDB schema bootstrap)
+#   ${gcs_bucket_name}     GCS bucket holding per-ordinal input/expected objects
+#   ${gcs_signer_secret}   Secret Manager secret id holding the signer SA JSON key
 #
 # All other config (kafka host IP, AR URL, JWT secret) lands in /opt/oj/.env
 # which the systemd unit sources via `EnvironmentFile=`.
@@ -82,8 +84,25 @@ AR_URL=${ar_url}
 KAFKA_HOST_EXTERNAL=$INTERNAL_IP
 JWT_SECRET=${jwt_secret}
 REGION=${region}
+GCS_BUCKET=${gcs_bucket_name}
 EOF
 chmod 0600 /opt/oj/.env
+
+# ---------- Fetch problem-service signer key from Secret Manager ------------
+# problem-service signs short-lived V4 GCS download URLs. The JCA needs the
+# SA's private key on disk — ADC tokens won't work. We fetch the SA JSON key
+# from Secret Manager (where terraform pushed it) on every boot. Compose
+# mounts /opt/oj/gcs-signer.json into the container as /var/secrets/gcs-signer.json.
+echo "[oj-startup] fetching problem-service signer key from Secret Manager"
+if gcloud secrets versions access latest --secret="${gcs_signer_secret}" \
+     > /opt/oj/gcs-signer.json.new 2>/dev/null; then
+  chmod 0400 /opt/oj/gcs-signer.json.new
+  mv /opt/oj/gcs-signer.json.new /opt/oj/gcs-signer.json
+  echo "[oj-startup] gcs-signer.json ready"
+else
+  echo "[oj-startup] WARN: secret ${gcs_signer_secret} not accessible yet — problem-service will fail GCS signing"
+  rm -f /opt/oj/gcs-signer.json.new
+fi
 
 # ---------- Pre-pull AR image (so first start isn't blocked on a 200 MB pull) -
 echo "[oj-startup] pre-pulling api-gateway image"
