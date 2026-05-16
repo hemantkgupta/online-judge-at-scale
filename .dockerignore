@@ -22,6 +22,12 @@ scoring-pipeline/build/
 docs/
 infra/firecracker/
 infra/end-to-end-mac-pi.md
+# ...except the Go agent source, which the sandbox-manager + execution-worker
+# Dockerfiles compile inside a `golang:1.22 AS go-builder` stage to produce
+# the static oj-vsock-client binary. `!` re-includes a path that an earlier
+# rule excluded.
+!infra/firecracker/agent
+!infra/firecracker/agent/**
 
 # Local OpenTofu state — never want this in a build context.
 infra/gcp/terraform/.terraform/
