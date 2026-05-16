@@ -139,8 +139,19 @@ echo "[oj-startup] building harness rootfs (first time ~10 min, then cached)"
 AGENT_SRC_DIR=/opt/oj/agent /opt/oj/rootfs-builder/build-rootfs.sh
 
 # ---------- gVisor (runsc) registered as a Docker runtime -------------------
-if ! command -v runsc >/dev/null 2>&1; then
+# Non-fatal: today the Sandbox Manager never routes anything to runsc — the
+# language → backend mapping (Firecracker for compiled, gVisor for
+# interpreted, per the Part 7 blog) isn't wired in code yet, so even with
+# gvisor installed nothing would call it. Keep the install step but treat
+# any failure as a warning, so a future URL change or transient 404 doesn't
+# block the entire VM boot. Re-evaluate this when the SM per-language
+# routing lands.
+install_gvisor() {
+  if command -v runsc >/dev/null 2>&1; then
+    return 0
+  fi
   echo "[oj-startup] installing gvisor ($GVISOR_RELEASE)"
+  local ARCH TMP
   ARCH="$(uname -m)"
   TMP="$(mktemp -d)"
   for f in runsc containerd-shim-runsc-v1; do
@@ -152,9 +163,6 @@ if ! command -v runsc >/dev/null 2>&1; then
   (cd "$TMP" && sha512sum -c runsc.sha512 containerd-shim-runsc-v1.sha512)
   install -m 0755 "$TMP/runsc" "$TMP/containerd-shim-runsc-v1" /usr/local/bin/
   rm -rf "$TMP"
-
-  # Register runsc with the Docker daemon. Merge into daemon.json without
-  # clobbering other settings if it already exists.
   install -d -m 0755 /etc/docker
   if [[ -s /etc/docker/daemon.json ]]; then
     jq '.runtimes.runsc = {"path": "/usr/local/bin/runsc"}' /etc/docker/daemon.json \
@@ -169,8 +177,18 @@ if ! command -v runsc >/dev/null 2>&1; then
 JSON
   fi
   systemctl restart docker
+}
+
+if ! install_gvisor; then
+  echo "[oj-startup] WARN: gvisor install failed; app.sandbox.docker.runtime=runsc will be unavailable on this host" >&2
+  echo "[oj-startup] WARN: see install_gvisor() in compute.sh.tpl — continuing without gvisor" >&2
 fi
-echo "[oj-startup] gvisor: $(runsc --version 2>&1 | head -1)"
+
+if command -v runsc >/dev/null 2>&1; then
+  echo "[oj-startup] gvisor: $(runsc --version 2>&1 | head -1)"
+else
+  echo "[oj-startup] gvisor: NOT INSTALLED (non-fatal, see WARN above)"
+fi
 
 # ---------- Seccomp profile (Docker hardening variant) ----------------------
 install -d -m 0755 /etc/seccomp
