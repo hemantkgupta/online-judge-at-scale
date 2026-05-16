@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -73,6 +74,10 @@ public class AgentClient {
     /** Test-only seam: lets unit tests substitute the subprocess. */
     private final Function<List<String>, Process> processFactory;
 
+    // See TestCaseFetcher.java for the long explanation; same bug here.
+    // Spring needs ONE constructor annotated when there are multiple; with
+    // none annotated, it looks for a no-arg default and crashes the context.
+    @Autowired
     public AgentClient(ObjectMapper objectMapper) {
         this(objectMapper, null);
     }

@@ -3,6 +3,7 @@ package com.onlinejudge.worker.service;
 import com.onlinejudge.worker.observability.WorkerMetrics;
 import com.onlinejudge.worker.service.ProblemServiceClient.TestCaseUrls;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -60,6 +61,12 @@ public class TestCaseFetcher {
     private final WorkerMetrics metrics;
     private final HttpClient httpClient;
 
+    // @Autowired marks this as THE constructor Spring should use. Without it,
+    // Spring sees two constructors, can't pick, and falls back to looking for
+    // a no-arg default — which doesn't exist → "No default constructor found"
+    // and the entire ApplicationContext bails out at boot. (Spring's implicit
+    // single-constructor autowiring only fires when there is exactly one.)
+    @Autowired
     public TestCaseFetcher(ProblemServiceClient problemServiceClient,
                            WorkerMetrics metrics) {
         this(problemServiceClient, metrics, HttpClient.newBuilder()
