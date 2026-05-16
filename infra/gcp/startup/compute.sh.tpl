@@ -34,7 +34,7 @@ echo "[oj-startup] $(date -Iseconds) — compute.sh begin"
 # Pinned versions. Bump deliberately, not by accident.
 FIRECRACKER_VERSION="v1.10.1"
 FIRECRACKER_CI_BASE="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64"
-GVISOR_RELEASE="release-20240826.0"
+GVISOR_RELEASE="20240826"  # bucket layout: gvisor/releases/release/<YYYYMMDD>/x86_64/runsc
 
 # ---------- Docker install (idempotent) -------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
