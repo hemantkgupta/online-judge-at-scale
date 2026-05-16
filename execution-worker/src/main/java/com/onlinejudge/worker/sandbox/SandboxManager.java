@@ -2,6 +2,7 @@ package com.onlinejudge.worker.sandbox;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -35,8 +36,33 @@ import java.util.concurrent.*;
  *   java:   4 (lower — Java executions take 0.5-1.5s average)
  *   cpp:    4 (lowest — C++ executions take 50-200ms average)
  */
+/**
+ * <h2>Legacy in-process sandbox pool — gated OFF by default.</h2>
+ *
+ * <p>This class predates the standalone {@code sandbox-manager} service
+ * (per Part 7 of the design blog). The production architecture is now:
+ * <pre>
+ *   execution-worker  --HTTP-->  sandbox-manager  --REST-->  Firecracker
+ *   (unprivileged)               (privileged, KVM)
+ * </pre>
+ *
+ * <p>The worker no longer manages VMs locally — it leases over HTTP via
+ * {@code SandboxManagerClient}. This in-process pool was useful during
+ * early development (single-host Docker pool) and remains available for
+ * that workflow, but it must NOT be active in the production deployment.
+ * On the privileged-split deployment it floods logs with provisioning
+ * errors because the worker container has no docker socket / no KVM.
+ *
+ * <p>The bean is enabled only when {@code app.sandbox.in-process-pool.enabled=true}.
+ * Default is OFF — the HTTP path through {@link com.onlinejudge.worker.service.SandboxManagerClient}
+ * runs regardless of this bean's presence.
+ */
 @Slf4j
 @Component
+@ConditionalOnProperty(
+        name = "app.sandbox.in-process-pool.enabled",
+        havingValue = "true",
+        matchIfMissing = false)
 public class SandboxManager {
 
     /** Per-language pool configuration: language → target depth */
