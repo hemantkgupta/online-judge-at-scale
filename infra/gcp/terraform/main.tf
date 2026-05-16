@@ -211,14 +211,14 @@ resource "google_compute_instance" "control_plane" {
     block-project-ssh-keys = "TRUE"  # only the key we put here is accepted
 
     # Stage 4: bring up Kafka/CRDB/Redis/api-gateway via docker-compose on
-    # every boot. Compose YAML + init.sql are base64-injected so we don't
-    # need a GCS bucket for them.
+    # every boot. Compose YAML is base64-injected so we don't need a GCS
+    # bucket for it. (Pre-V3 we also injected database/init.sql here; V3
+    # retired init.sql in favour of Flyway in api-gateway.)
     startup-script = templatefile("${path.module}/../startup/control-plane.sh.tpl", {
       ar_url             = local.ar_url
       region             = var.region
       jwt_secret         = random_password.jwt_secret.result
       compose_yaml_b64   = base64encode(file("${path.module}/../compose/control-plane-compose.yml"))
-      init_sql_b64       = base64encode(file("${path.module}/../../../database/init.sql"))
       # problem-service V4-signer wiring (see GCS bucket / SA / Secret Manager
       # resources at the top of main.tf). The startup script fetches the JSON
       # key into /opt/oj/gcs-signer.json on every boot.

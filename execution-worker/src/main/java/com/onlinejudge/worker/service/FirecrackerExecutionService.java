@@ -63,23 +63,31 @@ public class FirecrackerExecutionService implements ExecutionBackend {
     }
 
     @Override
-    public DockerExecutionService.ExecutionResult execute(
-            String submissionId, String language, String code, List<TestCaseSpec> testCases) {
+    public ExecutionBackend.ExecutionResult execute(
+            String submissionId, String language, String code,
+            List<TestCaseSpec> testCases,
+            int timeLimitMs, int memoryLimitMb) {
 
         if (!isSupportedLanguage(language)) {
             log.warn("[firecracker] unsupported language={} submission={}", language, submissionId);
-            return new DockerExecutionService.ExecutionResult(
+            return new ExecutionBackend.ExecutionResult(
                     "INTERNAL_ERROR",
                     "unsupported language for firecracker backend: " + language,
                     0, 0);
         }
 
+        // Roadmap §2.3: per-problem limits override the application.yml
+        // defaults. 0 == "use the backend default" (smoke / bypass path).
+        int effectiveTimeMs = timeLimitMs > 0 ? timeLimitMs : timeoutSeconds * 1000;
+        int effectiveMemoryMb = memoryLimitMb > 0 ? memoryLimitMb : this.memoryLimitMb;
+
         SandboxManagerClient.Lease lease = null;
         try {
-            lease = sandboxManager.lease(submissionId, language, memoryLimitMb);
-            log.info("[firecracker] LEASED submission={} sandbox={} vsock={}:{} cases={}",
+            lease = sandboxManager.lease(submissionId, language, effectiveMemoryMb);
+            log.info("[firecracker] LEASED submission={} sandbox={} vsock={}:{} cases={} t={}ms m={}MiB",
                     submissionId, lease.sandboxId(), lease.vsockUdsPath(), lease.vsockPort(),
-                    testCases == null ? 0 : testCases.size());
+                    testCases == null ? 0 : testCases.size(),
+                    effectiveTimeMs, effectiveMemoryMb);
 
             long started = System.nanoTime();
             AgentResult r = agentClient.exec(
@@ -88,7 +96,7 @@ public class FirecrackerExecutionService implements ExecutionBackend {
                     lease.sessionToken(),
                     language,
                     code,
-                    timeoutSeconds * 1000,
+                    effectiveTimeMs,
                     testCases == null ? List.of() : testCases);
             if (metrics != null) {
                 metrics.recordAgentExecLatency(System.nanoTime() - started, language);
@@ -97,16 +105,21 @@ public class FirecrackerExecutionService implements ExecutionBackend {
             log.info("[firecracker] submission={} overall={} perTest={}",
                     submissionId, r.overallVerdict(), r.perTest().size());
 
-            return new DockerExecutionService.ExecutionResult(
+            return new ExecutionBackend.ExecutionResult(
                     mapVerdict(r.overallVerdict()),
                     summarize(r.perTest(), r.detail()),
                     aggregateTimeMs(r.perTest()),
-                    aggregateMemoryMb(r.perTest()));
+                    aggregateMemoryMb(r.perTest()),
+                    r.perTest() == null ? List.of() : r.perTest());
 
+        } catch (PoolExhaustedException pex) {
+            // Propagate — the consumer wants to nack+retry without
+            // publishing a verdict. We never leased, so no release.
+            throw pex;
         } catch (IOException ex) {
             log.error("[firecracker] sandbox-manager call failed submission={}: {}",
                     submissionId, ex.getMessage());
-            return new DockerExecutionService.ExecutionResult(
+            return new ExecutionBackend.ExecutionResult(
                     "INTERNAL_ERROR", ex.getMessage(), 0, 0);
         } finally {
             if (lease != null) {

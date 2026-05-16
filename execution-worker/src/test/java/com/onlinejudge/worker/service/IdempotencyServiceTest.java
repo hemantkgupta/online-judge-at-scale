@@ -9,7 +9,9 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -25,6 +27,10 @@ import static org.mockito.Mockito.*;
  * concurrent claim race is handled gracefully, markCompleted updates status,
  * and the composite key is scoped by phase so the same submission can run
  * once in Phase 1 (pretest) and once in Phase 2 (system).
+ *
+ * Roadmap §2.5 additions: reclaim is bounded by an attempts counter, the
+ * service exposes releaseClaim() for transient-shortage cleanup, and
+ * markPoison() flips the row to a DLQ-friendly terminal state.
  */
 @ExtendWith(MockitoExtension.class)
 class IdempotencyServiceTest {
@@ -49,6 +55,10 @@ class IdempotencyServiceTest {
     @BeforeEach
     void setUp() {
         submissionId = UUID.randomUUID().toString();
+        // Mirrors the @Value default — Mockito @InjectMocks doesn't run
+        // the field initializer expression past primitive defaults.
+        ReflectionTestUtils.setField(idempotencyService, "maxAttempts", 5);
+        ReflectionTestUtils.setField(idempotencyService, "processingLeaseSeconds", 300L);
     }
 
     @Test
@@ -75,7 +85,8 @@ class IdempotencyServiceTest {
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
         when(updateQuery.executeUpdate()).thenReturn(0);
         when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
-        when(selectQuery.getResultList()).thenReturn(List.of("completed"));
+        when(selectQuery.getResultList()).thenReturn(java.util.Collections.singletonList(
+                new Object[] { "completed", 1, Timestamp.from(Instant.now()) }));
 
         IdempotencyService.ClaimDecision decision =
                 idempotencyService.claimSubmission(submissionId, "pretest");
@@ -94,7 +105,8 @@ class IdempotencyServiceTest {
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
         when(updateQuery.executeUpdate()).thenReturn(0);
         when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
-        when(selectQuery.getResultList()).thenReturn(List.of("processing"));
+        when(selectQuery.getResultList()).thenReturn(java.util.Collections.singletonList(
+                new Object[] { "processing", 1, Timestamp.from(Instant.now()) }));
 
         IdempotencyService.ClaimDecision decision =
                 idempotencyService.claimSubmission(submissionId, "pretest");
@@ -103,7 +115,7 @@ class IdempotencyServiceTest {
     }
 
     @Test
-    void claimSubmission_reclaimsStaleProcessingLease() {
+    void claimSubmission_reclaimsStaleProcessingLease_whileBelowCap() {
         when(entityManager.createNativeQuery(anyString()))
                 .thenReturn(insertQuery)
                 .thenReturn(updateQuery);
@@ -116,7 +128,50 @@ class IdempotencyServiceTest {
                 idempotencyService.claimSubmission(submissionId, "pretest");
 
         assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.CLAIMED);
-        verify(entityManager).createNativeQuery(contains("created_at < :staleBefore"));
+        verify(entityManager).createNativeQuery(contains("attempts < :maxAttempts"));
+    }
+
+    @Test
+    void claimSubmission_returnsPoison_whenAttemptsCapExceededAndRowStale() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery)
+                .thenReturn(selectQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(0);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        // Reclaim attempt rejected because attempts >= cap.
+        when(updateQuery.executeUpdate()).thenReturn(0);
+        when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
+        // A row with attempts=5 (>= cap) and a stale created_at.
+        Instant stale = Instant.now().minusSeconds(3_600);
+        when(selectQuery.getResultList()).thenReturn(java.util.Collections.singletonList(
+                new Object[] { "processing", 5, Timestamp.from(stale) }));
+
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
+
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.POISON);
+    }
+
+    @Test
+    void claimSubmission_returnsPoison_whenStatusAlreadyPoisoned() {
+        when(entityManager.createNativeQuery(anyString()))
+                .thenReturn(insertQuery)
+                .thenReturn(updateQuery)
+                .thenReturn(selectQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(0);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(0);
+        when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
+        when(selectQuery.getResultList()).thenReturn(java.util.Collections.singletonList(
+                new Object[] { "poisoned", 5, Timestamp.from(Instant.now()) }));
+
+        IdempotencyService.ClaimDecision decision =
+                idempotencyService.claimSubmission(submissionId, "pretest");
+
+        assertThat(decision.status()).isEqualTo(IdempotencyService.ClaimStatus.POISON);
     }
 
     @Test
@@ -131,7 +186,8 @@ class IdempotencyServiceTest {
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
         when(updateQuery.executeUpdate()).thenReturn(0);
         when(selectQuery.setParameter(anyString(), any())).thenReturn(selectQuery);
-        when(selectQuery.getResultList()).thenReturn(List.of("processing"));
+        when(selectQuery.getResultList()).thenReturn(java.util.Collections.singletonList(
+                new Object[] { "processing", 1, Timestamp.from(Instant.now()) }));
 
         IdempotencyService.ClaimDecision decision =
                 idempotencyService.claimSubmission(submissionId, "pretest");
@@ -149,6 +205,7 @@ class IdempotencyServiceTest {
 
         verify(entityManager).createNativeQuery(argThat(sql ->
                 sql.contains("ON CONFLICT") && sql.contains("DO NOTHING")
+                        && sql.contains("attempts")
         ));
     }
 
@@ -190,5 +247,32 @@ class IdempotencyServiceTest {
         boolean completed = idempotencyService.markCompleted(submissionId, "pretest", Instant.now());
 
         assertThat(completed).isFalse();
+    }
+
+    @Test
+    void releaseClaim_deletesProcessingRow() {
+        when(entityManager.createNativeQuery(anyString())).thenReturn(updateQuery);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(1);
+
+        boolean released = idempotencyService.releaseClaim(submissionId, "pretest", Instant.now());
+
+        assertThat(released).isTrue();
+        verify(entityManager).createNativeQuery(argThat(sql ->
+                sql.contains("DELETE") && sql.contains("status = 'processing'")
+        ));
+    }
+
+    @Test
+    void markPoison_flipsStatusToPoisoned() {
+        when(entityManager.createNativeQuery(anyString())).thenReturn(updateQuery);
+        when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
+        when(updateQuery.executeUpdate()).thenReturn(1);
+
+        idempotencyService.markPoison(submissionId, "pretest");
+
+        verify(entityManager).createNativeQuery(argThat(sql ->
+                sql.contains("UPDATE") && sql.contains("'poisoned'")
+        ));
     }
 }

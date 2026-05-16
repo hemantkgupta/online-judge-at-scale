@@ -1,6 +1,7 @@
 package com.onlinejudge.worker.service;
 
 import com.onlinejudge.worker.observability.WorkerMetrics;
+import com.onlinejudge.worker.service.ProblemServiceClient.TestCaseBundle;
 import com.onlinejudge.worker.service.ProblemServiceClient.TestCaseUrls;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -91,12 +92,19 @@ public class TestCaseFetcher {
      * @param phase     {@code "pretest"} → pretestOnly=true (ordinals 1–10);
      *                  any other value → pretestOnly=false (full suite)
      */
-    public List<TestCaseSpec> fetch(String problemId, String phase) throws IOException {
+    /**
+     * Plumbs both the per-test specs and the per-problem time/memory
+     * limits to the caller (roadmap §2.3). The limits originate in the
+     * {@code problems} row — for the legacy array-shaped server response
+     * they arrive as 0 and the consumer is expected to fall back to
+     * backend defaults.
+     */
+    public ProblemSpec fetch(String problemId, String phase) throws IOException {
         boolean pretestOnly = "pretest".equals(phase);
-        List<TestCaseUrls> urls = problemServiceClient.fetchTestCases(problemId, pretestOnly);
+        TestCaseBundle bundle = problemServiceClient.fetchTestCases(problemId, pretestOnly);
 
-        List<TestCaseSpec> out = new ArrayList<>(urls.size());
-        for (TestCaseUrls u : urls) {
+        List<TestCaseSpec> out = new ArrayList<>(bundle.testCases().size());
+        for (TestCaseUrls u : bundle.testCases()) {
             byte[] inputBytes = httpGet(u.inputUrl(), "tests");
             byte[] expectedBytes = httpGet(u.expectedOutputUrl(), "tests");
 
@@ -105,8 +113,10 @@ public class TestCaseFetcher {
 
             out.add(new TestCaseSpec(u.ordinal(), input, expectedHash));
         }
-        log.debug("[test-fetcher] problem={} phase={} testCases={}", problemId, phase, out.size());
-        return out;
+        log.debug("[test-fetcher] problem={} phase={} testCases={} t={}ms m={}MiB",
+                problemId, phase, out.size(),
+                bundle.timeLimitMs(), bundle.memoryLimitMb());
+        return new ProblemSpec(bundle.timeLimitMs(), bundle.memoryLimitMb(), out);
     }
 
     /**
@@ -164,4 +174,16 @@ public class TestCaseFetcher {
      * expected stdout — the agent compares using the same rule.
      */
     public record TestCaseSpec(int ordinal, String input, String expectedHash) {}
+
+    /**
+     * Full per-submission spec the worker needs from the control plane:
+     * the per-problem judging limits and the ordered test cases.
+     *
+     * <p>{@code timeLimitMs} and {@code memoryLimitMb} carry the per-problem
+     * budgets from the {@code problems} row through to the agent / sandbox
+     * manager. A value of 0 means the upstream server is on the pre-2.3
+     * array-shaped response and the consumer must apply its backend default.
+     */
+    public record ProblemSpec(int timeLimitMs, int memoryLimitMb,
+                              List<TestCaseSpec> testCases) {}
 }

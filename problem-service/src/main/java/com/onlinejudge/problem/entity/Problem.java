@@ -30,14 +30,19 @@ public class Problem {
     @Column(nullable = false, length = 256)
     private String title;
 
+    // CockroachDB's `INT` is BIGINT (8-byte). Hibernate's ddl-auto=validate
+    // requires the entity field type to match — Java `long` -> BIGINT, Java
+    // `int` -> INTEGER (INT4). These columns are declared `INT` in V3, so the
+    // matching Java type is `long`. (Pre-V3 these were `int`, which forced a
+    // compose-level ddl-auto=none workaround; V3 removes the workaround.)
     @Column(name = "time_limit_ms", nullable = false)
-    private int timeLimitMs;
+    private long timeLimitMs;
 
     @Column(name = "memory_limit_mb", nullable = false)
-    private int memoryLimitMb;
+    private long memoryLimitMb;
 
     @Column(nullable = false)
-    private int points;
+    private long points;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();

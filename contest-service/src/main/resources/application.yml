@@ -7,7 +7,10 @@ spring:
       enabled: true
 
   datasource:
-    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
+    # Unified DB (post-V3). Contest-service is not deployed in the current
+    # compose stack; this default exists for local-dev parity with the other
+    # services.
+    url: jdbc:postgresql://localhost:26257/onlinejudge?sslmode=disable
     username: root
     password:
     driver-class-name: org.postgresql.Driver

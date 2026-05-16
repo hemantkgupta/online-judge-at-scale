@@ -1,5 +1,6 @@
 package com.onlinejudge.problem.service;
 
+import com.onlinejudge.problem.entity.Problem;
 import com.onlinejudge.problem.entity.TestCase;
 import com.onlinejudge.problem.repository.ProblemRepository;
 import com.onlinejudge.problem.repository.TestCaseRepository;
@@ -11,6 +12,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,7 +35,13 @@ class ProblemServiceFilteringTest {
     @Test
     void getTestCaseUrls_pretestVsFull_filtersTo10vs12() {
         UUID problemId = UUID.randomUUID();
-        when(problemRepository.existsById(problemId)).thenReturn(true);
+        Problem problem = new Problem();
+        problem.setId(problemId);
+        problem.setTitle("filtering-test");
+        problem.setTimeLimitMs(1000);
+        problem.setMemoryLimitMb(256);
+        problem.setPoints(100);
+        when(problemRepository.findById(problemId)).thenReturn(Optional.of(problem));
         when(gcsSigner.sign(anyString())).thenAnswer(inv -> "https://signed/" + inv.getArgument(0));
 
         // 12 test cases total: ordinals 1..12. First 10 are pretests.

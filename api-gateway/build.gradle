@@ -25,6 +25,13 @@ dependencies {
     runtimeOnly    'io.jsonwebtoken:jjwt-impl:0.12.5'
     runtimeOnly    'io.jsonwebtoken:jjwt-jackson:0.12.5'
 
+    // Argon2id password hashing for /auth/signup + /auth/login.
+    // Spring Security's Argon2PasswordEncoder lives in spring-security-crypto
+    // (pulled in transitively by spring-boot-starter-security) and delegates to
+    // BouncyCastle for the actual Argon2 kernel — declare BC explicitly so
+    // hashing works at runtime without surprise.
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.testcontainers:junit-jupiter'
     testImplementation 'org.testcontainers:postgresql'

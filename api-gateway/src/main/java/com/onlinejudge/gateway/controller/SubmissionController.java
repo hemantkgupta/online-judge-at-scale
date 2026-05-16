@@ -37,6 +37,17 @@ public class SubmissionController {
     /** Redis key prefix the verdict-push consumer writes verdicts under (24-hour TTL). */
     private static final String VERDICT_STORE_KEY_PREFIX = "verdict:";
 
+    /**
+     * Hard cap on POST body size. 64 KiB of source plus generous headroom for
+     * the JSON envelope (problemId, contestId, language, idempotency key, etc.)
+     * — anything larger is rejected at the Content-Length stage, BEFORE Jackson
+     * deserializes the body and BEFORE we touch GCS. The fine-grained per-field
+     * @Size on {@code SubmissionRequest.code} still runs afterwards.
+     *
+     * Roadmap §3.6 — gateway-level submission body cap.
+     */
+    private static final long MAX_BODY_BYTES = 96 * 1024L; // 96 KiB
+
     private final SubmissionService submissionService;
     private final RateLimitService rateLimitService;
     private final StringRedisTemplate redisTemplate;
@@ -56,6 +67,26 @@ public class SubmissionController {
     public ResponseEntity<?> submit(@Valid @RequestBody SubmissionRequest request,
                                     @AuthenticationPrincipal String userId,
                                     HttpServletRequest httpRequest) throws Exception {
+
+        // Roadmap §3.6 — fail fast at the Content-Length stage as defence in
+        // depth. Note: @Valid on the @RequestBody parameter has ALREADY run by
+        // the time we land here, so @Size(max=65536) on SubmissionRequest.code
+        // is the authoritative per-field cap (it returns 400 via Spring's
+        // default MethodArgumentNotValidException handling). This Content-
+        // Length check is a coarse pre-filter that returns 413 for callers who
+        // honour the Content-Length header — useful when a body slips past
+        // bean validation (e.g. binary garbage that fails Jackson parsing
+        // before @Valid runs) and to make the cap explicit in this code path.
+        long declaredLen = httpRequest.getContentLengthLong();
+        if (declaredLen > MAX_BODY_BYTES) {
+            log.warn("[gateway] Rejecting oversized submission: Content-Length={} > {} (cap)",
+                    declaredLen, MAX_BODY_BYTES);
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
+                    "status", "PAYLOAD_TOO_LARGE",
+                    "message", "Submission body exceeds " + MAX_BODY_BYTES + " bytes. " +
+                            "Source code is capped at 64 KB."
+            ));
+        }
 
         String idempotencyKey = httpRequest.getHeader("Idempotency-Key");
         IdempotencyFilter.ClaimResult claim = idempotencyFilter.checkAndClaim(idempotencyKey);

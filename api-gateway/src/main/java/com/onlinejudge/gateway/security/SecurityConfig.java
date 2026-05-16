@@ -22,11 +22,13 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
  * <ul>
  *   <li>{@code GET /actuator/health} — load-balancer health checks.</li>
  *   <li>{@code GET /api/v1/submissions/health} — service-level health check.</li>
- *   <li>{@code POST /api/v1/auth/token} — dev-only token mint endpoint
- *       (in production this lives on the dedicated IdP, not the gateway).</li>
+ *   <li>{@code POST /api/v1/auth/signup} — username + password registration.</li>
+ *   <li>{@code POST /api/v1/auth/login} — exchange credentials for access + refresh tokens.</li>
+ *   <li>{@code POST /api/v1/auth/refresh} — exchange a refresh token for a new pair (carries
+ *       the refresh token in the body, so the endpoint itself is unauthenticated).</li>
  * </ul>
  *
- * <p>Everything else demands a valid JWT.
+ * <p>Everything else — including {@code POST /api/v1/auth/logout} — demands a valid JWT.
  */
 @Configuration
 @RequiredArgsConstructor
@@ -47,7 +49,9 @@ public class SecurityConfig {
                                 "/actuator/health",
                                 "/actuator/info",
                                 "/api/v1/submissions/health",
-                                "/api/v1/auth/token"
+                                "/api/v1/auth/signup",
+                                "/api/v1/auth/login",
+                                "/api/v1/auth/refresh"
                         ).permitAll()
                         .anyRequest().authenticated())
                 .exceptionHandling(eh ->

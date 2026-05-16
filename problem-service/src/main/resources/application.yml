@@ -18,8 +18,9 @@ spring:
 
   jpa:
     hibernate:
-      # Schema lives in database/init.sql (single source of truth across
-      # services). Hibernate must not auto-mutate it.
+      # Schema lives in api-gateway's Flyway migrations (post-V3 there is a
+      # single canonical `onlinejudge` database; api-gateway owns ALL DDL).
+      # problem-service is a pure JPA consumer — must NOT mutate the schema.
       ddl-auto: validate
     show-sql: false
     properties:

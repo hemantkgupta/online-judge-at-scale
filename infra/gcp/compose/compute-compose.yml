@@ -86,7 +86,8 @@ services:
       - oj-sandbox-manager
     environment:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: ${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:9092
-      SPRING_DATASOURCE_URL: jdbc:postgresql://${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:26257/defaultdb?sslmode=disable
+      # Unified DB (post-V3). Was `defaultdb` until V3 collapsed the two-database split.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${CONTROL_PLANE_IP:?must set CONTROL_PLANE_IP}:26257/onlinejudge?sslmode=disable
       SPRING_DATASOURCE_USERNAME: root
       APP_SANDBOX_BACKEND:                   ${APP_SANDBOX_BACKEND:-firecracker}
       APP_SANDBOX_DOCKER_RUNTIME:            ${APP_SANDBOX_DOCKER_RUNTIME:-runc}

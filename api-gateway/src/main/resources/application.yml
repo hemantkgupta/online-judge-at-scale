@@ -1,5 +1,16 @@
 server:
   port: 8080
+  # Roadmap §3.6 — gateway-level submission body cap. The authoritative
+  # per-field cap is @Size(max=65536) on SubmissionRequest.code (returns 400).
+  # These server-side caps protect against oversized bodies BEFORE they reach
+  # Spring/Jackson, so a 50 MB POST cannot exhaust JVM heap on its way to
+  # being rejected.
+  tomcat:
+    # Bytes Tomcat will swallow (discard) on an abort. Cap at 128 KiB so we
+    # don't sit reading megabytes from a closed/abusive client.
+    max-swallow-size: 131072
+    # Cap on form-encoded POSTs (we receive JSON so this is mostly defensive).
+    max-http-form-post-size: 131072
 
 spring:
   threads:
@@ -7,13 +18,20 @@ spring:
       enabled: true   # Java 21 Virtual Threads
 
   datasource:
-    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
+    # Single canonical database. Pre-V3 we used `defaultdb` (an accident of
+    # CRDB's superuser default) while problem-service used `onlinejudge`.
+    # V3 unifies everything onto `onlinejudge`. Flyway in this service owns
+    # schema; `database/init.sql` is retired.
+    url: jdbc:postgresql://localhost:26257/onlinejudge?sslmode=disable
     username: root
     password:
     driver-class-name: org.postgresql.Driver
 
   jpa:
     hibernate:
+      # validate is the right end state: Flyway V3 produces a schema that
+      # matches the JPA entities exactly. If you see ddl-auto=none anywhere
+      # in compose, that's a leftover from the two-database era — drop it.
       ddl-auto: validate
     show-sql: false
     properties:
@@ -37,12 +55,31 @@ spring:
       port: 6379
 
 app:
-  # JWT (Part 3 of the blog). HS256 with a pre-shared secret for the demo;
-  # production uses an IdP that signs with RS256 and the gateway only verifies.
-  # The secret MUST be at least 32 bytes for HS256 — anything shorter is
-  # rejected at startup by JwtTokenProvider.
+  # JWT (Part 3 of the blog). HS256 with pre-shared keys for the demo; production
+  # uses an IdP that signs with RS256 and the gateway only verifies.
+  #
+  # Key rotation: `keys.<kid>` map plus `kid-current` / `kid-previous`. New
+  # tokens are signed with the key under `kid-current`. Inbound tokens whose
+  # `kid` header references `kid-previous` are still accepted for one rotation
+  # cycle. Every key value MUST be at least 32 bytes for HS256 — startup fails
+  # otherwise.
+  #
+  # TODO(secret-manager): the actual key bytes should be sourced from Google
+  # Secret Manager (one secret per kid) rather than env. Tracked in a separate
+  # rotation pass — for now `JWT_SECRET` continues to feed keys.v1.
   jwt:
-    secret: dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256
+    secret: ${JWT_SECRET:dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256}
+    keys:
+      v1: ${JWT_KEY_V1:${JWT_SECRET:dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256}}
+      v2: ${JWT_KEY_V2:}
+    kid-current: ${JWT_KID_CURRENT:v1}
+    kid-previous: ${JWT_KID_PREVIOUS:}
+    # Access tokens are short-lived (15 min) and stateless. Refresh tokens
+    # live 7 days, sit in the refresh_tokens table, and rotate on every use.
+    access-ttl-seconds: ${JWT_ACCESS_TTL_SECONDS:900}
+    refresh-ttl-seconds: ${JWT_REFRESH_TTL_SECONDS:604800}
+    # Legacy property — pre-V5 token TTL hours. Kept so the JwtTokenProvider
+    # 3-arg test constructor still has a meaningful "ttl" parameter.
     ttl-hours: 8
     issuer: online-judge
 

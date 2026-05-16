@@ -3,7 +3,7 @@ package com.onlinejudge.problem.controller;
 import com.onlinejudge.problem.dto.CreateProblemRequest;
 import com.onlinejudge.problem.dto.CreateTestCaseRequest;
 import com.onlinejudge.problem.dto.ProblemDto;
-import com.onlinejudge.problem.dto.TestCaseUrlsDto;
+import com.onlinejudge.problem.dto.TestCaseBundleDto;
 import com.onlinejudge.problem.service.ProblemService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -65,14 +65,27 @@ public class ProblemController {
     }
 
     /**
-     * The critical endpoint. Returns an ordered list of test-case URLs.
+     * The critical endpoint. Returns the per-problem time/memory limits
+     * plus an ordered list of test-case URLs.
+     *
+     * <p>Wire shape (snake_case JSON, Workstream B's contract):
+     * <pre>
+     * {
+     *   "time_limit_ms":  1000,
+     *   "memory_limit_mb": 256,
+     *   "test_cases": [
+     *     {"ordinal": 1, "input_url": "...", "expected_output_url": "..."},
+     *     ...
+     *   ]
+     * }
+     * </pre>
      *
      * @param pretestOnly if true, only ordinals 1–10 are returned
      */
     @GetMapping("/{id}/test-cases")
-    public List<TestCaseUrlsDto> getTestCaseUrls(@PathVariable UUID id,
-                                                 @RequestParam(defaultValue = "false") boolean pretestOnly) {
-        return problemService.getTestCaseUrls(id, pretestOnly);
+    public TestCaseBundleDto getTestCaseBundle(@PathVariable UUID id,
+                                               @RequestParam(defaultValue = "false") boolean pretestOnly) {
+        return problemService.getTestCaseBundle(id, pretestOnly);
     }
 
     @ExceptionHandler(NoSuchElementException.class)

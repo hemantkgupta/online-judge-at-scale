@@ -65,7 +65,7 @@ class FirecrackerExecutionServiceTest {
         AgentClient ac = newMockAgent();
         FirecrackerExecutionService svc = newSvc(sm, ac);
 
-        var result = svc.execute("s1", "rust", "fn main() {}", ONE_CASE);
+        var result = svc.execute("s1", "rust", "fn main() {}", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("INTERNAL_ERROR");
         verify(sm, never()).lease(anyString(), anyString(), anyInt());
@@ -87,7 +87,7 @@ class FirecrackerExecutionServiceTest {
                 .thenReturn(agentResult("OK", 1, "OK", 137, 2048));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s1", "python", "print(42)", ONE_CASE);
+        var result = svc.execute("s1", "python", "print(42)", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("OK");
         assertThat(result.executionTimeMs()).isEqualTo(137);
@@ -115,7 +115,7 @@ class FirecrackerExecutionServiceTest {
                 .thenReturn(agentResult("TIMEOUT", 1, "TIMEOUT", 5000, 1024));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s2", "python", "while True: pass", ONE_CASE);
+        var result = svc.execute("s2", "python", "while True: pass", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("TIME_LIMIT_EXCEEDED");
     }
@@ -131,7 +131,7 @@ class FirecrackerExecutionServiceTest {
                 .thenReturn(agentResult("COMPILE_ERROR", 1, "COMPILE_ERROR", 80, 0));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s3", "java", "class Solution {", ONE_CASE);
+        var result = svc.execute("s3", "java", "class Solution {", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("COMPILE_ERROR");
     }
@@ -147,7 +147,7 @@ class FirecrackerExecutionServiceTest {
                 .thenReturn(agentResult("WRONG_ANSWER", 2, "WRONG_ANSWER", 22, 2300));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s-wa", "python", "print('x')", ONE_CASE);
+        var result = svc.execute("s-wa", "python", "print('x')", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("WRONG_ANSWER");
         verify(sm).release("sb-wa");
@@ -161,7 +161,7 @@ class FirecrackerExecutionServiceTest {
                 .thenThrow(new IOException("manager unreachable"));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s5", "python", "print()", ONE_CASE);
+        var result = svc.execute("s5", "python", "print()", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("INTERNAL_ERROR");
         assertThat(result.output()).contains("manager unreachable");
@@ -182,7 +182,7 @@ class FirecrackerExecutionServiceTest {
                 .thenReturn(AgentResult.internalError("agent ate it"));
 
         FirecrackerExecutionService svc = newSvc(sm, ac);
-        var result = svc.execute("s6", "python", "print()", ONE_CASE);
+        var result = svc.execute("s6", "python", "print()", ONE_CASE, 0, 0);
 
         assertThat(result.status()).isEqualTo("INTERNAL_ERROR");
         verify(sm).release("sb-bad");

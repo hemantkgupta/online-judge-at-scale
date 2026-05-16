@@ -7,7 +7,10 @@ spring:
       enabled: true
 
   datasource:
-    url: jdbc:postgresql://localhost:26257/defaultdb?sslmode=disable
+    # Unified DB (post-V3). The execution-worker reads idempotency_keys/
+    # outbox_events alongside api-gateway, so it must point at the same
+    # database. Override in compose via SPRING_DATASOURCE_URL.
+    url: jdbc:postgresql://localhost:26257/onlinejudge?sslmode=disable
     username: root
     password:
     driver-class-name: org.postgresql.Driver
@@ -45,6 +48,14 @@ app:
       system: submissions.system
       evaluated-results: evaluated_results
       analytics: analytics_events
+      # Roadmap §2.5 — dead-letter sink for poisoned submissions
+      # (idempotency attempts cap exceeded). Operators replay manually
+      # after fixing the root cause.
+      dlq: submissions.dlq
+  # Roadmap §2.5 — bound the idempotency reclaim loop.
+  idempotency:
+    processing-lease-seconds: 300
+    max-attempts: 5
   execution:
     timeout-seconds: 5
     memory-limit-mb: 256

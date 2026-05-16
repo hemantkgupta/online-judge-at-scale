@@ -10,7 +10,7 @@
 #   ${region}              e.g. asia-south1
 #   ${jwt_secret}          48-byte random secret (terraform random_password)
 #   ${compose_yaml_b64}    base64-encoded control-plane-compose.yml
-#   ${init_sql_b64}        base64-encoded database/init.sql (CRDB schema bootstrap)
+#   (init_sql_b64 was removed in V3 — Flyway in api-gateway owns the schema)
 #   ${gcs_bucket_name}     GCS bucket holding per-ordinal input/expected objects
 #   ${gcs_signer_secret}   Secret Manager secret id holding the signer SA JSON key
 #
@@ -66,11 +66,12 @@ AR_REGISTRY="$(echo '${ar_url}' | cut -d/ -f1)"
 echo "[oj-startup] configuring docker auth for $AR_REGISTRY"
 gcloud auth configure-docker "$AR_REGISTRY" --quiet
 
-# ---------- Drop compose + init.sql + .env ----------------------------------
+# ---------- Drop compose + .env ---------------------------------------------
 install -d -m 0755 /opt/oj
 
 echo '${compose_yaml_b64}' | base64 -d > /opt/oj/control-plane-compose.yml
-echo '${init_sql_b64}'     | base64 -d > /opt/oj/init.sql
+# init.sql is no longer injected here — V3 retired the two-database split.
+# api-gateway's Flyway migrations own the schema on the `onlinejudge` DB.
 
 # Internal IP of this VM, discovered from the GCE metadata service — used as
 # the advertised Kafka host for off-VM clients (i.e. the compute VM).

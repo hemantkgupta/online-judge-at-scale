@@ -2,6 +2,7 @@ package com.onlinejudge.problem.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.problem.dto.CreateProblemRequest;
+import com.onlinejudge.problem.dto.TestCaseBundleDto;
 import com.onlinejudge.problem.dto.TestCaseUrlsDto;
 import com.onlinejudge.problem.entity.Problem;
 import com.onlinejudge.problem.service.ProblemService;
@@ -102,45 +103,49 @@ class ProblemControllerTest {
     @Test
     void getTestCaseUrls_pretestOnly_returnsTenUrls() throws Exception {
         UUID id = UUID.randomUUID();
-        when(problemService.getTestCaseUrls(eq(id), eq(true)))
-                .thenReturn(buildUrls(10));
+        when(problemService.getTestCaseBundle(eq(id), eq(true)))
+                .thenReturn(new TestCaseBundleDto(1000, 256, buildUrls(10)));
 
         mvc.perform(get("/api/v1/problems/{id}/test-cases", id).param("pretestOnly", "true"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.length()").value(10))
-                .andExpect(jsonPath("$[0].ordinal").value(1))
-                .andExpect(jsonPath("$[0].input_url").exists())
-                .andExpect(jsonPath("$[0].expected_output_url").exists())
-                .andExpect(jsonPath("$[9].ordinal").value(10));
+                .andExpect(jsonPath("$.time_limit_ms").value(1000))
+                .andExpect(jsonPath("$.memory_limit_mb").value(256))
+                .andExpect(jsonPath("$.test_cases.length()").value(10))
+                .andExpect(jsonPath("$.test_cases[0].ordinal").value(1))
+                .andExpect(jsonPath("$.test_cases[0].input_url").exists())
+                .andExpect(jsonPath("$.test_cases[0].expected_output_url").exists())
+                .andExpect(jsonPath("$.test_cases[9].ordinal").value(10));
     }
 
     @Test
     void getTestCaseUrls_full_returnsAll() throws Exception {
         UUID id = UUID.randomUUID();
-        when(problemService.getTestCaseUrls(eq(id), eq(false)))
-                .thenReturn(buildUrls(12));
+        when(problemService.getTestCaseBundle(eq(id), eq(false)))
+                .thenReturn(new TestCaseBundleDto(2000, 512, buildUrls(12)));
 
         mvc.perform(get("/api/v1/problems/{id}/test-cases", id).param("pretestOnly", "false"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.length()").value(12))
-                .andExpect(jsonPath("$[11].ordinal").value(12));
+                .andExpect(jsonPath("$.time_limit_ms").value(2000))
+                .andExpect(jsonPath("$.memory_limit_mb").value(512))
+                .andExpect(jsonPath("$.test_cases.length()").value(12))
+                .andExpect(jsonPath("$.test_cases[11].ordinal").value(12));
     }
 
     @Test
     void getTestCaseUrls_defaultsToFullWhenParamOmitted() throws Exception {
         UUID id = UUID.randomUUID();
-        when(problemService.getTestCaseUrls(eq(id), eq(false)))
-                .thenReturn(buildUrls(3));
+        when(problemService.getTestCaseBundle(eq(id), eq(false)))
+                .thenReturn(new TestCaseBundleDto(1000, 256, buildUrls(3)));
 
         mvc.perform(get("/api/v1/problems/{id}/test-cases", id))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.length()").value(3));
+                .andExpect(jsonPath("$.test_cases.length()").value(3));
     }
 
     @Test
     void getTestCaseUrls_unknownProblem_returns404() throws Exception {
         UUID id = UUID.randomUUID();
-        when(problemService.getTestCaseUrls(eq(id), any(Boolean.class)))
+        when(problemService.getTestCaseBundle(eq(id), any(Boolean.class)))
                 .thenThrow(new NoSuchElementException("Problem not found: " + id));
 
         mvc.perform(get("/api/v1/problems/{id}/test-cases", id))

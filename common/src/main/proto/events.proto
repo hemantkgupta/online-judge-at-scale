@@ -40,6 +40,24 @@ message VerdictEvent {
   // correction in Flink scoring. Equals gateway_ts_ms in the happy path; an
   // out-of-order verdict carries the same timestamp it had at the gateway.
   int64 event_ts_ms = 12;
+  // Roadmap §2.4 — per-ordinal breakdown of the run. The execution-worker
+  // populates one entry per test case the in-guest agent ran; consumers
+  // that pre-date this field ignore it (proto3 unknown-field tolerance).
+  // NOTE: stdout_hash carries ONLY the SHA-256 hash, never bytes — preserving
+  // the test-case secrecy invariant from Workstream B.
+  repeated PerTestVerdict per_test = 13;
+}
+
+// Roadmap §2.4 — one row per test ordinal the agent executed.
+message PerTestVerdict {
+  int32  ordinal     = 1;
+  // OK / WRONG_ANSWER / RUNTIME_ERROR / TIME_LIMIT_EXCEEDED / MEMORY_LIMIT_EXCEEDED / COMPILE_ERROR / INTERNAL_ERROR
+  string verdict     = 2;
+  int64  time_ms     = 3;
+  int64  memory_kb   = 4;
+  // SHA-256 hex of the canonicalized stdout, for debugging hash mismatches.
+  // Never the raw stdout bytes.
+  string stdout_hash = 5;
 }
 
 message AnalyticsEvent {

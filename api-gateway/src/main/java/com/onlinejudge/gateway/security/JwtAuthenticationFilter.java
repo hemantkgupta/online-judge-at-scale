@@ -29,8 +29,9 @@ import java.util.List;
  * <p>On a missing or invalid token, the filter does <em>not</em> short-circuit
  * with a 401 itself — it leaves the {@code SecurityContext} empty and lets
  * Spring Security's authorization rules in {@link SecurityConfig} decide
- * whether the route requires authentication. This keeps the {@code /actuator/health}
- * and dev {@code /api/v1/auth/token} endpoints reachable without tokens.
+ * whether the route requires authentication. This keeps the public auth
+ * endpoints ({@code /signup}, {@code /login}, {@code /refresh}) and the
+ * actuator health endpoints reachable without tokens.
  */
 @Slf4j
 @Component

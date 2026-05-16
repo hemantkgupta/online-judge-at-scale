@@ -1,7 +1,9 @@
 package com.onlinejudge.worker.service;
 
 import com.onlinejudge.worker.observability.WorkerMetrics;
+import com.onlinejudge.worker.service.ProblemServiceClient.TestCaseBundle;
 import com.onlinejudge.worker.service.ProblemServiceClient.TestCaseUrls;
+import com.onlinejudge.worker.service.TestCaseFetcher.ProblemSpec;
 import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
 import org.junit.jupiter.api.Test;
 
@@ -71,10 +73,10 @@ class TestCaseFetcherTest {
         WorkerMetrics metrics = mock(WorkerMetrics.class);
 
         when(psc.fetchTestCases(eq("p-1"), eq(true)))
-                .thenReturn(List.of(
+                .thenReturn(new TestCaseBundle(1000, 256, List.of(
                         new TestCaseUrls(1,
                                 "https://storage.googleapis.com/oj-tests/p-1/1/input?sig=A",
-                                "https://storage.googleapis.com/oj-tests/p-1/1/expected?sig=B")));
+                                "https://storage.googleapis.com/oj-tests/p-1/1/expected?sig=B"))));
 
         Map<String, byte[]> table = new HashMap<>();
         table.put("https://storage.googleapis.com/oj-tests/p-1/1/input?sig=A",
@@ -84,13 +86,17 @@ class TestCaseFetcherTest {
 
         TestCaseFetcher fetcher = new TestCaseFetcher(psc, metrics, fakeClient(table));
 
-        List<TestCaseSpec> specs = fetcher.fetch("p-1", "pretest");
+        ProblemSpec result = fetcher.fetch("p-1", "pretest");
+        List<TestCaseSpec> specs = result.testCases();
 
         assertThat(specs).hasSize(1);
         TestCaseSpec spec = specs.get(0);
         assertThat(spec.ordinal()).isEqualTo(1);
         assertThat(spec.input()).isEqualTo("3 1 4 1 5\n");
         assertThat(spec.expectedHash()).isEqualTo(HELLO_HASH);
+        // Roadmap §2.3 — per-problem limits travel on the ProblemSpec.
+        assertThat(result.timeLimitMs()).isEqualTo(1000);
+        assertThat(result.memoryLimitMb()).isEqualTo(256);
 
         verify(metrics, org.mockito.Mockito.atLeastOnce())
                 .recordGcsFetchLatency(org.mockito.ArgumentMatchers.anyLong(), eq("tests"));
@@ -99,7 +105,8 @@ class TestCaseFetcherTest {
     @Test
     void fetch_systemPhase_passesPretestOnlyFalse() throws Exception {
         ProblemServiceClient psc = mock(ProblemServiceClient.class);
-        when(psc.fetchTestCases(any(), anyBoolean())).thenReturn(List.of());
+        when(psc.fetchTestCases(any(), anyBoolean()))
+                .thenReturn(new TestCaseBundle(0, 0, List.of()));
 
         TestCaseFetcher fetcher = new TestCaseFetcher(psc, mock(WorkerMetrics.class), fakeClient(Map.of()));
         fetcher.fetch("p-1", "system");

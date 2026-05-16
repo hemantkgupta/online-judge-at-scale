@@ -71,6 +71,25 @@ public class SandboxManagerClient {
                 "memoryMib",    memoryMib == null ? 256 : memoryMib);
 
         HttpResponse<String> resp = post("/lease", body, Duration.ofSeconds(15));
+
+        // Roadmap §2.5 + Problem 4: distinguish "pool exhausted" from a
+        // real error. 503 with body {"error":"pool_exhausted",
+        // "retry_after_ms":<ms>} is transient backpressure — translate it
+        // to a typed exception the consumer treats as nack+retry without
+        // burning an idempotency attempt or publishing a wrong-cause
+        // RUNTIME_ERROR verdict (which is what used to leak before this
+        // patch — see the smoke run on 2026-05-16).
+        if (resp.statusCode() == 503) {
+            JsonNode n = safeReadTree(resp.body());
+            String err = n.path("error").asText("");
+            if ("pool_exhausted".equals(err)) {
+                long retryAfter = n.path("retry_after_ms").asLong(250L);
+                throw new com.onlinejudge.worker.service.PoolExhaustedException(
+                        n.path("language").asText(language), retryAfter);
+            }
+            throw new IOException("sandbox-manager /lease HTTP 503 (non-pool-exhausted): "
+                    + resp.body());
+        }
         if (resp.statusCode() != 200) {
             throw new IOException("sandbox-manager /lease HTTP " + resp.statusCode()
                     + ": " + resp.body());
@@ -81,6 +100,16 @@ public class SandboxManagerClient {
                 n.path("sessionToken").asText(),
                 n.path("vsockUdsPath").asText(),
                 n.path("vsockPort").asInt());
+    }
+
+    /** Tolerant JSON parse — used on error paths so we never compound an
+     *  IO failure with a parse failure. */
+    private JsonNode safeReadTree(String body) {
+        try {
+            return objectMapper.readTree(body == null ? "{}" : body);
+        } catch (Exception e) {
+            return objectMapper.createObjectNode();
+        }
     }
 
     public void release(String sandboxId) {

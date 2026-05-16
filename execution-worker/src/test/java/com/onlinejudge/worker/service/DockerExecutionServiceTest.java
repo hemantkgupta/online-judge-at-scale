@@ -34,7 +34,7 @@ class DockerExecutionServiceTest {
 
     @Test
     void executionResult_recordHasCorrectFields() {
-        var result = new DockerExecutionService.ExecutionResult("OK", "42", 150, 32);
+        var result = new ExecutionBackend.ExecutionResult("OK", "42", 150, 32);
 
         assertThat(result.status()).isEqualTo("OK");
         assertThat(result.output()).isEqualTo("42");
@@ -44,7 +44,7 @@ class DockerExecutionServiceTest {
 
     @Test
     void executionResult_timeLimitExceeded() {
-        var result = new DockerExecutionService.ExecutionResult("TIME_LIMIT_EXCEEDED", "", 5001, 0);
+        var result = new ExecutionBackend.ExecutionResult("TIME_LIMIT_EXCEEDED", "", 5001, 0);
 
         assertThat(result.status()).isEqualTo("TIME_LIMIT_EXCEEDED");
         assertThat(result.executionTimeMs()).isGreaterThan(5000);
@@ -52,7 +52,7 @@ class DockerExecutionServiceTest {
 
     @Test
     void executionResult_runtimeError() {
-        var result = new DockerExecutionService.ExecutionResult("RUNTIME_ERROR", "ZeroDivisionError", 50, 0);
+        var result = new ExecutionBackend.ExecutionResult("RUNTIME_ERROR", "ZeroDivisionError", 50, 0);
 
         assertThat(result.status()).isEqualTo("RUNTIME_ERROR");
         assertThat(result.output()).contains("ZeroDivisionError");
@@ -60,7 +60,7 @@ class DockerExecutionServiceTest {
 
     @Test
     void executionResult_internalError() {
-        var result = new DockerExecutionService.ExecutionResult("INTERNAL_ERROR", "IOException", 0, 0);
+        var result = new ExecutionBackend.ExecutionResult("INTERNAL_ERROR", "IOException", 0, 0);
 
         assertThat(result.status()).isEqualTo("INTERNAL_ERROR");
     }
@@ -68,8 +68,9 @@ class DockerExecutionServiceTest {
     @Test
     void execute_handlesNullTestCases() {
         // This will attempt Docker execution which may fail without Docker,
-        // but should not throw NPE on null test-case list.
-        var result = executionService.execute("test-id", "python", "print(1)", null);
+        // but should not throw NPE on null test-case list. 0/0 → backend
+        // applies its application.yml defaults (roadmap §2.3).
+        var result = executionService.execute("test-id", "python", "print(1)", null, 0, 0);
         assertThat(result).isNotNull();
         assertThat(result.status()).isIn("OK", "INTERNAL_ERROR", "RUNTIME_ERROR", "TIME_LIMIT_EXCEEDED");
     }
@@ -77,15 +78,15 @@ class DockerExecutionServiceTest {
     @Test
     void execute_handlesEmptyTestCases() {
         var result = executionService.execute("test-id", "python", "print(1)",
-                List.<TestCaseSpec>of());
+                List.<TestCaseSpec>of(), 0, 0);
         assertThat(result).isNotNull();
         assertThat(result.status()).isIn("OK", "INTERNAL_ERROR", "RUNTIME_ERROR", "TIME_LIMIT_EXCEEDED");
     }
 
     @Test
     void executionResult_recordEquality() {
-        var result1 = new DockerExecutionService.ExecutionResult("OK", "42", 100, 10);
-        var result2 = new DockerExecutionService.ExecutionResult("OK", "42", 100, 10);
+        var result1 = new ExecutionBackend.ExecutionResult("OK", "42", 100, 10);
+        var result2 = new ExecutionBackend.ExecutionResult("OK", "42", 100, 10);
 
         assertThat(result1).isEqualTo(result2);
         assertThat(result1.hashCode()).isEqualTo(result2.hashCode());
@@ -93,8 +94,8 @@ class DockerExecutionServiceTest {
 
     @Test
     void executionResult_differentStatusNotEqual() {
-        var ok = new DockerExecutionService.ExecutionResult("OK", "42", 100, 10);
-        var tle = new DockerExecutionService.ExecutionResult("TIME_LIMIT_EXCEEDED", "42", 100, 10);
+        var ok = new ExecutionBackend.ExecutionResult("OK", "42", 100, 10);
+        var tle = new ExecutionBackend.ExecutionResult("TIME_LIMIT_EXCEEDED", "42", 100, 10);
 
         assertThat(ok).isNotEqualTo(tle);
     }

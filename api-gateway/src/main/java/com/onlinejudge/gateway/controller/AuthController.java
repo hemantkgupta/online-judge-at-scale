@@ -1,57 +1,107 @@
 package com.onlinejudge.gateway.controller;
 
-import com.onlinejudge.gateway.security.JwtTokenProvider;
-import jakarta.validation.constraints.NotBlank;
-import lombok.Data;
+import com.onlinejudge.gateway.dto.LoginRequest;
+import com.onlinejudge.gateway.dto.LogoutRequest;
+import com.onlinejudge.gateway.dto.RefreshRequest;
+import com.onlinejudge.gateway.dto.SignupRequest;
+import com.onlinejudge.gateway.dto.SignupResponse;
+import com.onlinejudge.gateway.dto.TokenPairResponse;
+import com.onlinejudge.gateway.service.AuthService;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Map;
+import java.util.UUID;
+
 /**
- * Dev-only token mint endpoint (Part 3 of the blog).
+ * Authentication endpoints.
  *
- * <p>In production, JWTs come from a dedicated identity provider (the blog's
- * Auth/Identity Service) — the API gateway only <em>verifies</em> tokens, never
- * mints them. For the local demo there's no IdP, so this endpoint hands out a
- * token for any user-id the caller asks for. Permitted in {@link com.onlinejudge.gateway.security.SecurityConfig}.
+ * <p>Replaces the pre-V5 dev-token-mint endpoint with real signup, login,
+ * refresh, and logout. All four endpoints write an audit row to
+ * {@code auth_events}; failed attempts are recorded too (LOGIN_FAIL with the
+ * reason in {@code detail}).
  *
- * <p>Usage:
- * <pre>{@code
- *   curl -X POST http://localhost:8080/api/v1/auth/token \
- *        -H 'Content-Type: application/json' \
- *        -d '{"userId":"00000000-0000-0000-0000-000000000001"}'
- *   # → {"accessToken":"<JWT>"}
- *
- *   curl -X POST http://localhost:8080/api/v1/submissions \
- *        -H 'Authorization: Bearer <JWT>' \
- *        -H 'Content-Type: application/json' \
- *        -d '{"problemId":"...","language":"python","code":"print(42)"}'
- * }</pre>
+ * <p>The old {@code POST /api/v1/auth/token} endpoint has been removed. Any
+ * test or script that still calls it must move to {@code POST /api/v1/auth/login}.
+ * TODO: audit callers in tests/scripts that still hit /auth/token (see infra/end-to-end-mac-pi.md).
  */
+@Slf4j
 @RestController
 @RequestMapping("/api/v1/auth")
 @RequiredArgsConstructor
 public class AuthController {
 
-    private final JwtTokenProvider tokenProvider;
+    private final AuthService authService;
 
-    @PostMapping("/token")
-    public ResponseEntity<TokenResponse> token(@RequestBody TokenRequest req) {
-        String jwt = tokenProvider.issueToken(req.getUserId());
-        return ResponseEntity.ok(new TokenResponse(jwt));
+    @PostMapping("/signup")
+    public ResponseEntity<?> signup(@Valid @RequestBody SignupRequest req, HttpServletRequest httpReq) {
+        try {
+            UUID userId = authService.signup(req, clientIp(httpReq), userAgent(httpReq));
+            return ResponseEntity.status(HttpStatus.CREATED).body(new SignupResponse(userId));
+        } catch (AuthService.AuthException ex) {
+            return errorResponse(ex);
+        }
     }
 
-    @Data
-    public static class TokenRequest {
-        @NotBlank
-        private String userId;
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest req, HttpServletRequest httpReq) {
+        try {
+            TokenPairResponse pair = authService.login(req, clientIp(httpReq), userAgent(httpReq));
+            return ResponseEntity.ok(pair);
+        } catch (AuthService.AuthException ex) {
+            return errorResponse(ex);
+        }
     }
 
-    @Data
-    public static class TokenResponse {
-        private final String accessToken;
+    @PostMapping("/refresh")
+    public ResponseEntity<?> refresh(@Valid @RequestBody RefreshRequest req, HttpServletRequest httpReq) {
+        try {
+            TokenPairResponse pair = authService.refresh(req.getRefreshToken(), clientIp(httpReq), userAgent(httpReq));
+            return ResponseEntity.ok(pair);
+        } catch (AuthService.AuthException ex) {
+            return errorResponse(ex);
+        }
+    }
+
+    @PostMapping("/logout")
+    public ResponseEntity<?> logout(@Valid @RequestBody LogoutRequest req,
+                                    @AuthenticationPrincipal String userId,
+                                    HttpServletRequest httpReq) {
+        if (userId == null || userId.isBlank()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        try {
+            authService.logout(UUID.fromString(userId), req.getRefreshToken(),
+                    clientIp(httpReq), userAgent(httpReq));
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException ex) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+    }
+
+    private static ResponseEntity<Map<String, String>> errorResponse(AuthService.AuthException ex) {
+        return ResponseEntity.status(ex.status()).body(Map.of("error", ex.getMessage()));
+    }
+
+    private static String clientIp(HttpServletRequest req) {
+        String xff = req.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            int comma = xff.indexOf(',');
+            return (comma > 0 ? xff.substring(0, comma) : xff).trim();
+        }
+        return req.getRemoteAddr();
+    }
+
+    private static String userAgent(HttpServletRequest req) {
+        return req.getHeader("User-Agent");
     }
 }

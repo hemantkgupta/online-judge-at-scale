@@ -110,7 +110,23 @@ public class DockerExecutionService implements ExecutionBackend {
 
     @Override
     public ExecutionResult execute(String submissionId, String language, String code,
-                                   List<TestCaseSpec> testCases) {
+                                   List<TestCaseSpec> testCases,
+                                   int timeLimitMs, int memoryLimitMb) {
+        // Docker backend respects the per-problem limits when supplied
+        // (roadmap §2.3). 0 means "fall back to the application.yml
+        // default" — that path is also exercised by the smoke / bypass
+        // flow where problem-service is intentionally not deployed.
+        int effectiveTimeoutSec = timeLimitMs > 0
+                ? Math.max(1, (timeLimitMs + 999) / 1000)
+                : timeoutSeconds;
+        int effectiveMemoryMb = memoryLimitMb > 0 ? memoryLimitMb : this.memoryLimitMb;
+        return executeInternal(submissionId, language, code, testCases,
+                effectiveTimeoutSec, effectiveMemoryMb);
+    }
+
+    private ExecutionResult executeInternal(String submissionId, String language, String code,
+                                            List<TestCaseSpec> testCases,
+                                            int effectiveTimeoutSec, int effectiveMemoryMb) {
         // Docker backend runs the first test case only — it's the dev / smoke
         // fallback when Firecracker isn't available. Multi-test orchestration
         // lives in the Firecracker path (which ships all cases over vsock in a
@@ -129,7 +145,8 @@ public class DockerExecutionService implements ExecutionBackend {
             Path inputFile = tempDir.resolve("input.txt");
             Files.writeString(inputFile, input);
 
-            List<String> cmd = buildDockerCommand(cfg.image(), language, tempDir.toString());
+            List<String> cmd = buildDockerCommand(cfg.image(), language,
+                    tempDir.toString(), effectiveMemoryMb);
             long startMs = System.currentTimeMillis();
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -137,7 +154,7 @@ public class DockerExecutionService implements ExecutionBackend {
             pb.redirectErrorStream(true);
             Process process = pb.start();
 
-            boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            boolean finished = process.waitFor(effectiveTimeoutSec, TimeUnit.SECONDS);
             long execMs = System.currentTimeMillis() - startMs;
 
             if (!finished) {
@@ -170,13 +187,18 @@ public class DockerExecutionService implements ExecutionBackend {
      * (seccomp, cgroupns) are inherited inside the VM, so the safest behavior
      * elsewhere is to skip the flag rather than risk a mis-configured container.
      */
+    /** Test seam — legacy signature uses the configured default memory cap. */
     List<String> buildDockerCommand(String image, String language, String hostDir) {
+        return buildDockerCommand(image, language, hostDir, memoryLimitMb);
+    }
+
+    List<String> buildDockerCommand(String image, String language, String hostDir, int memCapMb) {
         LanguageConfig langCfg = languageConfig(language);
         List<String> cmd = new ArrayList<>(List.of(
             "docker", "run",
             "--rm",                                // destroy-never-reuse
             "--network", "none",                   // air-gapped network
-            "--memory", memoryLimitMb + "m",       // memory.max equivalent
+            "--memory", memCapMb + "m",            // memory.max equivalent
             "--cpus", "0.5",                       // cpu.max equivalent
             "--pids-limit", "64",                  // pids.max: fork bomb defense
             "--read-only",                         // immutable filesystem
@@ -233,5 +255,8 @@ public class DockerExecutionService implements ExecutionBackend {
         } catch (IOException ignored) {}
     }
 
-    public record ExecutionResult(String status, String output, int executionTimeMs, int memoryUsedMb) {}
+    // The previous wrapper class `DockerExecutionService.ExecutionResult` was
+    // removed because it shadowed the interface record `ExecutionBackend.ExecutionResult`
+    // in this scope, breaking @Override on execute(...). Tests now reference
+    // the interface record directly: `new ExecutionBackend.ExecutionResult(...)`.
 }

@@ -2,6 +2,7 @@ package com.onlinejudge.problem.service;
 
 import com.onlinejudge.problem.dto.CreateProblemRequest;
 import com.onlinejudge.problem.dto.CreateTestCaseRequest;
+import com.onlinejudge.problem.dto.TestCaseBundleDto;
 import com.onlinejudge.problem.dto.TestCaseUrlsDto;
 import com.onlinejudge.problem.entity.Problem;
 import com.onlinejudge.problem.entity.TestCase;
@@ -84,25 +85,59 @@ public class ProblemService {
      * signed GCS download URL valid for 5 minutes.
      *
      * @throws NoSuchElementException if the problem does not exist
+     * @deprecated retained for the few unit tests that asserted directly on
+     *     this shape. Production callers should use
+     *     {@link #getTestCaseBundle(UUID, boolean)} which carries the
+     *     per-problem time/memory limits the execution worker needs.
      */
+    @Deprecated
     public List<TestCaseUrlsDto> getTestCaseUrls(UUID problemId, boolean pretestOnly) {
-        if (!problemRepository.existsById(problemId)) {
-            throw new NoSuchElementException("Problem not found: " + problemId);
-        }
+        return getTestCaseBundle(problemId, pretestOnly).testCases();
+    }
+
+    /**
+     * Returns ordered test-case URLs + the per-problem time/memory limits.
+     *
+     * <p>The bundle envelope carries {@code time_limit_ms} and
+     * {@code memory_limit_mb} from the {@code problems} row alongside the
+     * signed download URLs. The execution worker uses those limits to:
+     * <ul>
+     *   <li>configure the per-test wall clock the in-guest agent enforces
+     *       ({@code time_limit_ms} on the agent request);</li>
+     *   <li>size the leased sandbox's memory cgroup ({@code memory_limit_mb}
+     *       passed to the Sandbox Manager's {@code /lease} body); and</li>
+     *   <li>map an over-budget OK run to {@code TIME_LIMIT_EXCEEDED} when
+     *       the agent's reported time exceeds the contestant budget.</li>
+     * </ul>
+     *
+     * @throws NoSuchElementException if the problem does not exist
+     */
+    public TestCaseBundleDto getTestCaseBundle(UUID problemId, boolean pretestOnly) {
+        Problem problem = problemRepository.findById(problemId)
+                .orElseThrow(() -> new NoSuchElementException("Problem not found: " + problemId));
+
         List<TestCase> rows = pretestOnly
                 ? testCaseRepository.findByProblemIdAndOrdinalLessThanEqualOrderByOrdinal(problemId, PRETEST_MAX_ORDINAL)
                 : testCaseRepository.findByProblemIdOrderByOrdinal(problemId);
 
-        List<TestCaseUrlsDto> out = new ArrayList<>(rows.size());
+        List<TestCaseUrlsDto> urls = new ArrayList<>(rows.size());
         for (TestCase tc : rows) {
-            out.add(new TestCaseUrlsDto(
+            urls.add(new TestCaseUrlsDto(
                     tc.getOrdinal(),
                     gcsSigner.sign(tc.getInputGcsKey()),
                     gcsSigner.sign(tc.getExpectedOutputGcsKey())
             ));
         }
-        log.debug("[problem] signed {} test-case URLs for problem={} pretestOnly={}",
-                out.size(), problemId, pretestOnly);
-        return out;
+        log.debug("[problem] signed {} test-case URLs for problem={} pretestOnly={} timeLimitMs={} memoryLimitMb={}",
+                urls.size(), problemId, pretestOnly,
+                problem.getTimeLimitMs(), problem.getMemoryLimitMb());
+
+        // Entity fields are `long` (CRDB BIGINT); the wire DTO and execution-
+        // worker both speak `int`. Narrow with Math.toIntExact so any future
+        // out-of-range value blows up loudly rather than wrapping silently.
+        return new TestCaseBundleDto(
+                Math.toIntExact(problem.getTimeLimitMs()),
+                Math.toIntExact(problem.getMemoryLimitMb()),
+                urls);
     }
 }
