@@ -8,13 +8,13 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     implementation 'org.springframework.boot:spring-boot-starter-json'
 
-    // OpenTelemetry API only — the OTel Java agent bundles its own SDK at
-    // runtime (see Dockerfile). compileOnly because we don't ship the API
-    // jar; the agent's bundled classes win on the classpath at runtime.
-    // testRuntimeOnly gives us a real SDK noop during unit tests so
-    // GlobalOpenTelemetry.get() doesn't NPE on a missing provider.
-    compileOnly      'io.opentelemetry:opentelemetry-api:1.43.0'
-    testImplementation 'io.opentelemetry:opentelemetry-api:1.43.0'
+    // OpenTelemetry API. Ship as `implementation` so the API classes are on
+    // the application classpath at runtime. The -javaagent jar does auto-
+    // instrumentation but does NOT expose its bundled API to the app's
+    // classloader — SandboxMetrics's `import io.opentelemetry.api.common.Attributes`
+    // would throw NoClassDefFoundError at app boot without this. The OTel
+    // agent still drives the actual SDK provider behind GlobalOpenTelemetry.
+    implementation 'io.opentelemetry:opentelemetry-api:1.43.0'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
