@@ -50,20 +50,26 @@ services:
       APP_AGENT_VSOCK_CLIENT:        /usr/local/bin/oj-vsock-client
       APP_REGION:                    ${REGION:-asia-south1}
       # ── OpenTelemetry (Workstream H) ─────────────────────────────
-      # OTEL_ENDPOINT unset → all exporters disabled (auto-instrumentation
-      # still loads but never tries to push). Empty-string endpoint can't
-      # work — the OtlpConfigUtil validator parses it as a URL and crashes
-      # the agent during JVM premain. So when OTEL_ENDPOINT is empty we
-      # set the exporter trio to "none" rather than pass it through.
-      OTEL_TRACES_EXPORTER:        ${OTEL_TRACES_EXPORTER:-none}
-      OTEL_METRICS_EXPORTER:       ${OTEL_METRICS_EXPORTER:-none}
-      OTEL_LOGS_EXPORTER:          ${OTEL_LOGS_EXPORTER:-none}
-      # When OTEL_ENDPOINT IS set, operator should also set the three
-      # exporter values to "otlp" (or whatever they want) AND OTEL_ENDPOINT
-      # itself. compose substitutes both pieces from /opt/oj/.env.
+      # The OTel Java agent (baked into the image) crashes during JVM
+      # premain via two paths even when the exporter trio is set to "none":
+      #
+      #   1. OtlpConfigUtil.validateEndpoint("") MalformedURL when the
+      #      endpoint env var is empty
+      #   2. OtlpMetricExporterProvider.createExporter is still called by
+      #      autoconfigure even with OTEL_METRICS_EXPORTER=none, and re-
+      #      validates the endpoint, throwing again
+      #
+      # Until we have a real collector to export to AND can configure the
+      # agent properly, the simplest correct posture is to keep the agent
+      # JAR in the image (it's baked in by the Dockerfile) but tell it not
+      # to load at JVM start. OTEL_JAVAAGENT_ENABLED=false is honoured by
+      # the agent's bootstrap before it touches the SDK autoconfig.
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      # When the operator wants real export: set OTEL_JAVAAGENT_ENABLED=true
+      # AND set OTEL_ENDPOINT to a reachable OTLP endpoint in /opt/oj/.env.
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
-      OTEL_SERVICE_NAME: oj-sandbox-manager
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
+      OTEL_SERVICE_NAME:           oj-sandbox-manager
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
 
   oj-execution-worker:
     image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
@@ -91,9 +97,7 @@ services:
       APP_SANDBOX_MANAGER_URL:               http://oj-sandbox-manager:9100
       APP_REGION:                            ${REGION:-asia-south1}
       # ── OpenTelemetry (Workstream H) — same shape as SM above. ──
-      OTEL_TRACES_EXPORTER:        ${OTEL_TRACES_EXPORTER:-none}
-      OTEL_METRICS_EXPORTER:       ${OTEL_METRICS_EXPORTER:-none}
-      OTEL_LOGS_EXPORTER:          ${OTEL_LOGS_EXPORTER:-none}
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
-      OTEL_SERVICE_NAME: oj-execution-worker
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
+      OTEL_SERVICE_NAME:           oj-execution-worker
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}

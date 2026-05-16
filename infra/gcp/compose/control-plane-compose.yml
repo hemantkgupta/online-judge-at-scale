@@ -104,18 +104,14 @@ services:
       APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
       APP_REGION: ${REGION:-asia-south1}
       # ── OpenTelemetry (Workstream H) ─────────────────────────────
-      # The OTel Java agent crashes during JVM premain if
-      # OTEL_EXPORTER_OTLP_ENDPOINT is the empty string ("no protocol"
-      # MalformedURLException). When OTEL_ENDPOINT is unset, disable the
-      # exporter trio so the agent loads but never tries to push. When
-      # operator sets OTEL_ENDPOINT in /opt/oj/.env they should also flip
-      # the exporters to "otlp" (or set the env vars explicitly there).
-      OTEL_TRACES_EXPORTER:        ${OTEL_TRACES_EXPORTER:-none}
-      OTEL_METRICS_EXPORTER:       ${OTEL_METRICS_EXPORTER:-none}
-      OTEL_LOGS_EXPORTER:          ${OTEL_LOGS_EXPORTER:-none}
+      # OTel agent disabled at JVM start until we have a real collector +
+      # working endpoint config. The agent JAR stays baked in the image;
+      # only the bootstrap is skipped. Flip OTEL_JAVAAGENT_ENABLED=true
+      # in /opt/oj/.env when you also set a reachable OTEL_ENDPOINT.
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
-      OTEL_SERVICE_NAME: oj-api-gateway
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=gcp,region=${REGION:-asia-south1}
+      OTEL_SERVICE_NAME:           oj-api-gateway
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
 
   # NOTE (Workstream H): when Workstream A lands its `problem-service`
   # compose entry on this VM, copy the same OTEL_* trio above with
