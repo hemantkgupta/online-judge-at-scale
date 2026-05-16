@@ -62,13 +62,17 @@ func main() {
 	go func() {
 		defer wg.Done()
 		// stdin → vsock
-		if _, err := io.Copy(conn, os.Stdin); err == nil {
-			// Closing the write half tells the guest "I'm done sending"
-			// without tearing down the read half.
-			if uc, ok := conn.(*net.UnixConn); ok {
-				_ = uc.CloseWrite()
-			}
-		}
+		//
+		// Deliberately do NOT call (*net.UnixConn).CloseWrite() after stdin
+		// EOF. On a plain AF_UNIX stream socket a half-close is the correct
+		// way to signal "no more input," but Firecracker's vsock layer does
+		// not preserve half-close semantics — it treats CloseWrite on the
+		// host UDS as a FULL teardown of the vsock connection. The agent
+		// then fails its response write with "broken pipe" and we lose the
+		// reply. Instead we just let this goroutine return; the agent
+		// closes its end after writing the response, which propagates back
+		// as a regular EOF on the vsock → stdout copy below.
+		_, _ = io.Copy(conn, os.Stdin)
 	}()
 	go func() {
 		defer wg.Done()
