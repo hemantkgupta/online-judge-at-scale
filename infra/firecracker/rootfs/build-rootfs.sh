@@ -146,10 +146,15 @@ apt-get install -y --no-install-recommends \
     libc6-dev \
     libstdc++-11-dev
 
-# Strip apt + locale caches so the rootfs stays under 1 GiB.
+# Strip apt + locale caches so the rootfs stays under 1 GiB. Use `find`
+# rather than the bash extglob `!(en|en_US|C.UTF-8)` glob — Ubuntu's
+# /bin/sh is dash, which doesn't understand extglob and crashes with
+# "Syntax error: '(' unexpected".
 apt-get clean
-rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man \
-       /usr/share/locale/!(en|en_US|C.UTF-8) 2>/dev/null || true
+rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man
+find /usr/share/locale -maxdepth 1 -mindepth 1 -type d \
+     ! -name 'en' ! -name 'en_US' ! -name 'C.UTF-8' \
+     -exec rm -rf {} + 2>/dev/null || true
 
 # Mount points the /init script needs.
 mkdir -p /code /proc /sys /tmp
