@@ -86,6 +86,25 @@ public class SubmissionConsumer {
     @Value("${app.kafka.topic.system}")
     private String systemTestTopic;
 
+    /**
+     * Smoke-test / graceful-degradation knob. When {@code true} (default), the
+     * worker calls TestCaseFetcher → problem-service over HTTP to resolve the
+     * per-ordinal GCS-signed input/expected URLs. When {@code false}, the worker
+     * bypasses problem-service entirely and uses a single empty TestCaseSpec
+     * (same fallback the unit-test path already used when testCaseFetcher is
+     * null).
+     *
+     * <p>This exists because problem-service is the heaviest control-plane
+     * dependency for the worker and operators may want to run a Firecracker /
+     * Kafka smoke test before problem-service is deployed in a region.
+     * Set <code>APP_PROBLEM_SERVICE_REQUIRED=false</code> in the worker's env
+     * for that smoke path — the verdict will be WRONG_ANSWER (no real
+     * expected_hash to compare against), but the agent runs the code, the
+     * worker publishes the verdict, and the full Kafka round-trip is exercised.
+     */
+    @Value("${app.problem-service.required:true}")
+    private boolean problemServiceRequired;
+
     /** Phase 1: high-priority pretest pipeline (live during the contest). */
     @KafkaListener(
         topics = "${app.kafka.topic.pretest}",
@@ -145,11 +164,14 @@ public class SubmissionConsumer {
 
             // Workstream B: fetch the real test-case suite from Problem Service +
             // GCS. When testCaseFetcher is null (legacy smoke harness / unit tests
-            // without a problem service), fall back to a single empty-stdin spec
-            // with an empty expected_hash. The agent will report WA on that case
-            // — fine for a smoke test, the run itself completes.
+            // without a problem service), or when problem-service is explicitly
+            // marked optional via app.problem-service.required=false (smoke-test
+            // path before problem-service is deployed in a region), fall back to
+            // a single empty-stdin spec with an empty expected_hash. The agent
+            // will report WA on that case — fine for a smoke test, the run
+            // itself completes and the full Kafka round-trip is exercised.
             List<TestCaseSpec> testCases;
-            if (testCaseFetcher != null) {
+            if (testCaseFetcher != null && problemServiceRequired) {
                 try {
                     testCases = testCaseFetcher.fetch(event.getProblemId(), phase);
                 } catch (Exception ex) {

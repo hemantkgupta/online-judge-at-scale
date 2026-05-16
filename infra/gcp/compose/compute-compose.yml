@@ -96,6 +96,14 @@ services:
       # trust boundary).
       APP_SANDBOX_MANAGER_URL:               http://oj-sandbox-manager:9100
       APP_REGION:                            ${REGION:-asia-south1}
+      # problem-service is the heaviest control-plane dependency for the
+      # worker (per-test signed-URL lookups). When it isn't deployed in this
+      # region — typically during the initial Firecracker/Kafka smoke test —
+      # flip this to false to bypass the fetch and use a single empty
+      # TestCaseSpec instead. The agent still runs the code, the worker still
+      # publishes the verdict; only the WA/AC determination becomes degenerate
+      # (always WA against the empty expected_hash).
+      APP_PROBLEM_SERVICE_REQUIRED:          ${APP_PROBLEM_SERVICE_REQUIRED:-false}
       # ── OpenTelemetry (Workstream H) — same shape as SM above. ──
       OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://localhost:4317}
