@@ -35,12 +35,20 @@ app:
   # READY pool depth the replenishment loop tries to maintain. The
   # replenisher runs every 500ms; max-parallel-boot caps how many VMs
   # one tick may spawn so a deep deficit can't saturate KVM.
+  #
+  # Targets reduced (python:2 / cpp:1 / java:1 = 4 total) from the
+  # original 7 because on a 2 vCPU / 8 GB compute VM, 7-way parallel
+  # Firecracker boots caused vsock-CONNECT timeouts in waitForGuestAgent
+  # — the in-guest agent couldn't get scheduled fast enough. Per-language
+  # separation is preserved; operators can scale up per host via env vars.
+  # max-parallel-boot capped at 2 so at most two FC processes contend
+  # for vCPUs + KVM at once, keeping the readiness deadline reachable.
   pool:
     targets:
-      python: 3
-      cpp: 2
-      java: 2
-    max-parallel-boot: 4
+      python: 2
+      cpp: 1
+      java: 1
+    max-parallel-boot: 2
     # 503 retry_after_ms hint to clients when the pool is empty.
     retry-after-ms: 250
 

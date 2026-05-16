@@ -361,7 +361,12 @@ public class LeaseService {
      * Probes the vsock UDS until the guest agent accepts a CONNECT.
      */
     private void waitForGuestAgent(String vsockUds) throws InterruptedException, IOException {
-        long deadline = System.currentTimeMillis() + 5_000;
+        // Wider deadline (30s) accommodates parallel pool boots on a constrained
+        // host; single-VM boots typically take ~1s, but with N parallel FC
+        // processes contending for vCPUs + KVM the in-guest agent can take many
+        // seconds to start listening on vsock. Readiness is a one-time-per-VM
+        // cost so widening this doesn't hurt steady-state lease latency.
+        long deadline = System.currentTimeMillis() + 30_000;
         IOException lastErr = null;
         while (System.currentTimeMillis() < deadline) {
             if (Files.exists(Paths.get(vsockUds))) {
