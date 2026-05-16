@@ -94,13 +94,28 @@ def main():
                     help="Topic to publish to (default: submissions.pretest)")
     ap.add_argument("--language", default="python", choices=("python", "java", "cpp"),
                     help="Source language")
-    ap.add_argument("--code", default="print('hello firecracker')",
-                    help="Contestant source. Embedded as data: URL.")
+    src_group = ap.add_mutually_exclusive_group()
+    src_group.add_argument("--code", default=None,
+                           help="Contestant source as inline string. Embedded as data: URL.")
+    src_group.add_argument("--code-file", default=None,
+                           help="Path to a contestant source file. Embedded as data: URL.")
+    ap.add_argument("--problem-id", default="00000000-0000-0000-0000-0000000cafee",
+                    help="Problem UUID (default: the trivial print(2+2) smoke problem)")
     ap.add_argument("--input", default="",
-                    help="Stdin for the contestant program")
+                    help="(unused; stdin is now driven per-ordinal by problem-service test cases)")
     ap.add_argument("--region", default="asia-south1",
                     help="Region tag passed through to the verdict")
     args = ap.parse_args()
+
+    # Resolve the contestant source: --code wins, then --code-file, else
+    # a hardcoded fallback so the no-arg invocation still does something.
+    if args.code_file:
+        with open(args.code_file, "r", encoding="utf-8") as fh:
+            source_code = fh.read()
+    elif args.code is not None:
+        source_code = args.code
+    else:
+        source_code = "print('hello firecracker')"
 
     try:
         from kafka import KafkaProducer
@@ -110,14 +125,14 @@ def main():
 
     submission_id = str(uuid.uuid4())
     user_id       = "00000000-0000-0000-0000-00000000beef"
-    problem_id    = "00000000-0000-0000-0000-0000000cafee"
+    problem_id    = args.problem_id
     contest_id    = ""
     gateway_ts_ms = int(time.time() * 1000)
     phase         = "pretest"
 
     # data: URL — the worker's resolveSourceCode() handles this without
     # needing S3 / GCS to be wired up.
-    encoded_code = base64.b64encode(args.code.encode("utf-8")).decode("ascii")
+    encoded_code = base64.b64encode(source_code.encode("utf-8")).decode("ascii")
     s3_code_url  = f"data:text/plain;base64,{encoded_code}"
 
     payload = build_submission_event(
