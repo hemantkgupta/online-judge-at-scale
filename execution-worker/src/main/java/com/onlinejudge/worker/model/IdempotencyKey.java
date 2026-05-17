@@ -26,8 +26,10 @@ public class IdempotencyKey {
     /** Roadmap §2.5 — reclaim cycles. Bumped on every stale-row reclaim;
      *  once it exceeds {@code app.idempotency.max-attempts} the next claim
      *  is treated as POISON and the consumer dead-letters the submission. */
+    // CRDB INT = BIGINT; Hibernate ddl-auto=validate rejects Java `int` (INTEGER).
+    // Widen to long to match the column's actual storage width.
     @Column(nullable = false)
-    private int attempts;
+    private long attempts;
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt = Instant.now();

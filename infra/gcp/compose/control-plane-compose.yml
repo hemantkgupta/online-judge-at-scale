@@ -105,6 +105,13 @@ services:
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
       APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
+      # Flyway compatibility settings: pre-V3, `onlinejudge` already had some
+      # tables from the old init.sql path. baseline-version=0 forces V1 to
+      # run (V1's CREATE TABLE IF NOT EXISTS handles the partial-overlap
+      # case cleanly). baseline-on-migrate=true so Flyway accepts the pre-
+      # existing schema without an explicit `flyway baseline` invocation.
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_BASELINE_VERSION:    "0"
       APP_REGION: ${REGION:-asia-south1}
       # ── OpenTelemetry (Workstream H) ─────────────────────────────
       # OTel agent disabled at JVM start until we have a real collector +

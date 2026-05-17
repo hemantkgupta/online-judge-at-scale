@@ -63,6 +63,12 @@ public class JwtTokenProvider {
     private final Duration accessTtl;
     private final String issuer;
 
+    // @Autowired marks this as THE constructor Spring should use. Without it,
+    // Spring sees two constructors (this + the legacy 3-arg test-only one
+    // below), can't pick, and falls back to looking for a no-arg default —
+    // which doesn't exist → "No default constructor found" at boot. Same
+    // pattern we hit on TestCaseFetcher and AgentClient.
+    @org.springframework.beans.factory.annotation.Autowired
     public JwtTokenProvider(
             @Value("${app.jwt.kid-current:v1}") String currentKid,
             @Value("${app.jwt.kid-previous:}") String previousKid,
