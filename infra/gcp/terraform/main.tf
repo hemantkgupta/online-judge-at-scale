@@ -121,6 +121,26 @@ resource "google_project_iam_member" "control_plane_log_writer" {
   member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
 }
 
+# Roadmap §2.6: the oj-otel-collector container (sibling of api-gateway on the
+# control-plane VM) authenticates to GCP via ADC from the GCE metadata server.
+# It needs:
+#   * roles/monitoring.metricWriter — for the googlemanagedprometheus exporter
+#     to push OTel metrics into Cloud Monitoring as Prometheus-native series
+#   * roles/cloudtrace.agent — for the googlecloud trace exporter (logWriter
+#     does NOT transitively grant trace write — that was a 2024 misconception)
+# Cloud Logging is already covered by control_plane_log_writer above.
+resource "google_project_iam_member" "control_plane_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
+}
+
+resource "google_project_iam_member" "control_plane_trace_agent" {
+  project = var.project_id
+  role    = "roles/cloudtrace.agent"
+  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
+}
+
 resource "google_project_iam_member" "compute_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
@@ -224,6 +244,9 @@ resource "google_compute_instance" "control_plane" {
       # key into /opt/oj/gcs-signer.json on every boot.
       gcs_bucket_name    = google_storage_bucket.oj_test_cases.name
       gcs_signer_secret  = google_secret_manager_secret.problem_service_signer_key.secret_id
+      # Roadmap §2.6: OTel collector config dropped at /opt/oj/otel-collector-config.yaml
+      # for the oj-otel-collector container to volume-mount on every boot.
+      otel_config_yaml_b64 = base64encode(file("${path.module}/../compose/otel-collector-config.yaml"))
     })
   }
 

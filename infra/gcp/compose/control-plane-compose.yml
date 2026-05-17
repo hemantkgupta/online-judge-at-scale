@@ -24,6 +24,39 @@
 # =============================================================================
 
 services:
+  # OpenTelemetry collector (roadmap §2.6). Receives OTLP from every JVM
+  # service on this VM (and from the compute VM across the VPC) and exports
+  # to Cloud Trace + Cloud Monitoring + Cloud Logging. The control-plane
+  # VM's SA has the required roles via terraform (monitoring.metricWriter,
+  # cloudtrace.agent, logging.logWriter); ADC picks them up from the GCE
+  # metadata server, no key file mounted.
+  #
+  # Bring-up sequence (operator):
+  #   1. terraform apply (lands the new IAM bindings + monitoring API enable)
+  #   2. control-plane.sh redeploys this stack → collector boots, runs
+  #      health check, becomes ready
+  #   3. ONLY THEN flip OTEL_JAVAAGENT_ENABLED=true in /opt/oj/.env and
+  #      bounce each service. The default in this compose stays `false`
+  #      so a partial deploy can never crash-loop every JVM at once.
+  oj-otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: oj-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - /opt/oj/otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC — accepts spans from oj-compute too
+      - "8888:8888"  # collector self-metrics
+      - "13133:13133" # health probe
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: oj-zookeeper
@@ -53,7 +86,24 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # Roadmap §2.7 stepping-stone hardening (still single-broker for now):
+      # * AUTO_CREATE_TOPICS_ENABLE=false — every topic must be created via
+      #   the bootstrap step (infra/scripts/kafka-bootstrap-topics.sh) with
+      #   the right partition count + retention. Stops the typo-creates-a-
+      #   topic class of bugs and forces an explicit conversation when a
+      #   new topic is added.
+      # * min.insync.replicas=1 because we have one broker; this is the
+      #   correct value for the cluster size, and is what min.insync.replicas
+      #   will need to be re-tuned to (=2) once the 3-broker move lands.
+      # * Producer-side acks=all is set in each service's Kafka config
+      #   (api-gateway / execution-worker) — it works on a single broker
+      #   (waits for the local leader to fsync) and is correct under 3 brokers
+      #   too. See infra/gcp/compose/_kafka-3broker.md for the migration plan
+      #   to actual ISR=2/RF=3 durability.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
     volumes:
       - kafka-data:/var/lib/kafka/data
 

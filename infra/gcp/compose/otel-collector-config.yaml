@@ -1,0 +1,96 @@
+# =============================================================================
+# OpenTelemetry Collector pipeline (roadmap §2.6).
+#
+# Receives OTLP gRPC on :4317 from every JVM-baked OTel javaagent and routes
+# to GCP-native backends:
+#   * traces  → Cloud Trace          (via the googlecloud exporter)
+#   * metrics → Cloud Monitoring     (via googlemanagedprometheus)
+#   * logs    → Cloud Logging        (via the googlecloud exporter)
+#
+# The collector picks up ADC from the GCE metadata server (the control-plane
+# VM SA has roles/{monitoring.metricWriter, cloudtrace.agent, logging.logWriter}).
+# No JSON key file mounted — same posture as the GCS signer.
+#
+# Memory math (e2-medium has 4 GB; existing services already use ~3.2 GB):
+#   * memory_limiter caps the JVM-style heap pressure at 384 MB
+#   * compose `mem_limit: 512m` enforces the OS-level ceiling at 512 MB
+# Net new control-plane VM footprint: ~512 MB. Headroom is tight; the
+# follow-up "bump control-plane VM to e2-standard-2 (8 GB)" item from
+# Agent I's audit is the right move before any further service lands.
+# =============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Must come first — if the collector itself runs out of memory it can't
+  # drop gracefully. The limiter rejects new spans/metrics/logs back to the
+  # SDKs (which buffer briefly then drop) when memory pressure spikes.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+
+  # Aggressive batching cuts the cost of Cloud Trace's per-write API calls
+  # by ~10x versus the default 200 ms batch. 5 s p99 telemetry latency is
+  # fine for backend monitoring.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+  # Stamps every signal with GCE instance-id, zone, project — makes the
+  # per-VM split (oj-control-plane vs oj-compute) immediately legible in
+  # the dashboards.
+  resourcedetection:
+    detectors: [gcp, env]
+    timeout: 2s
+
+exporters:
+  # Cloud Trace + Cloud Logging share one exporter. Project resolved from
+  # ADC if `project` is omitted; pinning it explicitly avoids surprises if
+  # ADC ever points at a different project for some reason.
+  googlecloud:
+    project: online-judge-hk
+    log:
+      default_log_name: oj-otel-default
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 200
+
+  # GMP is the canonical path for OTel metrics into Cloud Monitoring as of
+  # 2025-Q4. Produces Prometheus-native time series; Grafana can query
+  # them via the GMP frontend without an extra ingest step.
+  googlemanagedprometheus:
+    project: online-judge-hk
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [googlecloud]
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [googlemanagedprometheus]
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [googlecloud]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888

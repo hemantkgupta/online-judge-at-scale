@@ -13,6 +13,7 @@
 #   (init_sql_b64 was removed in V3 — Flyway in api-gateway owns the schema)
 #   ${gcs_bucket_name}     GCS bucket holding per-ordinal input/expected objects
 #   ${gcs_signer_secret}   Secret Manager secret id holding the signer SA JSON key
+#   ${otel_config_yaml_b64} base64-encoded otel-collector-config.yaml (roadmap §2.6)
 #
 # All other config (kafka host IP, AR URL, JWT secret) lands in /opt/oj/.env
 # which the systemd unit sources via `EnvironmentFile=`.
@@ -69,7 +70,8 @@ gcloud auth configure-docker "$AR_REGISTRY" --quiet
 # ---------- Drop compose + .env ---------------------------------------------
 install -d -m 0755 /opt/oj
 
-echo '${compose_yaml_b64}' | base64 -d > /opt/oj/control-plane-compose.yml
+echo '${compose_yaml_b64}'     | base64 -d > /opt/oj/control-plane-compose.yml
+echo '${otel_config_yaml_b64}' | base64 -d > /opt/oj/otel-collector-config.yaml
 # init.sql is no longer injected here — V3 retired the two-database split.
 # api-gateway's Flyway migrations own the schema on the `onlinejudge` DB.
 
