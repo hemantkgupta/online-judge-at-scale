@@ -1,0 +1,147 @@
+---
+# CI: runs on every PR to main and every push to non-main branches.
+# Cancels in-flight runs when a PR is updated, so reviewers only ever
+# see the latest result.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-workflows:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.1
+        with:
+          args: -color -config-file .github/actionlint.yaml
+
+  gradle-test:
+    name: Test :${{ matrix.module }}
+    runs-on: ubuntu-latest
+    needs: lint-workflows
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - common
+          - api-gateway
+          - execution-worker
+          - problem-service
+          - sandbox-manager
+          - contest-service
+          - leaderboard-service
+          - scoring-pipeline
+          - analytics-pipeline
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/build.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run tests
+        run: ./gradlew :${{ matrix.module }}:test --no-daemon --stacktrace
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.module }}
+          path: ${{ matrix.module }}/build/reports/tests/
+          retention-days: 7
+
+  proto-roundtrip:
+    name: Proto roundtrip
+    runs-on: ubuntu-latest
+    needs: lint-workflows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Cache Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/build.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+      - name: Generate + compile proto
+        run: ./gradlew :common:generateProto :common:compileJava --no-daemon --stacktrace
+
+  terraform-validate:
+    name: OpenTofu validate
+    runs-on: ubuntu-latest
+    needs: lint-workflows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.7.3
+      - name: tofu fmt -check
+        working-directory: infra/gcp/terraform
+        run: tofu fmt -check -recursive
+      - name: tofu init -backend=false
+        working-directory: infra/gcp/terraform
+        run: tofu init -backend=false
+      - name: tofu validate
+        working-directory: infra/gcp/terraform
+        run: tofu validate
+
+  go-agent-build:
+    name: Firecracker agent (Go)
+    runs-on: ubuntu-latest
+    needs: lint-workflows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: infra/firecracker/agent/go.sum
+      - name: Build
+        working-directory: infra/firecracker/agent
+        run: go build ./...
+      - name: Test
+        working-directory: infra/firecracker/agent
+        run: go test ./...

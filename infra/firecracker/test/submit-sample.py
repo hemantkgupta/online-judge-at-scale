@@ -105,6 +105,14 @@ def main():
                     help="(unused; stdin is now driven per-ordinal by problem-service test cases)")
     ap.add_argument("--region", default="asia-south1",
                     help="Region tag passed through to the verdict")
+    ap.add_argument("--expect-verdict", default=None,
+                    choices=("ACCEPTED", "WRONG_ANSWER", "RUNTIME_ERROR",
+                             "TIME_LIMIT_EXCEEDED", "COMPILE_ERROR"),
+                    help="When set, the script also consumes evaluated_results "
+                         "and exits 0 only if the verdict for this submission "
+                         "matches. Used by ci-smoke.sh.")
+    ap.add_argument("--expect-timeout-s", type=int, default=60,
+                    help="Seconds to wait for the expected verdict (default 60)")
     args = ap.parse_args()
 
     # Resolve the contestant source: --code wins, then --code-file, else
@@ -148,12 +156,82 @@ def main():
     print(f"submission_id = {submission_id}")
     print(f"language      = {args.language}")
     print(f"topic         = {md.topic}  partition={md.partition}  offset={md.offset}")
-    print()
-    print("Watch the worker logs + the evaluated_results topic on the control-plane VM:")
-    print("  docker exec -it oj-execution-worker tail -f /proc/1/fd/1   # on oj-compute")
-    print("  docker exec -it oj-kafka kafka-console-consumer "
-          "--bootstrap-server localhost:29092 --topic evaluated_results "
-          f"--from-beginning --property print.key=true 2>/dev/null | grep {submission_id}")
+
+    if args.expect_verdict is None:
+        print()
+        print("Watch the worker logs + the evaluated_results topic on the control-plane VM:")
+        print("  docker exec -it oj-execution-worker tail -f /proc/1/fd/1   # on oj-compute")
+        print("  docker exec -it oj-kafka kafka-console-consumer "
+              "--bootstrap-server localhost:29092 --topic evaluated_results "
+              f"--from-beginning --property print.key=true 2>/dev/null | grep {submission_id}")
+        return
+
+    # --expect-verdict path: consume evaluated_results, look for OUR submissionId,
+    # exit 0 only if the verdict matches. ci-smoke.sh and similar harnesses use
+    # this to fail loudly when the round-trip produces the wrong outcome.
+    from kafka import KafkaConsumer
+    consumer = KafkaConsumer(
+        "evaluated_results",
+        bootstrap_servers=args.bootstrap,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        consumer_timeout_ms=args.expect_timeout_s * 1000,
+        group_id=None,
+    )
+    deadline = time.time() + args.expect_timeout_s
+    for msg in consumer:
+        if time.time() > deadline:
+            break
+        f = _decode_verdict_fields(msg.value)
+        if f.get(1) != submission_id:
+            continue
+        verdict = f.get(5, "")
+        print(f"verdict       = {verdict}  time_ms={f.get(6,'?')} pts={f.get(9,'?')} phase={f.get(10,'')}")
+        if verdict == args.expect_verdict:
+            print("OK — verdict matches --expect-verdict")
+            return
+        print(f"FAIL — expected {args.expect_verdict}, got {verdict}", file=sys.stderr)
+        sys.exit(2)
+    print(f"FAIL — no verdict for {submission_id} within {args.expect_timeout_s}s", file=sys.stderr)
+    sys.exit(3)
+
+
+def _decode_verdict_fields(buf: bytes) -> dict:
+    """Minimal proto wire-format decoder for VerdictEvent. Returns a dict of
+    {tagNumber: value}. Strings / int64s only — enough for the fields the
+    smoke check inspects (1=submissionId, 5=result, 6=time_ms, 9=points,
+    10=phase)."""
+    out, off = {}, 0
+    while off < len(buf):
+        try:
+            tag, off = _vparse(buf, off)
+            field, wire = tag >> 3, tag & 7
+            if wire == 0:
+                v, off = _vparse(buf, off)
+                out[field] = v
+            elif wire == 2:
+                ln, off = _vparse(buf, off)
+                if off + ln > len(buf):
+                    break
+                out[field] = buf[off:off + ln].decode("utf-8", "replace")
+                off += ln
+            else:
+                break
+        except IndexError:
+            break
+    return out
+
+
+def _vparse(data: bytes, off: int):
+    out, shift = 0, 0
+    while off < len(data):
+        b = data[off]
+        off += 1
+        out |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return out, off
+        shift += 7
+    raise IndexError("varint truncated")
 
 
 if __name__ == "__main__":

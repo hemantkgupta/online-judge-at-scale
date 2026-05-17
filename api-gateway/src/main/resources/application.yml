@@ -94,6 +94,10 @@ app:
     topic:
       pretest: submissions.pretest
       system: submissions.system
+      # Roadmap §3.9 — exhausted-reconcile rows are routed here. Same
+      # topic the execution-worker uses, so a single tail surfaces every
+      # dead submission whatever the cause.
+      dlq: submissions.dlq
   rate-limit:
     submissions-per-minute: 10
     submissions-per-ip-per-minute: 60
@@ -105,6 +109,35 @@ app:
       enabled: true
     poll-interval-ms: 1000
     batch-size: 50
+
+  # Roadmap §3.9 — stuck-submission reconciliation sweep.
+  #
+  # Closes the failure mode where api-gateway crashed BETWEEN the
+  # `submissions` row INSERT and the `outbox_events` INSERT. The outbox
+  # publisher only walks the outbox table, so a submission with no
+  # corresponding outbox row sits PENDING forever. The scanner walks
+  # `submissions WHERE status='PENDING' AND created_at < now()-stale`
+  # every interval-seconds and re-publishes a SubmissionEvent to the
+  # pretest topic for each stuck row.
+  #
+  #   enabled              — ops kill-switch; set false to drain.
+  #   interval-seconds     — sweep cadence (fixed-delay; runs N seconds
+  #                          after the previous sweep finishes).
+  #   stale-after-seconds  — how long PENDING must persist before we
+  #                          consider it stuck. 15 min covers normal
+  #                          backlogs without false positives.
+  #   batch-size           — per-sweep cap; thundering-herd guard after
+  #                          a long outage. Subsequent sweeps drain
+  #                          the rest.
+  #   max-attempts         — per-row republish cap. Past this the row
+  #                          is marked FAILED and an envelope goes to
+  #                          app.kafka.topic.dlq (submissions.dlq).
+  reconciliation:
+    enabled: true
+    interval-seconds: 60
+    stale-after-seconds: 900
+    batch-size: 500
+    max-attempts: 10
 
   # Workstream G — Submission source persistence.
   #   source-mode=gcs     → write source bytes to GCS BEFORE the outbox event

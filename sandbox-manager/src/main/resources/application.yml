@@ -58,6 +58,31 @@ app:
     default-cpu-period-us: 100000
     default-cpu-quota-us:  100000
 
+  # §3.1 — per-microVM egress lockdown. When `enabled`, each leased
+  # sandbox gets its own Linux network namespace (`oj-<sb-id>`), the
+  # Firecracker machine config drops its `network-interfaces` array (so
+  # the guest boots with only `lo`), and the only host↔guest channel is
+  # vsock. `iptables-enabled` controls the belt-and-suspenders host
+  # firewall rules; it defaults to false because tests + macOS dev
+  # boxes have no `iptables` binary and the netns isolation is already
+  # sufficient in those environments.
+  #
+  # `deny-cidrs` is a list of host-side CIDRs that should additionally
+  # be DROPped if iptables is enabled. The metadata server
+  # (169.254.169.254/32) is the most important entry — leaking that
+  # would expose the compute VM's service-account token.
+  sandbox:
+    egress-lockdown:
+      enabled: true
+      iptables-enabled: false
+      ip-binary: /usr/sbin/ip
+      iptables-binary: /usr/sbin/iptables
+      deny-cidrs:
+        - 169.254.169.254/32
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+
   agent:
     # Vsock port the in-guest agent listens on. Hard-coded into both the
     # Go agent (cmd/agent/main.go) and the host-side client.

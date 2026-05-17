@@ -48,4 +48,16 @@ public class Submission {
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
+
+    /**
+     * Number of times the {@link com.onlinejudge.gateway.scanner.ReconciliationScanner}
+     * has republished a {@code SubmissionEvent} for this row because it was
+     * still PENDING past {@code app.reconciliation.stale-after-seconds}.
+     *
+     * <p>Bumped only by the scanner — never on the happy path. When this
+     * crosses {@code app.reconciliation.max-attempts}, the scanner stops
+     * republishing and routes the submission to the DLQ (status FAILED).
+     */
+    @Column(name = "reconcile_attempts", nullable = false)
+    private int reconcileAttempts = 0;
 }

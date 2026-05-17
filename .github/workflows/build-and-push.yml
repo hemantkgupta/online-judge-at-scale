@@ -1,0 +1,93 @@
+---
+# Build + push every service image to Artifact Registry on merge to main.
+# Auth via Workload Identity Federation (no static JSON keys).
+# scoring-pipeline is intentionally excluded: it has no Dockerfile yet
+# (see Agent I's audit — BLOCKED until the module ships its image).
+name: Build and Push
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-and-push-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_REGION: asia-south1
+  AR_HOST: asia-south1-docker.pkg.dev
+  AR_REPO: oj
+
+jobs:
+  build-and-push:
+    name: Build + push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - api-gateway
+          - execution-worker
+          - problem-service
+          - sandbox-manager
+          - contest-service
+          - leaderboard-service
+          # NOTE: scoring-pipeline has no Dockerfile yet — BLOCKED.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHA="${GITHUB_SHA::12}"
+          BASE="${AR_HOST}/${{ secrets.GCP_PROJECT_ID }}/${AR_REPO}/${{ matrix.image }}"
+          echo "sha_tag=${BASE}:${SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Emit pushed tag
+        run: |
+          mkdir -p pushed-tags
+          echo "${{ steps.tags.outputs.sha_tag }}" > "pushed-tags/${{ matrix.image }}.txt"
+
+      - name: Upload pushed-tags artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pushed-tags-${{ matrix.image }}
+          path: pushed-tags/${{ matrix.image }}.txt
+          retention-days: 30

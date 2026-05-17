@@ -84,9 +84,21 @@ public class LeaseService {
     @Value("${app.agent.port}")
     private int agentPort;
 
+    /**
+     * Roadmap §3.1 — per-microVM egress lockdown. When true (the default
+     * in prod), every leased sandbox gets its own Linux netns and the
+     * Firecracker machine config drops its {@code network-interfaces}
+     * block. When false, the legacy tap-device path is used (kept for
+     * local dev on macOS and for tests that rely on a fully wired VM).
+     */
+    @Value("${app.sandbox.egress-lockdown.enabled:true}")
+    private boolean egressLockdownEnabled;
+
     private final PoolManager poolManager;
     private final WatchdogService watchdog;
     private final CgroupApplier cgroupApplier;
+    /** Netns + iptables lifecycle for the egress lockdown (§3.1). */
+    private final NetnsApplier netnsApplier;
     /**
      * Workstream-H observability hooks. Records {@code sandbox.lease.latency_ms}
      * around the full lease invocation and inc/decs {@code sandbox.leases.active}
@@ -99,11 +111,13 @@ public class LeaseService {
     public LeaseService(PoolManager poolManager,
                         WatchdogService watchdog,
                         CgroupApplier cgroupApplier,
-                        SandboxMetrics metrics) {
+                        SandboxMetrics metrics,
+                        NetnsApplier netnsApplier) {
         this.poolManager = poolManager;
         this.watchdog = watchdog;
         this.cgroupApplier = cgroupApplier;
         this.metrics = metrics;
+        this.netnsApplier = netnsApplier;
     }
 
     /** Active sandboxes keyed by id. Used by /release + /exec lookups. */
@@ -142,12 +156,31 @@ public class LeaseService {
         }
 
         try {
+            // §3.1 — apply the egress lockdown before any per-submission
+            // state mutates. Order matters: a failure here must release
+            // the sandbox back to nothing (we forceKill in the catch
+            // below, which also destroys the namespace). When the
+            // feature flag is off we skip both create and destroy so
+            // dev / CI hosts that can't run `ip netns` see the legacy
+            // path untouched.
+            if (egressLockdownEnabled) {
+                netnsApplier.create(sb.sandboxId());
+                netnsApplier.installIptablesRules(sb.sandboxId());
+            }
+
             // Per-submission state. The pool-warmed sandbox arrives with
             // a placeholder session token; rotate it here so only this
             // caller's /exec /release can talk to the VM.
             String token = UUID.randomUUID().toString();
             sb.setSessionToken(token);
             sb.setCodeDrivePath(codeDrivePath);
+
+            // Defence in depth: the sandbox is normally added to the
+            // active map at pool-provision time, but unit tests that
+            // mock pool.acquire(...) skip that path. putIfAbsent ensures
+            // the release() lookup later succeeds either way without
+            // changing prod behaviour (the same key was already there).
+            sandboxes.putIfAbsent(sb.sandboxId(), sb);
 
             // Apply cgroup limits before transitioning to LEASED. If we
             // crashed between LEASED and cgroup-apply, the watchdog
@@ -183,6 +216,16 @@ public class LeaseService {
             log.error("[sm] LEASE post-pop failed submission={} sandbox={}: {}",
                     submissionId, sb.sandboxId(), ex.getMessage());
             try { forceKill(sb.sandboxId()); } catch (Exception ignored) {}
+            // Defence in depth: forceKill→release destroys the namespace
+            // for sandboxes still in the active map. If FC never started
+            // (lease failed before the LEASED transition could populate
+            // anything new), release() is a no-op for the netns — call
+            // destroy explicitly so we never leak a namespace on the
+            // failure path.
+            if (egressLockdownEnabled) {
+                try { netnsApplier.removeIptablesRules(sb.sandboxId()); } catch (Exception ignored) {}
+                try { netnsApplier.destroy(sb.sandboxId()); } catch (Exception ignored) {}
+            }
             metrics.recordLeaseLatency(System.nanoTime() - t0, language);
             throw ex;
         }
@@ -266,6 +309,15 @@ public class LeaseService {
         cgroupApplier.cleanup(sb);
         tryDelete(sb.apiSockPath());
         tryDelete(sb.vsockUdsPath());
+        // §3.1 — tear down the netns. Iptables rules first (they
+        // reference the sandbox id; safe to leave behind but cleaner
+        // not to), then the namespace itself. Idempotent — release()
+        // can race with the watchdog's forceKill path; whichever loses
+        // simply sees a missing namespace and logs a benign warning.
+        if (egressLockdownEnabled) {
+            try { netnsApplier.removeIptablesRules(sb.sandboxId()); } catch (Exception ignored) {}
+            try { netnsApplier.destroy(sb.sandboxId()); } catch (Exception ignored) {}
+        }
         sb.transition(SandboxState.TERMINATED);
         // Workstream H: paired decrement for the inc at LEASED.
         // Whichever path got us here (worker /release, watchdog forceKill)

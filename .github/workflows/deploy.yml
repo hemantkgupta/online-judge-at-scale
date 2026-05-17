@@ -1,0 +1,99 @@
+---
+# Manual deploy to oj-control-plane and/or oj-compute via gcloud + IAP SSH.
+# Triggered ONLY by workflow_dispatch — there is no automatic push trigger.
+# Existing operator contract: "merge to main builds the image; deploy is
+# a deliberate human action". Adding auto-deploy is a separate maturity step.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to deploy (e.g. abc123def456 or latest)'
+        required: true
+        default: latest
+        type: string
+      target:
+        description: 'Which VM(s) to deploy to'
+        required: true
+        default: both
+        type: choice
+        options:
+          - compute
+          - control-plane
+          - both
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_ZONE: asia-south1-a
+  CONTROL_PLANE_VM: oj-control-plane
+  COMPUTE_VM: oj-compute
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy to control-plane
+        if: inputs.target == 'control-plane' || inputs.target == 'both'
+        env:
+          DEPLOY_TAG: ${{ inputs.tag }}
+        run: |
+          gcloud compute ssh "${CONTROL_PLANE_VM}" \
+            --zone "${GCP_ZONE}" \
+            --tunnel-through-iap \
+            --command="cd /opt/oj && sudo IMAGE_TAG=${DEPLOY_TAG} docker compose pull && sudo IMAGE_TAG=${DEPLOY_TAG} docker compose up -d"
+
+      - name: Deploy to compute
+        if: inputs.target == 'compute' || inputs.target == 'both'
+        env:
+          DEPLOY_TAG: ${{ inputs.tag }}
+        run: |
+          gcloud compute ssh "${COMPUTE_VM}" \
+            --zone "${GCP_ZONE}" \
+            --tunnel-through-iap \
+            --command="cd /opt/oj && sudo IMAGE_TAG=${DEPLOY_TAG} docker compose pull && sudo IMAGE_TAG=${DEPLOY_TAG} docker compose up -d"
+
+      - name: Wait for services to settle
+        run: sleep 60
+
+      - name: Health check (control-plane)
+        if: inputs.target == 'control-plane' || inputs.target == 'both'
+        run: |
+          for svc in api-gateway problem-service contest-service leaderboard-service; do
+            echo "Checking ${svc} on ${CONTROL_PLANE_VM}..."
+            gcloud compute ssh "${CONTROL_PLANE_VM}" \
+              --zone "${GCP_ZONE}" \
+              --tunnel-through-iap \
+              --command="curl -fsS --max-time 5 http://localhost/actuator/health || (echo FAIL ${svc}; exit 1)"
+          done
+
+      - name: Health check (compute)
+        if: inputs.target == 'compute' || inputs.target == 'both'
+        run: |
+          echo "Checking execution-worker + sandbox-manager on ${COMPUTE_VM}..."
+          gcloud compute ssh "${COMPUTE_VM}" \
+            --zone "${GCP_ZONE}" \
+            --tunnel-through-iap \
+            --command="curl -fsS --max-time 5 http://localhost:8081/actuator/health && curl -fsS --max-time 5 http://localhost:8082/actuator/health"

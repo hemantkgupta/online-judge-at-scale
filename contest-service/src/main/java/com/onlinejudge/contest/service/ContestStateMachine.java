@@ -3,6 +3,7 @@ package com.onlinejudge.contest.service;
 import com.onlinejudge.contest.model.Contest;
 import com.onlinejudge.contest.model.ContestState;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -29,6 +30,23 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 public class ContestStateMachine {
+
+    /**
+     * Roadmap §4.23: optional publisher that, when present, kicks off the
+     * system-test replay scan on every successful ACTIVE→CLOSED transition.
+     * Injected as a constructor parameter when running in a Spring context;
+     * left null in the standalone unit tests that pre-date the replay path.
+     */
+    private final SystemTestReplayPublisher systemTestReplayPublisher;
+
+    public ContestStateMachine() {
+        this(null);
+    }
+
+    @Autowired(required = false)
+    public ContestStateMachine(SystemTestReplayPublisher systemTestReplayPublisher) {
+        this.systemTestReplayPublisher = systemTestReplayPublisher;
+    }
 
     /**
      * Attempts to transition the contest to the target state.
@@ -62,6 +80,26 @@ public class ContestStateMachine {
 
         log.info("[lifecycle] Contest {} transitioned: {} → {}",
                 contest.getId(), currentState, targetState);
+
+        // Roadmap §4.23: post-transition hook. Only fires on a *real* transition
+        // (not the idempotent no-op above), and only for ACTIVE→CLOSED — a
+        // hard-cancel from REGISTRATION would have no submissions to replay
+        // and is rejected by the transition graph anyway.
+        if (targetState == ContestState.CLOSED
+                && currentState == ContestState.ACTIVE
+                && systemTestReplayPublisher != null) {
+            try {
+                systemTestReplayPublisher.replayContest(contest);
+            } catch (RuntimeException ex) {
+                // Don't block the state transition on replay failure — the
+                // contest is genuinely CLOSED and the replay can be retried
+                // by an admin. The worker's per-submission idempotency keys
+                // prevent double-execution of any submissions that did make
+                // it through.
+                log.error("[replay] System-test replay failed for contest={}: {}",
+                        contest.getId(), ex.getMessage(), ex);
+            }
+        }
 
         return true;
     }

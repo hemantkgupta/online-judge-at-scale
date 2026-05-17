@@ -1,0 +1,6 @@
+---
+# actionlint configuration. Defaults are sane; this file exists so future
+# tweaks (e.g. allowing a self-hosted runner label) have a single home.
+self-hosted-runner:
+  labels: []
+config-variables: []
