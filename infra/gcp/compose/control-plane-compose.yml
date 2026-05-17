@@ -219,6 +219,58 @@ services:
       OTEL_SERVICE_NAME:           oj-problem-service
       OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
 
+  # contest-service (roadmap §4.19): owns the contest lifecycle. Reads/writes
+  # the `contests` table (V6 migration). REST API on :8084.
+  #
+  # MEMORY: -Xmx256m is intentionally tight. e2-medium is at ~3.7 GB committed
+  # after OTel collector landed; this + leaderboard-service will push us to
+  # ~4.1 GB. Bump to e2-standard-2 (8 GB) before going live with real users —
+  # the existing budgets are dev-grade with no swap room.
+  contest-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/contest-service:latest
+    container_name: oj-contest-service
+    restart: unless-stopped
+    depends_on:
+      - cockroachdb
+      - kafka
+    ports:
+      - "8084:8084"
+    environment:
+      SERVER_PORT: 8084
+      SPRING_DATASOURCE_URL: jdbc:postgresql://cockroachdb:26257/onlinejudge?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      APP_REGION: ${REGION:-asia-south1}
+      JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-contest-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
+
+  # leaderboard-service (roadmap §4.22): consumes evaluated_results, maintains
+  # a Redis sorted-set ranking, serves /ws/leaderboard WebSocket subscriptions
+  # for the future React SPA. No CRDB dependency.
+  leaderboard-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/leaderboard-service:latest
+    container_name: oj-leaderboard-service
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - redis
+    ports:
+      - "8082:8082"
+    environment:
+      SERVER_PORT: 8082
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      APP_REGION: ${REGION:-asia-south1}
+      JAVA_TOOL_OPTIONS: "-Xmx256m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-leaderboard-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION:-asia-south1}
+
 volumes:
   zookeeper-data:
   zookeeper-log:

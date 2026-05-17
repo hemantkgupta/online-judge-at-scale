@@ -17,7 +17,10 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: update
+      # Roadmap §2.2: Flyway in api-gateway owns the schema (V6__contests.sql).
+      # contest-service is a pure JPA consumer — flipped from `update` to
+      # `validate` to stop schema drift on every contest-service boot.
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
