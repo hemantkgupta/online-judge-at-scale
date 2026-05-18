@@ -851,6 +851,10 @@ Full repo test: `./gradlew test` — 41 actionable tasks, all green on `main` as
 
 The "ACCEPTED on live GCP" smoke is the final integration check — running `submit-sample.py` from `oj-control-plane` against the full stack and reading back the verdict from `evaluated_results`. Documented in `docs/ci-cd.md` and the production blog.
 
+### 13.5 Phase 5: multi-region failure-mode integration tests
+
+`infra/scripts/test-multi-region-local.sh` is a self-contained, host-local harness that stands up two regions of the stack (kafka, two CRDB nodes with locality, two redis, two api-gateways, two leaderboard-services) via `infra/compose/test-multi-region.yml` and exercises three failure paths: (S1) 307 region-mismatch redirect from `RegionMismatchFilter` when a request lands on the wrong-region gateway; (S2) leaderboard `global=true` graceful peer degradation — `X-Peer-Region-Unreachable: true` when the peer leaderboard is down; (S3) per-region Kafka topic isolation — `submissions.<region>.pretest` etc. exist for both regions after `kafka-bootstrap-topics.sh` runs. Each scenario logs `PASS`/`FAIL` and the script exits non-zero on any failure. First run ~15 min (Gradle Docker builds), subsequent runs ~5 min. Operator playbook: `docs/runbooks/multi-region.md` §5.
+
 ---
 
 ## 14. Known limitations and debt

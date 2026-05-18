@@ -246,3 +246,95 @@ docker compose -f <(...) down -v
 Total run time on Docker Desktop: ~5 minutes (3 of which are V9's async finalisation).
 
 This is exactly the procedure used to validate V9 before Phase 2 was committed; see `docs/tech-spec.md#10` Phase 2 entry.
+
+---
+
+## 5. Phase 5: local failure-mode harness
+
+§4 above validates schema bring-up only. Phase 5 extends that into a full end-to-end harness that also stands up api-gateway and leaderboard-service in each region and exercises the failure paths Phases 1–4 wired in.
+
+### 5.1 How to run
+
+```sh
+# From the repo root
+bash infra/scripts/test-multi-region-local.sh
+
+# Keep the stack up after the run for manual poking
+bash infra/scripts/test-multi-region-local.sh --keep-up
+docker compose -f infra/compose/test-multi-region.yml down -v   # when done
+```
+
+Expected runtime:
+- **First run**: ~15 min — most of which is building the api-gateway and leaderboard-service images from source via Gradle in the Docker builder stage.
+- **Subsequent runs**: ~5 min — Docker reuses cached layers. CRDB V9's async LOCALITY finalisation still takes ~3 min of that.
+
+The script is idempotent and self-contained: it tears down with `docker compose down -v` at the end (unless `--keep-up`), and it uses dedicated host ports (18088, 18089, 18182, 18083, 19092, 26357, 26258, 28080, 28181, 16379, 16380) so it does not collide with the root `docker-compose.yml` (which already uses 28081 for the Flink jobmanager).
+
+### 5.2 What each scenario validates
+
+| Scenario | Path under test | Pass criterion |
+|---|---|---|
+| **S1 — region-mismatch 307** | `RegionMismatchFilter` in api-gateway. Signs up + logs in on gateway-a (region=asia-south1), then hits `GET /api/v1/submissions/health` on gateway-b with the gateway-a JWT. | HTTP 307 with `Location: http://localhost:18088/api/v1/submissions/health` (the host-reachable URL of gateway-a, which is `APP_PEER_GATEWAY_URL` on gateway-b). |
+| **S2 — peer-leaderboard graceful degradation** | `LeaderboardController.getLeaderboard(global=true)`. Stops `leaderboard-b`, then hits leaderboard-a's `GET /api/v1/leaderboard/<id>?global=true` directly. | HTTP 200 AND response header `X-Peer-Region-Unreachable: true`. |
+| **S3 — per-region Kafka topic isolation** | `kafka-bootstrap-topics.sh` creates exactly the `submissions.<region>.{pretest,system,dlq}` + `evaluated_results.<region>` + `analytics_events.<region>` + `contest_events.<region>` families that the regional execution-worker / leaderboard-service subscribe to. | `kafka-topics --list` shows both regions' `pretest`, `dlq`, and `evaluated_results` topics. |
+
+S1 endpoint choice notes — `GET /api/v1/submissions/health` is the right target because (a) it lives under `/api/`, so `RegionMismatchFilter` inspects it; (b) it is `permitAll` in `SecurityConfig`, so the Spring Security chain doesn't pre-empt the filter with a 401; (c) it is NOT in `RegionMismatchFilter.PUBLIC_PATHS` (which only bypasses `/auth/{signup,login,refresh}` and `/actuator/*`), so the filter actually runs.
+
+### 5.3 Captured output
+
+First green run, asia-south1 primary + us-central1 secondary:
+
+```
+[step 1] building images (this is the slow first-run step)
+[step 2] starting infra (zookeeper, kafka, crdb-a, crdb-b, redis-a, redis-b)
+[step 3] waiting for CRDB nodes to be reachable
+[wait] crdb-a http ready (0s)
+[wait] crdb-b http ready (0s)
+[step 3] cockroach init (idempotent — tolerates 'already initialized')
+[step 3] waiting for both nodes to report is_available=true
+[wait] crdb cluster healthy ready (1s)
+[step 4-prep] creating database onlinejudge
+[step 4a] applying Flyway V1..V8 against crdb-a (single-region phase)
+Successfully applied 8 migrations to schema "public", now at version v8 (execution time 00:07.130s)
+[step 4b] declaring multi-region (asia-south1 primary, us-central1 secondary)
+[crdb-init] declaring PRIMARY REGION=asia-south1 on database onlinejudge
+[crdb-init] adding secondary region us-central1
+[crdb-init] done
+[step 4c] applying Flyway V9 against crdb-a (multi-region LOCALITY DDL)
+Successfully applied 1 migration to schema "public", now at version v9 (execution time 00:08.376s)
+[step 5] bootstrapping per-region Kafka topics
+[bootstrap] submissions.asia-south1.pretest partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] submissions.asia-south1.system  partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] evaluated_results.asia-south1   partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] contest_events.asia-south1      partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] submissions.asia-south1.dlq     partitions=6  rf=1 isr=1 retention_ms=2592000000
+[bootstrap] submissions.us-central1.pretest partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] submissions.us-central1.system  partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] evaluated_results.us-central1   partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] contest_events.us-central1      partitions=12 rf=1 isr=1 retention_ms=604800000
+[bootstrap] submissions.us-central1.dlq     partitions=6  rf=1 isr=1 retention_ms=2592000000
+[step 6] starting api-gateway-a/b and leaderboard-a/b
+[wait] api-gateway-a UP ready (0s)
+[wait] api-gateway-b UP ready (13s)
+[wait] leaderboard-a UP ready (0s)
+[wait] leaderboard-b UP ready (0s)
+[scenario 1] 307 region-mismatch redirect
+[scenario 1] PASS — status=307 Location=http://localhost:18088/api/v1/submissions/health
+[scenario 2] leaderboard global=true graceful degradation
+[scenario 2] PASS — status=200 X-Peer-Region-Unreachable=true
+[scenario 3] per-region Kafka topic isolation
+[scenario 3] PASS — both regions' topic families present
+[summary] PASS — all three scenarios green
+```
+
+Findings surfaced by the first green run:
+
+- **Flyway-against-multi-region pathology** — running V2..V8 (simple `ALTER TABLE`) AFTER declaring PRIMARY REGION on a Docker Desktop CRDB cluster stalls each migration for minutes waiting on region-lease replication. The script's step-4a/4b/4c split is deliberate: apply V1..V8 single-region (~7 s), THEN declare regions, THEN apply V9 (LOCALITY DDL, ~8 s). Matches the recommended production order (run V8, declare regions, run V9).
+- **CRDB `INT` vs Java `int` schema-validation crash** — surfaced on the first run because `submissions.reconcile_attempts` (CRDB `INT8`) was mapped to Java `int` (JDBC `INTEGER`). Fixed at commit `15b29c7` (Submission.reconcileAttempts: int → long).
+
+### 5.4 Reading failures
+
+- **S1 returns 503 not 307** → `APP_PEER_GATEWAY_URL` is unset on gateway-b. The filter is failing closed by design. Check the compose env block.
+- **S1 returns 401 instead of 307** → the two gateways aren't sharing a JWT secret. Both must read the same `JWT_SECRET`; gateway-b verifies the token gateway-a signed.
+- **S2 returns 200 with no `X-Peer-Region-Unreachable` header** → `leaderboard-b` is actually serving requests (the `docker compose stop` didn't take), or `leaderboard-a` was given an `APP_PEER_LEADERBOARD_URL` of empty (in which case the controller returns local-only without the header — that's a config bug, not a behaviour bug).
+- **S3 missing topics** → `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` on the broker is intentional. If the bootstrap script reported "permission denied" or "sudo required", confirm the harness is invoking the topic script with `DOCKER=docker` (added in Phase 5 to `kafka-bootstrap-topics.sh` so dev hosts skip sudo).

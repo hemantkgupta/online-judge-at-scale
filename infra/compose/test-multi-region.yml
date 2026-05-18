@@ -1,0 +1,307 @@
+# =============================================================================
+# infra/compose/test-multi-region.yml
+#
+# Phase 5 — local failure-mode validation harness for the multi-region rollout.
+# Stands up a self-contained two-region "cluster" entirely on the host so the
+# wiring exercised by Phases 1–4 (RegionMismatchFilter 307, leaderboard global
+# fan-out with graceful peer degradation, per-region Kafka topics) can be
+# validated without GCP.
+#
+# Topology (single-host docker network `oj-test-net`):
+#
+#   zookeeper ─── kafka  (one broker, region-agnostic — the per-region topic
+#                         FAMILY is created by infra/scripts/kafka-bootstrap-topics.sh
+#                         which the harness invokes twice, once per region)
+#
+#   crdb-a (locality=region=asia-south1,zone=local)  ┐  same logical cluster,
+#   crdb-b (locality=region=us-central1,zone=local)  ┘  joined via --join
+#
+#   redis-a ── api-gateway-a (APP_REGION=asia-south1)  ──┐
+#                leaderboard-a (APP_REGION=asia-south1) ─┤   peer URLs cross-
+#   redis-b ── api-gateway-b (APP_REGION=us-central1)  ──┤   point each other
+#                leaderboard-b (APP_REGION=us-central1) ─┘
+#
+# Host port plan — chosen to NOT collide with the parent docker-compose.yml:
+#   * 18088 → api-gateway-a       18089 → api-gateway-b
+#   * 18182 → leaderboard-a       18083 → leaderboard-b
+#                                  (18082 reserved by dev's local leaderboard JVM)
+#   * 26357 → crdb-a SQL          26258 → crdb-b SQL
+#                                  (26257 reserved by dev's local CRDB process)
+#   * 28080 → crdb-a HTTP UI      28181 → crdb-b HTTP UI
+#                                  (28081 reserved by parent docker-compose.yml's Flink jobmanager)
+#   * 19092 → kafka (PLAINTEXT_HOST)
+#   * 16379 → redis-a             16380 → redis-b
+#
+# Driven by infra/scripts/test-multi-region-local.sh — do NOT `docker compose up`
+# this file by hand. The script orders bring-up (CRDB cluster init must run
+# BEFORE Flyway, and Flyway must finish BEFORE the Spring services start).
+# =============================================================================
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: oj-test-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      # `ruok` is gated by the 4lw whitelist on modern ZK; expose it explicitly
+      # only because Confluent's own healthcheck tool (`cub zk-ready` below)
+      # uses standard client APIs anyway. Left in for direct operator debug.
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=*"
+    networks: [oj-test-net]
+    healthcheck:
+      # `cub zk-ready` is Confluent's purpose-built readiness probe — connects
+      # via the client protocol and returns 0 only when ZK is in a serving
+      # state. Avoids the netcat-vs-4lw flakiness of the older recipe.
+      test: ["CMD-SHELL", "cub zk-ready localhost:2181 5"]
+      interval: 5s
+      timeout: 8s
+      retries: 20
+
+  # Single broker. KAFKA_AUTO_CREATE_TOPICS_ENABLE=false so the harness MUST
+  # run infra/scripts/kafka-bootstrap-topics.sh per region — that's the path
+  # under test in S3.
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: oj-test-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "19092:19092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Internal listener (oj-test-net) on 29092; host listener on 19092.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  crdb-a:
+    image: cockroachdb/cockroach:v24.1.10
+    container_name: oj-test-crdb-a
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=crdb-a:26257
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --locality=region=asia-south1,zone=local
+      - --join=crdb-a:26257,crdb-b:26257
+      - --cache=128MiB
+      - --max-sql-memory=128MiB
+    ports:
+      - "26357:26257"
+      - "28080:8080"
+    networks: [oj-test-net]
+    healthcheck:
+      # `node status` returns non-zero until init has run; the harness handles
+      # init explicitly. This healthcheck only proves the binary is listening.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health?ready=1 || curl -fsS http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  crdb-b:
+    image: cockroachdb/cockroach:v24.1.10
+    container_name: oj-test-crdb-b
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=crdb-b:26257
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --locality=region=us-central1,zone=local
+      - --join=crdb-a:26257,crdb-b:26257
+      - --cache=128MiB
+      - --max-sql-memory=128MiB
+    ports:
+      - "26258:26257"
+      - "28181:8080"
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health?ready=1 || curl -fsS http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis-a:
+    image: redis:7.2
+    container_name: oj-test-redis-a
+    command: redis-server --appendonly no --save ""
+    ports:
+      - "16379:6379"
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-b:
+    image: redis:7.2
+    container_name: oj-test-redis-b
+    command: redis-server --appendonly no --save ""
+    ports:
+      - "16380:6379"
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Region A (asia-south1) ───────────────────────────────────────────────
+  api-gateway-a:
+    build:
+      context: ../..
+      dockerfile: api-gateway/Dockerfile
+    image: oj-test/api-gateway:phase5
+    container_name: oj-test-api-gateway-a
+    depends_on:
+      kafka: { condition: service_healthy }
+      crdb-a: { condition: service_healthy }
+      redis-a: { condition: service_healthy }
+    ports:
+      - "18088:8088"
+    environment:
+      SERVER_PORT: 8088
+      APP_REGION: asia-south1
+      # Peer URL is what RegionMismatchFilter splices into the 307 Location.
+      # Use the HOST-reachable port so the test client can follow it manually.
+      APP_PEER_GATEWAY_URL: "http://localhost:18089"
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://crdb-a:26257/onlinejudge?sslmode=disable"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ""
+      # Flyway must be a no-op here — the harness runs flyway via the official
+      # image BEFORE these services start. Disabling avoids a duplicate-baseline
+      # race against the leaderboard? gateway is the only Flyway owner, so we
+      # leave it enabled — it will simply observe v9 already applied. Idempotent.
+      SPRING_FLYWAY_ENABLED: "true"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      SPRING_DATA_REDIS_HOST: redis-a
+      SPRING_DATA_REDIS_PORT: "6379"
+      # Both gateways MUST share the JWT secret — gateway-b verifies a JWT
+      # minted by gateway-a in S1, which fails closed with 401 otherwise.
+      JWT_SECRET: "phase5-multi-region-shared-secret-must-be-32-bytes-or-longer"
+      # Disable OTel exporter so a missing collector doesn't spam logs.
+      OTEL_TRACES_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      JAVA_TOOL_OPTIONS: ""
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  leaderboard-a:
+    build:
+      context: ../..
+      dockerfile: leaderboard-service/Dockerfile
+    image: oj-test/leaderboard-service:phase5
+    container_name: oj-test-leaderboard-a
+    depends_on:
+      kafka: { condition: service_healthy }
+      redis-a: { condition: service_healthy }
+    ports:
+      - "18182:8082"
+    environment:
+      SERVER_PORT: 8082
+      APP_REGION: asia-south1
+      # Peer URL used by the global=true fan-out. Use a HOST-reachable address
+      # — the script stops leaderboard-b in S2, and a host-port URL produces
+      # the same "connection refused" surface as a real cross-region outage.
+      APP_PEER_LEADERBOARD_URL: "http://leaderboard-b:8082"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      SPRING_DATA_REDIS_HOST: redis-a
+      SPRING_DATA_REDIS_PORT: "6379"
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  # ─── Region B (us-central1) ───────────────────────────────────────────────
+  api-gateway-b:
+    build:
+      context: ../..
+      dockerfile: api-gateway/Dockerfile
+    image: oj-test/api-gateway:phase5
+    container_name: oj-test-api-gateway-b
+    depends_on:
+      kafka: { condition: service_healthy }
+      crdb-b: { condition: service_healthy }
+      redis-b: { condition: service_healthy }
+      # We make B wait on A's Flyway-completed health to ensure the schema is
+      # in place before B opens its connection pool. CRDB is one cluster so B
+      # only needs A to have FINISHED migrations.
+      api-gateway-a: { condition: service_healthy }
+    ports:
+      - "18089:8088"
+    environment:
+      SERVER_PORT: 8088
+      APP_REGION: us-central1
+      APP_PEER_GATEWAY_URL: "http://localhost:18088"
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://crdb-b:26257/onlinejudge?sslmode=disable"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ""
+      # Disable Flyway on gateway-b — gateway-a is the sole Flyway owner in
+      # this harness. CRDB is a single logical cluster, so the schema A applied
+      # is already visible to B; running V9 twice is a no-op but noisy.
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      SPRING_DATA_REDIS_HOST: redis-b
+      SPRING_DATA_REDIS_PORT: "6379"
+      JWT_SECRET: "phase5-multi-region-shared-secret-must-be-32-bytes-or-longer"
+      OTEL_TRACES_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      JAVA_TOOL_OPTIONS: ""
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  leaderboard-b:
+    build:
+      context: ../..
+      dockerfile: leaderboard-service/Dockerfile
+    image: oj-test/leaderboard-service:phase5
+    container_name: oj-test-leaderboard-b
+    depends_on:
+      kafka: { condition: service_healthy }
+      redis-b: { condition: service_healthy }
+    ports:
+      - "18083:8082"
+    environment:
+      SERVER_PORT: 8082
+      APP_REGION: us-central1
+      APP_PEER_LEADERBOARD_URL: "http://leaderboard-a:8082"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      SPRING_DATA_REDIS_HOST: redis-b
+      SPRING_DATA_REDIS_PORT: "6379"
+    networks: [oj-test-net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+networks:
+  oj-test-net:
+    name: oj-test-net
+    driver: bridge

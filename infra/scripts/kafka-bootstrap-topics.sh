@@ -72,7 +72,19 @@ if [[ -z "$REGION" ]]; then
   exit 1
 fi
 
-EXEC="sudo docker exec -i ${CONTAINER} kafka-topics --bootstrap-server ${BROKER}"
+# Docker invocation prefix. Mirrors crdb-multiregion-init.sh: production VMs
+# invoke this via `sudo bash …` so DOCKER defaults to `sudo docker`; on macOS
+# / dev hosts Docker Desktop accepts the unprefixed binary, so override via
+# `DOCKER=docker bash kafka-bootstrap-topics.sh …` to skip the sudo prompt.
+if [ -z "${DOCKER:-}" ]; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        DOCKER="sudo docker"
+    else
+        DOCKER="docker"
+    fi
+fi
+
+EXEC="${DOCKER} exec -i ${CONTAINER} kafka-topics --bootstrap-server ${BROKER}"
 
 create_topic() {
   local name="$1" partitions="$2" retention_ms="${3:-$RETENTION_MS}"
