@@ -4,7 +4,7 @@
 >
 > Audience: a Principal SWE joining the team cold. Should be enough to answer "where does X happen, why was Y chosen, what breaks Z" without reading every file.
 >
-> Companions: [`docs/ci-cd.md`](./ci-cd.md), [`docs/code-companion.md`](./code-companion.md), the per-feature [design docs](./design-docs/) (index in [Appendix D](#d-design-doc-index)), and the [prod-readiness roadmap](https://github.com/hemantkgupta/CSE-Raw/blob/main/raw-blog/oj-prod-readiness-roadmap.md).
+> Companions: per-service owner pages under [`docs/services/`](./services/) (the four high-complexity services — api-gateway, execution-worker, sandbox-manager, problem-service — have dedicated pages), [`docs/ci-cd.md`](./ci-cd.md), [`docs/code-companion.md`](./code-companion.md), the per-feature [design docs](./design-docs/) (index in [Appendix D](#d-design-doc-index)), and the [prod-readiness roadmap](https://github.com/hemantkgupta/CSE-Raw/blob/main/raw-blog/oj-prod-readiness-roadmap.md).
 
 ---
 
@@ -151,144 +151,31 @@ A full submission round-trip is rendered as a sequence diagram in [Appendix A](#
 
 Each subsection follows the same shape: purpose, tech stack, external interfaces, key internal mechanisms, failure modes, configuration knobs of interest, pointers to code.
 
+The four high-complexity services (api-gateway, execution-worker, sandbox-manager, problem-service) each have a **dedicated owner page** under [`docs/services/`](./services/) that goes far deeper than these summaries — full configuration reference, metrics catalogue, runbook, code map. The summary below points to those pages; treat them as the authoritative reference for the service. The four thinner services (contest-service, leaderboard-service, scoring-pipeline, analytics-pipeline) and the cross-cutting modules (common, the Go agent) keep their full description inline here.
+
 ### 4.1 api-gateway
 
-**Purpose.** Public-facing HTTP API. Authenticates contestants, accepts submission requests, persists the row in CRDB, publishes a `SubmissionEvent` to Kafka via the outbox pattern. Also owns Flyway migrations — it is the canonical schema owner for every JVM service.
+The single public-facing component. Owns: contestant identity (signup / login / JWT issuance with `kid` rotation, refresh-token rotation, Argon2id), the `POST /api/v1/submissions` endpoint (validates auth + 64 KiB body cap + persists with outbox pattern), and the Flyway migrations for the entire system (`onlinejudge` schema, V1..V8). The cross-cutting reliability story (outbox publisher + reconciliation scanner) lives here; the policy story (rate limiting) lives here. Spring Boot 3.2.4, port 8088.
 
-**Tech stack.** Spring Boot 3.2.4 on Java 17; PostgreSQL JDBC against CRDB; Spring Kafka; Spring Data JPA + Redis; Spring Security; Flyway 9.22.3.
-
-**External interfaces.**
-- `POST /api/v1/auth/{signup,login,refresh,logout}` — see §7.1.
-- `POST /api/v1/submissions` — accept a submission. Body capped at 64 KiB (`@Size(max=65536)` + Tomcat-level body caps). Produces a row in `onlinejudge.submissions` with `status='PENDING'`.
-- `GET /api/v1/submissions/{id}` — poll the verdict. The verdict lands here via the same Kafka stream that drives the leaderboard.
-- `GET /actuator/health` — liveness/readiness for compose + Kubernetes-style probes.
-- Kafka: produces `SubmissionEvent` to `submissions.pretest`; consumes nothing.
-
-**Key internal mechanisms.**
-- **Outbox pattern.** `POST /submissions` writes both the `submissions` row AND an `outbox_events` row in one transaction. A polling publisher reads unpublished outbox rows and sends to Kafka, marking them published. Survives the api-gateway crashing between the two writes (the row is consistent because they're in the same txn) and survives Kafka being down (the publisher retries until it succeeds).
-- **Reconciliation scanner** (roadmap §3.9). A `@Scheduled` sweep runs every 60 s, finds `submissions WHERE status='PENDING' AND created_at < now()-15min AND reconcile_attempts < 10`, and re-publishes the `SubmissionEvent` to `submissions.pretest`. Catches the failure mode where the outbox row was never inserted (e.g. api-gateway crashed between the submission INSERT and the outbox INSERT, even though both are in one txn — bug class for the future). Above the attempts cap, the row is `markFailed` and dead-lettered to `submissions.dlq`. See `api-gateway/src/main/java/com/onlinejudge/gateway/scanner/ReconciliationScanner.java`.
-- **Rate limiting.** A Lua-script leaky-bucket runs in Redis (`RateLimitService`). Buckets per IP and per user; configured via `app.rate-limit.{per-ip,per-user}.*` properties. Today's defaults are dev-grade — tuning is a roadmap item.
-
-**Failure modes & handling.**
-- Kafka down → outbox publisher backs off; the api-gateway endpoint still returns 200 because the row is persisted. The contestant sees their submission was accepted; the verdict will appear once Kafka recovers.
-- CRDB lease loss mid-txn → Spring's JTA rollback unwinds both writes; the contestant sees 503 and retries.
-- Worker crash-loop → submissions pile up on `submissions.pretest` with no consumer. The reconciliation scanner is the safety net for *gateway-side* drops; *worker-side* stuck submissions surface through the idempotency-attempts-cap → DLQ path (§8.3).
-
-**Configuration knobs.**
-- `app.jwt.{kid-current,kid-previous,keys.v1,keys.v2,access-ttl-seconds,refresh-ttl-seconds,issuer}` — see §7.1.
-- `app.reconciliation.{enabled,interval-seconds,stale-after-seconds,batch-size,max-attempts}` — defaults `{true, 60, 900, 500, 10}`.
-- `app.kafka.topic.{pretest,evaluated-results,analytics,dlq}` — topic names.
-- `spring.flyway.{baseline-on-migrate=true,baseline-version=0}` — required when the canonical `onlinejudge` database is bootstrapped against a partially-populated state (see §10.4).
-
-**Code pointers.**
-- Controllers: `api-gateway/src/main/java/com/onlinejudge/gateway/controller/`
-- Auth subsystem: `.../security/{JwtTokenProvider,JwtAuthenticationFilter,SecurityConfig}.java` + `.../service/AuthService.java`
-- Migrations: `api-gateway/src/main/resources/db/migration/V1__init.sql` through `V8__reconcile_attempts.sql`
+→ **Full owner page: [`services/api-gateway.md`](./services/api-gateway.md)** — REST surface, auth design, outbox + reconciliation internals, configuration reference, metrics, runbook (5 incidents), tests, code map.
 
 ### 4.2 execution-worker
 
-**Purpose.** Kafka consumer that pulls each submission, executes it via the Sandbox Manager, and publishes the verdict. The "translator" between the asynchronous Kafka world and the synchronous lease/exec API.
+The translator between Kafka and the synchronous SM lease/exec API. Pulls `SubmissionEvent` from `submissions.pretest` (concurrency 4) and `submissions.system` (concurrency 2); calls `problem-service` for test-case URLs; calls the SM `/lease`; dispatches to the in-guest agent over vsock; publishes `VerdictEvent` (with per-test breakdown) and `AnalyticsEvent`; on Phase-1 ACCEPTED re-publishes the submission to `submissions.system`. Idempotency is claimed AFTER successful sandbox lease so transient `pool_exhausted` 503s don't burn an attempt. Spring Boot 3.2.4; not publicly exposed.
 
-**Tech stack.** Spring Boot 3.2.4; Spring Kafka with 4 concurrent pretest consumers + 2 system consumers; JPA against CRDB (only for `idempotency_keys` reads/writes); JDK `HttpClient` for outbound HTTP to `problem-service` + the SM.
-
-**External interfaces.**
-- Consumes `submissions.pretest` (consumer group `execution-worker-pretest`, concurrency 4) and `submissions.system` (group `execution-worker-system`, concurrency 2).
-- Produces `evaluated_results`, `analytics`, and on Phase-1 ACCEPTED also re-publishes to `submissions.system`. Publishes to `submissions.dlq` on attempts-cap exceeded.
-- Outbound HTTP: `problem-service:8089` for test-case URLs; `sandbox-manager:9100` for sandbox lifecycle.
-
-**Key internal mechanisms.**
-- **Two-phase pipeline.** Phase 1 (`pretest`) is real-time during the contest — first 10 test ordinals only, fast verdict back to the user. Phase 2 (`system`) runs all ordinals; triggered automatically when Phase 1 returns ACCEPTED OR via the contest-close replay path (§4.7).
-- **Per-test loop in the agent, not the worker.** The worker hands the agent a single JSON request containing the source + all per-test specs (input string + expected hash). The agent compiles once, runs N times, returns one consolidated response with per-ordinal results. This is "Option α" from Workstream B — no mounted code drive, no per-test vsock chatter.
-- **Idempotency.** Every submission claims an `idempotency_keys` row scoped by `(submissionId, phase)` BEFORE leasing a sandbox. Three outcomes: CLAIMED (proceed), COMPLETED (skip, ack — duplicate), IN_PROGRESS (nack with 5 s backoff — another consumer is mid-flight). The claim is moved AFTER sandbox lease so transient `pool_exhausted` 503s don't burn an attempt. See §8.3 for the attempts-cap + DLQ mechanism.
-- **Pool-exhausted handling.** When the SM returns `503 pool_exhausted`, the worker throws `PoolExhaustedException`, `releaseClaim`s the idempotency row, and `ack.nack(retry_after_ms)` so Kafka redelivers. The contestant never sees a RUNTIME_ERROR for a transient backpressure event.
-
-**Failure modes & handling.**
-- Problem-service unreachable → `TestCaseFetcher.fetch()` throws; the worker `ack.nack(5s)`. The idempotency row was released (the claim happens after the lease, so a fetch failure never poisons the idempotency state).
-- Agent crashes mid-execution → vsock connection drops; the worker sees the bridge process exit non-zero, emits `INTERNAL_ERROR` (mapped to RUNTIME_ERROR in the verdict — debatable; flagged for refinement in [`design-docs/microvm-egress-lockdown.md`](./design-docs/microvm-egress-lockdown.md)).
-- Worker container crashes → the in-flight submission's idempotency row stays `processing` for 300 s, then is reclaimed by the next consumer's `claimSubmission` call (with attempts++). After 10 consecutive reclaim-and-fail cycles, the row goes `poisoned` and is DLQ'd.
-
-**Configuration knobs.**
-- `app.sandbox.backend={docker|firecracker}` — `firecracker` in prod, `docker` for local dev / CI smoke.
-- `app.sandbox.docker.runtime={runc|runsc}` — gVisor lives here.
-- `app.problem-service.{required,url}` — `required=true` in prod, `false` for the bypass smoke. URL defaults to `http://oj-control-plane:8089`, overridden via `APP_PROBLEM_SERVICE_URL` env on the compute VM (DNS doesn't cross VMs).
-- `app.idempotency.{processing-lease-seconds,max-attempts}` — defaults `{300, 5}`.
-- `app.sandbox.in-process-pool.enabled` — defaults `false`. The legacy embedded pool is gated behind this; only useful for dev workflows that want a single-host docker pool.
-
-**Code pointers.**
-- Consumer: `execution-worker/src/main/java/com/onlinejudge/worker/consumer/SubmissionConsumer.java`
-- Sandbox lease abstraction: `.../service/{ExecutionBackend,FirecrackerExecutionService,DockerExecutionService,SandboxManagerClient,AgentClient,PoolExhaustedException}.java`
-- Idempotency: `.../service/IdempotencyService.java`
-- Test-case fetch: `.../service/{TestCaseFetcher,ProblemServiceClient}.java`
+→ **Full owner page: [`services/execution-worker.md`](./services/execution-worker.md)** — Kafka consumer wiring, idempotency state machine, pool-exhausted retry, agent dispatch, configuration reference, metrics, runbook (6 incidents), tests, code map.
 
 ### 4.3 sandbox-manager
 
-**Purpose.** Per-host privileged daemon. Owns `/dev/kvm`, `/usr/local/bin/firecracker`, the harness rootfs (`/var/lib/firecracker/rootfs.ext4`), and the kernel image. Exposes a tiny REST API (`/lease /exec /release`) on `:9100` consumed by the worker. Manages the warm-pool state machine. The trust-zone boundary that lets the worker stay unprivileged.
+Per-host privileged daemon. Owns `/dev/kvm`, the Firecracker binary, the harness rootfs, the kernel image, and the per-lease network namespace + iptables + cgroups. Exposes `POST /lease /release` on `:9100` for the worker. Manages the warm-pool state machine (PROVISIONING → READY → LEASED → DIRTY → TERMINATED) with target counts per language (`python:2 / cpp:1 / java:1`). Enforces the wall-clock kill via the watchdog and the per-microVM network namespace + iptables egress lockdown. The trust-zone boundary that lets the worker stay unprivileged. The cross-cutting architectural story for this service is in [§6 Sandbox architecture (deep dive)](#6-sandbox-architecture-deep-dive); the implementation reference is the owner page.
 
-**Tech stack.** Spring Boot 3.2.4 + Spring Web on Java 17. Shells out to `firecracker`, `ip`, `iptables`, `cgcreate/cgset` (cgroup-tools). The vsock bridge to the in-guest agent is a tiny Go binary (`oj-vsock-client`, ~250 lines) baked into the image.
-
-**External interfaces.**
-- `POST /lease {language, submission_id}` — returns `{sandbox_id, vsock_uds_path, vsock_port, session_token}`. 503 with `{error: "pool_exhausted", retry_after_ms, language}` when no warm VM is available.
-- `POST /exec {sandbox_id, session_token, request_json}` — streams the agent's JSON response back. (Today the worker bypasses this and talks vsock directly via `oj-vsock-client`; `/exec` is reserved for the alternative "SM-as-proxy" path documented in the production blog at `raw-blog/execution-service-gcp.md`.)
-- `POST /release {sandbox_id}` — moves the VM through DIRTY → TERMINATED.
-- `GET /actuator/health` — also publishes pool depth metrics.
-
-**Key internal mechanisms.** See §6 for the full deep dive. Highlights:
-- **Pool state machine** — PROVISIONING → READY → LEASED → DIRTY → TERMINATED. The pool replenisher is a `@Scheduled` thread that brings the count back to target (`python:2 / cpp:1 / java:1` in the current sizing).
-- **Watchdog** — every leased sandbox gets a wall-clock kill scheduled at `lease_wall_seconds` (default 30 s). Fires `forceKill`, which transitions the VM to DIRTY and triggers release.
-- **Cgroups** — `CgroupApplier` puts the Firecracker process into a per-lease memory + CPU cgroup at lease time. Mem comes from the per-problem `memory_limit_mb`; CPU is a tenant-fair quota/period pair.
-- **Egress lockdown** (roadmap §3.1). Each lease gets its own Linux network namespace (`ip netns add oj-<id-prefix>`), the Firecracker process is exec'd inside it via `ip netns exec`, and host iptables rules add belt-and-suspenders DROP rules on the (now non-existent) tap device. The microVM boots with zero NICs — only vsock survives. Gated by `app.sandbox.egress-lockdown.enabled` (default true; iptables sub-flag default false for dev hosts).
-
-**Failure modes & handling.**
-- Kernel panic in the microVM → Firecracker process exits non-zero, watchdog observes the dead PID, transitions to TERMINATED. The pool replenisher fills in.
-- `firecracker` binary missing / KVM not available → SM logs the error on startup and the lease API returns 503 to every request. Operator-visible immediately.
-- Pool replenisher stalls → eventually every lease returns 503; an alert on `sandbox.pool.ready{language=…}` < 1 fires (when OTel lands).
-
-**Configuration knobs.**
-- `app.firecracker.{binary,kernel-image,rootfs-image,api-sock-dir,vsock-uds-dir}` — paths to the FC artifacts.
-- `app.pool.targets.{python,cpp,java}` — desired warm count per language.
-- `app.pool.max-parallel-boot` — caps concurrent FC spawns during replenishment so the 2-vCPU compute VM doesn't thrash.
-- `app.lease.wall-seconds` — watchdog kill deadline.
-- `app.sandbox.egress-lockdown.{enabled,iptables-enabled,ip-binary,iptables-binary,deny-cidrs}`.
-
-**Code pointers.**
-- Lease: `sandbox-manager/src/main/java/com/onlinejudge/sandbox/service/LeaseService.java`
-- Pool: `.../service/PoolManager.java`
-- Watchdog: `.../service/WatchdogService.java`
-- Cgroups: `.../service/CgroupApplier.java`
-- Netns: `.../service/NetnsApplier.java`
-- Firecracker launcher: `.../firecracker/FirecrackerLauncher.java`
-- REST: `.../web/SandboxController.java`
+→ **Full owner page: [`services/sandbox-manager.md`](./services/sandbox-manager.md)** — pool state machine + replenisher + watchdog + cgroups + netns internals, configuration reference, metrics, runbook (6 incidents), tests, code map.
 
 ### 4.4 problem-service
 
-**Purpose.** Reads the `problems` and `test_cases` tables; signs V4 GCS download URLs for the per-ordinal input + expected output objects; hands them to the worker over HTTP. The only thing in the system that has the GCS signer SA's private key.
+The narrow waist between the `problems` / `test_cases` CRDB rows and the GCS bytes the worker consumes. Single endpoint: `GET /api/v1/problems/{id}/test-cases?pretestOnly={bool}` returns `{time_limit_ms, memory_limit_mb, test_cases: [{ordinal, input_url, expected_output_url}, ...]}`. URLs are V4-signed in-process (no API roundtrip; RSA-SHA256 against the signer SA's private key fetched from Secret Manager at VM boot) with a 5-minute TTL. Per-problem `time_limit_ms` / `memory_limit_mb` are also returned and flow forward to the SM's cgroup + the agent's wall clock. The only component that holds the GCS signer SA's private key in process. Spring Boot 3.2.4, port 8089.
 
-**Tech stack.** Spring Boot 3.2.4; JPA against CRDB (`onlinejudge` database, `ddl-auto: validate`); `com.google.cloud:google-cloud-storage` 2.40.1.
-
-**External interfaces.**
-- `GET /api/v1/problems/{problemId}/test-cases?pretestOnly={bool}` — returns `{time_limit_ms, memory_limit_mb, test_cases: [{ordinal, input_url, expected_output_url}, ...]}`. Worker calls this once per submission.
-- `GET /actuator/health` — liveness.
-
-**Key internal mechanisms.**
-- **V4 URL signing.** JCA-side RSA-SHA256 over the canonical request string. Happens in-process — no API roundtrip. Requires the SA's private key on disk (ADC tokens won't sign URLs; that's why the GCS_SIGNER_KEY_PATH env exists). The key is fetched from Secret Manager at VM boot.
-- **5-minute URL TTL** — short enough that a leaked URL is a small window; long enough that a slow microVM boot doesn't fail the GET.
-- **Per-problem limits in the response** (roadmap §2.3). Plumbed forward into `time_limit_ms` / `memory_limit_mb` that reach the agent's `runTimeout` and the SM's cgroup at lease time.
-
-**Failure modes & handling.**
-- Signer key file missing → application boot crashes with a clear log. Recover via the Secret Manager fetch in `control-plane.sh.tpl`.
-- `problems` row missing → 404 from this endpoint; worker `ack.nack`s.
-- GCS API rate-limit → V4 signing is offline, so this never happens for signing. A worker fetching the signed URL could 429 from GCS, but in practice no.
-
-**Configuration knobs.**
-- `DB_URL` / `DB_USER` / `DB_PASSWORD` — `onlinejudge` database.
-- `GCS_PROJECT_ID` / `GCS_BUCKET` — bucket the signed URLs point at.
-- `GCS_SIGNER_KEY_PATH` — disk path to the SA JSON key.
-
-**Code pointers.**
-- Controller: `problem-service/src/main/java/com/onlinejudge/problem/controller/ProblemController.java`
-- Service: `.../service/{ProblemService,GcsSigner}.java`
-- Entities: `.../entity/{Problem,TestCase}.java` — `Problem` fields widened to `long` post-§2.2 to match CRDB BIGINT.
-- DTO: `.../dto/{ProblemDto,TestCaseBundleDto}.java`
+→ **Full owner page: [`services/problem-service.md`](./services/problem-service.md)** — V4 signing internals, signer-key loading, configuration reference, metrics, runbook (5 incidents), tests, code map.
 
 ### 4.5 contest-service
 
