@@ -21,7 +21,7 @@
 9. [Observability](#9-observability)
 10. [Deployment](#10-deployment)
 11. [Operations](#11-operations)
-12. [Multi-region (future)](#12-multi-region-future)
+12. [Multi-region](#12-multi-region)
 13. [Testing strategy](#13-testing-strategy)
 14. [Known limitations and debt](#14-known-limitations-and-debt)
 15. [Glossary](#15-glossary)
@@ -762,21 +762,50 @@ A teardown via `tofu destroy` reduces ongoing cost to ₹0 (only persistent stat
 
 ---
 
-## 12. Multi-region (future)
+## 12. Multi-region
 
-The codebase carries `region` columns on `submissions` and `outbox_events`, `RegionResolver` populates them from the `X-Region` header, and `database/multi-region-setup.sql` documents the three CRDB `ALTER` statements needed to enable `LOCALITY REGIONAL BY ROW`. None of this is live. The full migration plan lives at [`design-docs/multi-region-rollout.md`](./design-docs/multi-region-rollout.md).
+Two regions, each running the full stack, sharing one logical CRDB cluster and one logical Kafka cluster across regions. The roll-up plan and historic rationale live in [`design-docs/multi-region-rollout.md`](./design-docs/multi-region-rollout.md); incident procedures in [`docs/runbooks/multi-region.md`](./runbooks/multi-region.md).
 
-Sketch of what shipped vs what would deploy:
+### 12.1 Sticky-region routing
 
-| Concern | Code today | Production deploy |
-|---|---|---|
-| Per-row region tag | Column on submissions / outbox_events / contests | Same |
-| CRDB multi-region | 3-region setup SQL exists | Apply it; switch to ≥ 3 nodes per region |
-| Kafka per region | Topic naming convention `submissions.{region}.{phase}` proposed | Stand up per-region clusters; no MirrorMaker |
-| Worker affinity | Consumer-group routing by region | Each worker subscribes only to its region's topic |
-| DNS | `api.online-judge.example.com` not yet provisioned | Cloud DNS geo-routed; fallback to nearest healthy region |
+Every write-path resource has a home region. Users register in region X; their `users.region` column is stamped at signup time (see §5.1). The access-token JWT carries a `region` claim that the gateway populates from `users.region` at login. If a request lands at the wrong region's gateway, `RegionMismatchFilter` returns **HTTP 307 Temporary Redirect** with a `Location` header pointing at `${APP_PEER_GATEWAY_URL}` (set by the startup script to the peer VM's internal address). Clients retry there; idempotent verbs follow the redirect transparently.
 
-Cost estimate per `multi-region-rollout.md`: ~3× current monthly burn for a three-region setup.
+This keeps every write — submission insert, contest enrollment, refresh-token rotation — on the user's home node, which is exactly the row's `REGIONAL BY ROW` partition. No cross-region SQL hop in the hot path.
+
+### 12.2 Per-region Kafka topics
+
+Topic names carry the region:
+
+| Topic | Purpose | Producer | Consumer |
+|---|---|---|---|
+| `submissions.<region>.pretest` | Live-contest pretest fan-out | api-gateway (outbox publisher) | execution-worker (region-local) |
+| `submissions.<region>.system` | Post-contest system-test replay | contest-service `SystemTestReplayPublisher` (key off row.region) | execution-worker (region-local) |
+| `contest_events.<region>` | Contest open/close fan-out | contest-service | leaderboard-service |
+| `submissions.dlq` | Poison messages (region-agnostic) | execution-worker | DLQ tooling |
+| `evaluated_results.<region>` | Worker verdicts | execution-worker | leaderboard-service (subscribed to BOTH regions — §12.3) |
+
+Each worker subscribes only to its own region's submissions topic via the `${REGION}` env var. The contest-service replay publisher reads each `AcceptedSubmissionRow.region` and routes that row to `submissions.<row.region>.system` — so a contest contestant who submitted from us-central1 has their system-test fan-out replayed on the us-central1 worker, even if the contest was closed by an asia-south1 operator. Rows with NULL/blank region (legacy data) fall back to the local region's system topic.
+
+Topics are created by [`infra/scripts/kafka-bootstrap-topics.sh --region <name>`](https://github.com/hemantkgupta/online-judge-at-scale/blob/main/infra/scripts/kafka-bootstrap-topics.sh). The script is idempotent (`--create --if-not-exists`).
+
+### 12.3 Leaderboard global view
+
+Leaderboard reads are global — a contestant in asia-south1 sees the same ordering as one in us-central1. The leaderboard-service subscribes to **both** regions' `evaluated_results` topics and updates the same Redis ZSET keys. Writes to Redis stay in the local region (each region has its own Redis primary); the leaderboard-service fan-out to the peer happens via `${APP_PEER_LEADERBOARD_URL}` for the WebSocket push. Details in §4.6 + the [leaderboard-service owner page](./services/leaderboard-service.md).
+
+### 12.4 What's live today vs deferred
+
+| Concern | Status |
+|---|---|
+| CRDB multi-region locality (V9) | **Live** — schema validated by V9 on a fresh cluster, runbook in `docs/runbooks/multi-region.md`. |
+| JWT region claim + 307 mismatch redirect | **Live** — `RegionMismatchFilter` + `JwtTokenProvider.extractRegion` |
+| Per-region Kafka topic naming | **Live** — `submissions.<region>.{pretest,system}`, `contest_events.<region>`, `evaluated_results.<region>` |
+| Worker region affinity | **Live** — `app.region` env var drives the topic subscription |
+| Leaderboard global view via dual subscription | **Live** — leaderboard-service consumes both regions' `evaluated_results` |
+| Region-aware system-test replay | **Live** — `SystemTestReplayPublisher` reads `row.region` and routes per row |
+| GCS Cloud DNS geo-routed entry | **Deferred** — clients today talk to a region's external IP directly; multi-region DNS is a §3.x roadmap item |
+| 3-broker Kafka / 3-node CRDB per region | **Deferred** — single-broker / single-node per region; RF=1 today, RF=3 after the cluster bump (see §14) |
+
+Cost estimate per `multi-region-rollout.md`: ~2× current monthly burn for the 2-region setup we run today; ~3× for the eventual three-region target.
 
 ---
 

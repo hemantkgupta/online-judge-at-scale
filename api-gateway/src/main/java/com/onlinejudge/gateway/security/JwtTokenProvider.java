@@ -119,24 +119,53 @@ public class JwtTokenProvider {
 
     /** Mints an access JWT carrying {@code userId} as the subject. */
     public String issueToken(String userId) {
-        return issueAccessToken(userId);
+        return issueAccessToken(userId, null);
     }
 
-    /** Mints an access JWT carrying {@code userId} as the subject. */
+    /** Mints an access JWT carrying {@code userId} as the subject (no region claim). */
     public String issueAccessToken(String userId) {
+        return issueAccessToken(userId, null);
+    }
+
+    /**
+     * Mints an access JWT carrying {@code userId} as the subject and the
+     * user's home {@code region} as a non-standard claim. The region claim
+     * lets the {@code RegionMismatchFilter} route requests that arrive at
+     * the wrong regional gateway pod to the correct one via 307.
+     *
+     * <p>{@code region} may be {@code null} or blank — in which case no
+     * region claim is set (back-compat for tokens issued before the
+     * multi-region rollout; the filter treats a missing claim as "no
+     * mismatch" and passes the request through).
+     */
+    public String issueAccessToken(String userId, String region) {
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("userId must not be blank");
         }
         Instant now = Instant.now();
-        return Jwts.builder()
+        io.jsonwebtoken.JwtBuilder builder = Jwts.builder()
                 .header().keyId(currentKid).and()
                 .issuer(issuer)
                 .subject(userId)
                 .claim("typ", TYPE_ACCESS)
                 .issuedAt(Date.from(now))
-                .expiration(Date.from(now.plus(accessTtl)))
-                .signWith(keysByKid.get(currentKid))
-                .compact();
+                .expiration(Date.from(now.plus(accessTtl)));
+        if (region != null && !region.isBlank()) {
+            builder.claim("region", region);
+        }
+        return builder.signWith(keysByKid.get(currentKid)).compact();
+    }
+
+    /**
+     * Returns the {@code region} claim from a previously-issued access token,
+     * or {@code null} if the token has no region claim (legacy tokens issued
+     * before the multi-region rollout). Throws {@link JwtException} if the
+     * token is unparseable / has a bad signature / has expired.
+     */
+    public String extractRegion(String token) {
+        Jws<Claims> jws = parse(token);
+        Object region = jws.getPayload().get("region");
+        return region == null ? null : region.toString();
     }
 
     /**

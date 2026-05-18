@@ -57,12 +57,25 @@ public class AuthService {
     private final JwtTokenProvider tokenProvider;
     private final Argon2PasswordEncoder passwordEncoder;
     private final Duration refreshTtl;
+    /**
+     * Region this api-gateway pod is pinned to. Stamped onto new users at
+     * signup (so the user's "home" region is whichever gateway accepted the
+     * registration), and read back at login to inject the {@code region}
+     * claim into the access JWT.
+     */
+    private final String currentRegion;
 
+    // @Autowired marks this as THE constructor Spring picks at startup —
+    // without it Spring sees two constructors (this + the legacy 5-arg one
+    // used by AuthServiceTest) and falls back to "no default ctor found".
+    // Same pattern as JwtTokenProvider / TestCaseFetcher / AgentClient.
+    @org.springframework.beans.factory.annotation.Autowired
     public AuthService(UserRepository userRepository,
                        RefreshTokenRepository refreshTokenRepository,
                        AuthEventRepository authEventRepository,
                        JwtTokenProvider tokenProvider,
-                       @Value("${app.jwt.refresh-ttl-seconds:604800}") long refreshTtlSeconds) {
+                       @Value("${app.jwt.refresh-ttl-seconds:604800}") long refreshTtlSeconds,
+                       @Value("${app.region:asia-south1}") String currentRegion) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.authEventRepository = authEventRepository;
@@ -71,6 +84,22 @@ public class AuthService {
         // hashLength=32, parallelism=1, memory=64 MiB (65536 KiB), iterations=3.
         this.passwordEncoder = Argon2PasswordEncoder.defaultsForSpringSecurity_v5_8();
         this.refreshTtl = Duration.ofSeconds(refreshTtlSeconds);
+        this.currentRegion = currentRegion;
+    }
+
+    /**
+     * Legacy constructor used by {@code AuthServiceTest} (no region — defaults
+     * to "asia-south1" to match the prod default). Kept so the existing test
+     * seam compiles without changes; new tests should pass {@code currentRegion}
+     * explicitly via the 6-arg ctor.
+     */
+    public AuthService(UserRepository userRepository,
+                       RefreshTokenRepository refreshTokenRepository,
+                       AuthEventRepository authEventRepository,
+                       JwtTokenProvider tokenProvider,
+                       long refreshTtlSeconds) {
+        this(userRepository, refreshTokenRepository, authEventRepository, tokenProvider,
+                refreshTtlSeconds, "asia-south1");
     }
 
     /** Thrown when an auth precondition fails. Maps to 4xx in the controller. */
@@ -88,7 +117,9 @@ public class AuthService {
             throw new AuthException(409, "Username already taken");
         }
         UUID userId = UUID.randomUUID();
-        User user = new User(userId, username, passwordEncoder.encode(req.getPassword()));
+        // Stamp the gateway pod's region onto the user so future logins
+        // (from anywhere) carry it forward into the JWT region claim.
+        User user = new User(userId, username, passwordEncoder.encode(req.getPassword()), currentRegion);
         userRepository.save(user);
         recordEvent(userId, "SIGNUP", ip, userAgent, null);
         log.info("[auth] signup userId={} username={}", userId, username);
@@ -110,7 +141,7 @@ public class AuthService {
             log.warn("[auth] LOGIN_FAIL userId={} ip={}", user.getId(), ip);
             throw new AuthException(401, "Invalid credentials");
         }
-        TokenPairResponse pair = issuePair(user.getId());
+        TokenPairResponse pair = issuePair(user.getId(), user.getRegion());
         recordEvent(user.getId(), "LOGIN_OK", ip, userAgent, null);
         return pair;
     }
@@ -130,9 +161,14 @@ public class AuthService {
                     stored.getRevokedAt() != null ? "revoked" : "expired");
             throw new AuthException(401, "Invalid refresh token");
         }
-        // Rotate: revoke old, issue new pair.
+        // Rotate: revoke old, issue new pair. Read the user's region back
+        // from the row so the new access token carries the same region claim
+        // the previous one did (region is set-once at signup, never updated).
         refreshTokenRepository.revoke(hash, now);
-        TokenPairResponse pair = issuePair(stored.getUserId());
+        String region = userRepository.findById(stored.getUserId())
+                .map(User::getRegion)
+                .orElse(currentRegion);
+        TokenPairResponse pair = issuePair(stored.getUserId(), region);
         recordEvent(stored.getUserId(), "REFRESH", ip, userAgent, null);
         return pair;
     }
@@ -150,8 +186,8 @@ public class AuthService {
 
     // --- helpers --------------------------------------------------------
 
-    private TokenPairResponse issuePair(UUID userId) {
-        String access = tokenProvider.issueAccessToken(userId.toString());
+    private TokenPairResponse issuePair(UUID userId, String region) {
+        String access = tokenProvider.issueAccessToken(userId.toString(), region);
         String raw = newRefreshToken();
         RefreshToken rt = new RefreshToken(sha256Hex(raw), userId, Instant.now().plus(refreshTtl));
         refreshTokenRepository.save(rt);

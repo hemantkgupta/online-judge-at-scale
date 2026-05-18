@@ -95,7 +95,14 @@ public class SubmissionConsumer {
      * manually replay after a fix. The value is a small JSON envelope
      * wrapping the original {@code SubmissionEvent} bytes.
      */
-    @Value("${app.kafka.topic.dlq:submissions.dlq}")
+    /**
+     * Tech-spec §5.3: the DLQ is per-region (submissions.&lt;region&gt;.dlq).
+     * No literal default here — application.yml templates the full name from
+     * {@code app.region}, so an unset property is a misconfiguration we want
+     * to surface at startup rather than silently fall back to a cross-region
+     * sink.
+     */
+    @Value("${app.kafka.topic.dlq}")
     private String dlqTopic;
 
     /**

@@ -83,21 +83,36 @@ app:
     ttl-hours: 8
     issuer: online-judge
 
-  # Region this gateway pod is pinned to. In production every pod is deployed
-  # into one region and writes carry this value (matched by CockroachDB's
-  # REGIONAL BY ROW locality so the row's replicas live in the same region).
+  # Region this gateway pod is pinned to (tech-spec §12). In production every
+  # pod is deployed into one region and writes carry this value (matched by
+  # CockroachDB's REGIONAL BY ROW locality so the row's replicas live in the
+  # same region). It also feeds (a) the user.region stamp on signup, (b) the
+  # `region` claim on access JWTs, (c) the `${app.region}` placeholder in the
+  # regional Kafka topic names below, and (d) the RegionMismatchFilter's
+  # comparison against the JWT region claim.
   # Locally there's only one node — this just stamps the submissions/outbox
   # rows and propagates into the outbox payload. The `X-Region` request
   # header overrides this per-request for multi-region simulation tests.
-  region: us-east-1
+  region: ${APP_REGION:asia-south1}
+  # URL of the OTHER regional gateway. When a request arrives whose JWT
+  # region claim differs from app.region above, RegionMismatchFilter sends a
+  # 307 redirect to <peer-gateway-url><request-uri>. Empty in single-region
+  # dev — the filter then returns 503 on mismatch so misconfigurations don't
+  # silently route to the wrong data.
+  peer-gateway:
+    url: ${APP_PEER_GATEWAY_URL:}
   kafka:
     topic:
-      pretest: submissions.pretest
-      system: submissions.system
+      # Regional topics — each gateway pod publishes only to its own region's
+      # family, and the regional Flink job consumes its region's family.
+      # Cross-region traffic happens at the data layer (CRDB regional reads
+      # of competition state), not at the Kafka layer.
+      pretest:           submissions.${app.region}.pretest
+      system:            submissions.${app.region}.system
       # Roadmap §3.9 — exhausted-reconcile rows are routed here. Same
-      # topic the execution-worker uses, so a single tail surfaces every
-      # dead submission whatever the cause.
-      dlq: submissions.dlq
+      # topic family the execution-worker uses, so a single regional tail
+      # surfaces every dead submission whatever the cause.
+      dlq:               submissions.${app.region}.dlq
   rate-limit:
     submissions-per-minute: 10
     submissions-per-ip-per-minute: 60

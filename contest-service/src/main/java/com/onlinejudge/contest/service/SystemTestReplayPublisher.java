@@ -127,9 +127,30 @@ public class SystemTestReplayPublisher {
                 .build();
 
         byte[] payload = event.toByteArray();
+
+        // Multi-region (tech-spec §12): each submission's system-test must run
+        // in its home region so the verdict, idempotency state, and analytics
+        // all stay regional. The submission's `region` column (since V2) drives
+        // the destination topic submissions.<region>.system. A contest's
+        // replay can therefore fan out to multiple region-scoped topics.
+        //
+        // Fallback: legacy rows with a missing region land on this
+        // contest-service's local-region topic so they still get replayed —
+        // they may be processed by the wrong region, but losing the row
+        // entirely would be worse.
+        String region = row.region();
+        String topic;
+        if (region == null || region.isBlank()) {
+            topic = topics.systemTopic();
+            log.warn("[replay] submission={} has no region; falling back to local-region topic {}",
+                    row.id(), topic);
+        } else {
+            topic = String.format("submissions.%s.system", region);
+        }
+
         // Key by user_id to keep one user's submissions on the same partition,
         // mirroring the gateway's original write-side keying.
-        Future<?> future = kafkaTemplate.send(topics.systemTopic(),
+        Future<?> future = kafkaTemplate.send(topic,
                 row.userId().toString(), payload);
         awaitSend(future, row.id());
     }

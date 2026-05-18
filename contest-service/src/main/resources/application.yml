@@ -32,13 +32,22 @@ spring:
       value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
       acks: all
 
-# Roadmap §4.23 — system-test replay. When a contest flips to CLOSED, every
-# ACCEPTED pretest submission for its problems is re-published as
-# phase="system" on the system-test topic. The topic name MUST match the one
-# the execution-worker consumes (see execution-worker/application.yml
-# app.kafka.topic.system).
+# Tech-spec §12 (multi-region) + §4.23 (system-test replay).
+# Each contest-service pod runs in one region. The two topic properties
+# below are this region's local-region topics:
+#
+#   * system          — FALLBACK for the replay path when a submission's
+#                       `region` column is null/blank. The normal replay
+#                       path reads each submission's own region and writes to
+#                       submissions.<that-region>.system, so a single contest's
+#                       closure can fan out to multiple region-scoped topics
+#                       (see SystemTestReplayPublisher).
+#   * contest-events  — state-transition fanout, now per-region; each region's
+#                       api-gateway and push-service pods subscribe to their
+#                       own region's stream.
 app:
+  region: ${APP_REGION:asia-south1}
   kafka:
     topic:
-      system: submissions.system
-      contest-events: contest_events
+      system:         submissions.${app.region}.system
+      contest-events: contest_events.${app.region}

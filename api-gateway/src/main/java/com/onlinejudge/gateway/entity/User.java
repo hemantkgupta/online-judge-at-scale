@@ -39,10 +39,29 @@ public class User {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 
+    /**
+     * Region this user signed up in — written once on signup, never updated.
+     * The api-gateway pod stamps {@code app.region} here so subsequent logins
+     * from any region can read it back, embed it in the JWT, and route the
+     * user back to their home region via the {@code RegionMismatchFilter}.
+     * V9 migration adds the column with a backfill default, but the app layer
+     * is authoritative on the value for newly-created rows.
+     */
+    @Column(name = "region", nullable = false)
+    private String region;
+
     public User(UUID id, String username, String passwordHash) {
         this.id = id;
         this.username = username;
         this.passwordHash = passwordHash;
+        this.createdAt = Instant.now();
+    }
+
+    public User(UUID id, String username, String passwordHash, String region) {
+        this.id = id;
+        this.username = username;
+        this.passwordHash = passwordHash;
+        this.region = region;
         this.createdAt = Instant.now();
     }
 }

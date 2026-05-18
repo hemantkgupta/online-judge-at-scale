@@ -42,16 +42,29 @@ spring:
       ack-mode: MANUAL_IMMEDIATE
 
 app:
+  # Multi-region context (tech-spec §12). Each execution-worker pod runs in
+  # exactly one region and ONLY consumes/produces its region's topics — a
+  # submission stays in its home region from pretest verdict through system
+  # test, so verdicts and analytics fan back to the same region's downstream
+  # consumers. Set APP_REGION per Helm release / per regional cluster.
+  region: ${APP_REGION:asia-south1}
   kafka:
     topic:
-      pretest: submissions.pretest
-      system: submissions.system
-      evaluated-results: evaluated_results
-      analytics: analytics_events
+      # Per-region naming convention from tech-spec §5.3:
+      #   submissions.<region>.pretest
+      #   submissions.<region>.system
+      #   evaluated_results.<region>
+      #   analytics_events.<region>
+      #   submissions.<region>.dlq
+      pretest:           submissions.${app.region}.pretest
+      system:            submissions.${app.region}.system
+      evaluated-results: evaluated_results.${app.region}
+      analytics:         analytics_events.${app.region}
       # Roadmap §2.5 — dead-letter sink for poisoned submissions
       # (idempotency attempts cap exceeded). Operators replay manually
-      # after fixing the root cause.
-      dlq: submissions.dlq
+      # after fixing the root cause. Now per-region so DLQ ownership lines
+      # up with the region's operator team.
+      dlq:               submissions.${app.region}.dlq
   # Roadmap §2.5 — bound the idempotency reclaim loop.
   idempotency:
     processing-lease-seconds: 300

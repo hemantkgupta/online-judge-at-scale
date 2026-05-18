@@ -35,6 +35,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtFilter;
+    private final RegionMismatchFilter regionMismatchFilter;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -56,7 +57,14 @@ public class SecurityConfig {
                         .anyRequest().authenticated())
                 .exceptionHandling(eh ->
                         eh.authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
+                // Order matters: JwtAuthenticationFilter validates the token
+                // and populates SecurityContext. RegionMismatchFilter then
+                // inspects the (already-trusted) region claim and 307-routes
+                // wrong-region requests. Putting region AFTER jwt means we
+                // never redirect a request with an invalid token — those
+                // get a 401 instead.
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(regionMismatchFilter, JwtAuthenticationFilter.class)
                 .build();
     }
 }

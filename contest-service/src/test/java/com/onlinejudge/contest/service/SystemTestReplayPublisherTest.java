@@ -39,7 +39,14 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class SystemTestReplayPublisherTest {
 
-    private static final String SYSTEM_TOPIC = "submissions.system";
+    /** Fallback topic used when a submission has no region (legacy data). */
+    private static final String FALLBACK_SYSTEM_TOPIC = "submissions.asia-south1.system";
+
+    /** Region the synthetic rows in {@link #buildAcceptedRows} carry. */
+    private static final String ROW_REGION = "us-east-1";
+
+    /** Per-region topic derived from {@link #ROW_REGION}. */
+    private static final String ROW_SYSTEM_TOPIC = "submissions.us-east-1.system";
 
     @Mock private ProblemContestRepository problemContestRepository;
     @Mock private SubmissionReplayRepository submissionReplayRepository;
@@ -54,7 +61,7 @@ class SystemTestReplayPublisherTest {
                 problemContestRepository,
                 submissionReplayRepository,
                 kafkaTemplate,
-                new KafkaTopics(SYSTEM_TOPIC, "contest_events"));
+                new KafkaTopics(FALLBACK_SYSTEM_TOPIC, "contest_events.asia-south1"));
 
         contest = new Contest();
         contest.setId(UUID.randomUUID());
@@ -76,14 +83,14 @@ class SystemTestReplayPublisherTest {
         when(submissionReplayRepository.pageAccepted(eq(problemB), any(), any(), anyInt()))
                 .thenReturn(rowsB)
                 .thenReturn(List.of());
-        when(kafkaTemplate.send(eq(SYSTEM_TOPIC), any(String.class), any(byte[].class)))
+        when(kafkaTemplate.send(eq(ROW_SYSTEM_TOPIC), any(String.class), any(byte[].class)))
                 .thenAnswer(inv -> CompletableFuture.completedFuture(null));
 
         int replayed = publisher.replayContest(contest);
 
         assertThat(replayed).isEqualTo(6);
         verify(kafkaTemplate, times(6))
-                .send(eq(SYSTEM_TOPIC), any(String.class), any(byte[].class));
+                .send(eq(ROW_SYSTEM_TOPIC), any(String.class), any(byte[].class));
     }
 
     @Test
@@ -123,7 +130,7 @@ class SystemTestReplayPublisherTest {
         CompletableFuture<Object> bad = new CompletableFuture<>();
         bad.completeExceptionally(new RuntimeException("broker down"));
         java.util.concurrent.atomic.AtomicInteger sendCount = new java.util.concurrent.atomic.AtomicInteger();
-        when(kafkaTemplate.send(eq(SYSTEM_TOPIC), any(String.class), any(byte[].class)))
+        when(kafkaTemplate.send(eq(ROW_SYSTEM_TOPIC), any(String.class), any(byte[].class)))
                 .thenAnswer(inv -> {
                     int n = sendCount.incrementAndGet();
                     return n == 4 ? bad : CompletableFuture.completedFuture(null);
@@ -135,7 +142,7 @@ class SystemTestReplayPublisherTest {
 
         // Confirm we stopped at the failure rather than blindly trying the 5th.
         verify(kafkaTemplate, times(4))
-                .send(eq(SYSTEM_TOPIC), any(String.class), any(byte[].class));
+                .send(eq(ROW_SYSTEM_TOPIC), any(String.class), any(byte[].class));
     }
 
     @Test
@@ -147,14 +154,14 @@ class SystemTestReplayPublisherTest {
         when(submissionReplayRepository.pageAccepted(eq(problemA), any(), any(), anyInt()))
                 .thenReturn(List.of(row))
                 .thenReturn(List.of());
-        when(kafkaTemplate.send(eq(SYSTEM_TOPIC), any(String.class), any(byte[].class)))
+        when(kafkaTemplate.send(eq(ROW_SYSTEM_TOPIC), any(String.class), any(byte[].class)))
                 .thenAnswer(inv -> CompletableFuture.completedFuture(null));
 
         publisher.replayContest(contest);
 
         ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
         ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(kafkaTemplate).send(eq(SYSTEM_TOPIC), keyCaptor.capture(), payloadCaptor.capture());
+        verify(kafkaTemplate).send(eq(ROW_SYSTEM_TOPIC), keyCaptor.capture(), payloadCaptor.capture());
 
         SubmissionEvent parsed = SubmissionEvent.parseFrom(payloadCaptor.getValue());
         assertThat(parsed.getPhase()).isEqualTo("system");
@@ -171,6 +178,10 @@ class SystemTestReplayPublisherTest {
     }
 
     private List<AcceptedSubmissionRow> buildAcceptedRows(UUID problemId, int count) {
+        return buildAcceptedRows(problemId, count, ROW_REGION);
+    }
+
+    private List<AcceptedSubmissionRow> buildAcceptedRows(UUID problemId, int count, String region) {
         List<AcceptedSubmissionRow> rows = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             rows.add(new AcceptedSubmissionRow(
@@ -181,10 +192,100 @@ class SystemTestReplayPublisherTest {
                     "java",
                     "s3://bucket/code/" + i + ".java",
                     1_700_000_000_000L + i,
-                    "us-east-1",
+                    region,
                     1_700_000_000_000L + i
             ));
         }
         return rows;
+    }
+
+    // ---------------------------------------------------------------
+    // Region-aware routing tests (tech-spec §12). Each submission's
+    // `region` column drives the destination topic. Legacy rows with
+    // no region fall back to the local-region system topic.
+    // ---------------------------------------------------------------
+
+    @Test
+    void replayContest_mixedRegions_publishesToPerRegionTopics() {
+        UUID problemA = UUID.randomUUID();
+        when(problemContestRepository.findProblemIdsByContestId(contest.getId()))
+                .thenReturn(List.of(problemA));
+
+        // Two submissions in us-west-1, one in us-central1. We deliberately
+        // avoid the fallback region (asia-south1) so the "never hit fallback"
+        // assertion below can distinguish a per-region send from a fallback
+        // send — Mockito matches on the topic string alone.
+        List<AcceptedSubmissionRow> mixed = new ArrayList<>();
+        mixed.addAll(buildAcceptedRows(problemA, 2, "us-west-1"));
+        mixed.addAll(buildAcceptedRows(problemA, 1, "us-central1"));
+
+        when(submissionReplayRepository.pageAccepted(eq(problemA), any(), any(), anyInt()))
+                .thenReturn(mixed)
+                .thenReturn(List.of());
+        when(kafkaTemplate.send(any(String.class), any(String.class), any(byte[].class)))
+                .thenAnswer(inv -> CompletableFuture.completedFuture(null));
+
+        int replayed = publisher.replayContest(contest);
+
+        assertThat(replayed).isEqualTo(3);
+        verify(kafkaTemplate, times(2))
+                .send(eq("submissions.us-west-1.system"), any(String.class), any(byte[].class));
+        verify(kafkaTemplate, times(1))
+                .send(eq("submissions.us-central1.system"), any(String.class), any(byte[].class));
+        // No send to the fallback topic when every row has a region.
+        verify(kafkaTemplate, never())
+                .send(eq(FALLBACK_SYSTEM_TOPIC), any(String.class), any(byte[].class));
+    }
+
+    @Test
+    void replayContest_nullRegion_fallsBackToLocalRegionTopic() {
+        UUID problemA = UUID.randomUUID();
+        when(problemContestRepository.findProblemIdsByContestId(contest.getId()))
+                .thenReturn(List.of(problemA));
+
+        AcceptedSubmissionRow legacy = new AcceptedSubmissionRow(
+                UUID.randomUUID(), UUID.randomUUID(), problemA,
+                null, "java", "s3://bucket/code/legacy.java",
+                1_700_000_000_001L, null /* legacy: no region */,
+                1_700_000_000_001L);
+
+        when(submissionReplayRepository.pageAccepted(eq(problemA), any(), any(), anyInt()))
+                .thenReturn(List.of(legacy))
+                .thenReturn(List.of());
+        when(kafkaTemplate.send(eq(FALLBACK_SYSTEM_TOPIC), any(String.class), any(byte[].class)))
+                .thenAnswer(inv -> CompletableFuture.completedFuture(null));
+
+        int replayed = publisher.replayContest(contest);
+
+        assertThat(replayed).isEqualTo(1);
+        verify(kafkaTemplate, times(1))
+                .send(eq(FALLBACK_SYSTEM_TOPIC), any(String.class), any(byte[].class));
+        // And nowhere else.
+        verify(kafkaTemplate, never())
+                .send(eq("submissions.us-east-1.system"), any(String.class), any(byte[].class));
+    }
+
+    @Test
+    void replayContest_blankRegion_fallsBackToLocalRegionTopic() {
+        UUID problemA = UUID.randomUUID();
+        when(problemContestRepository.findProblemIdsByContestId(contest.getId()))
+                .thenReturn(List.of(problemA));
+
+        AcceptedSubmissionRow blank = new AcceptedSubmissionRow(
+                UUID.randomUUID(), UUID.randomUUID(), problemA,
+                null, "java", "s3://bucket/code/blank.java",
+                1_700_000_000_002L, "   " /* whitespace */,
+                1_700_000_000_002L);
+
+        when(submissionReplayRepository.pageAccepted(eq(problemA), any(), any(), anyInt()))
+                .thenReturn(List.of(blank))
+                .thenReturn(List.of());
+        when(kafkaTemplate.send(eq(FALLBACK_SYSTEM_TOPIC), any(String.class), any(byte[].class)))
+                .thenAnswer(inv -> CompletableFuture.completedFuture(null));
+
+        publisher.replayContest(contest);
+
+        verify(kafkaTemplate, times(1))
+                .send(eq(FALLBACK_SYSTEM_TOPIC), any(String.class), any(byte[].class));
     }
 }

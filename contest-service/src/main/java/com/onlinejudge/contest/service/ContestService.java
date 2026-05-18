@@ -6,6 +6,7 @@ import com.onlinejudge.contest.model.ContestState;
 import com.onlinejudge.contest.repository.ContestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -41,7 +42,14 @@ public class ContestService {
     private final KafkaTemplate<String, byte[]> kafkaTemplate;
     private final ObjectMapper objectMapper;
 
-    private static final String CONTEST_EVENTS_TOPIC = "contest_events";
+    /**
+     * Contest state-change fanout topic. Per tech-spec §12, this is now
+     * region-scoped (contest_events.&lt;region&gt;) — each region's api-gateway
+     * pods subscribe to their own region's events. Owner page §11 had this
+     * as a hardcoded constant; it now reads from {@code app.kafka.topic.contest-events}.
+     */
+    @Value("${app.kafka.topic.contest-events}")
+    private String contestEventsTopic;
 
     /**
      * Creates a new contest in CREATED state.
@@ -243,7 +251,7 @@ public class ContestService {
             }
 
             byte[] payload = objectMapper.writeValueAsBytes(event);
-            kafkaTemplate.send(CONTEST_EVENTS_TOPIC, contest.getId().toString(), payload);
+            kafkaTemplate.send(contestEventsTopic, contest.getId().toString(), payload);
 
             log.debug("[contest] Published state change: {} → {} for contest={}",
                     oldState, newState, contest.getId());
