@@ -1,5 +1,6 @@
 package com.onlinejudge.common.sharding;
 
+import java.io.Serializable;
 import java.util.*;
 
 /**
@@ -32,7 +33,9 @@ import java.util.*;
  * write side) and the leaderboard-service (read side) can share the same shard
  * topology without duplication.
  */
-public class ScoreRangeShardRouter {
+public class ScoreRangeShardRouter implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     /** Score boundary for each shard. Shard i covers [boundaries[i], boundaries[i+1]) */
     private final long[] boundaries;

@@ -19,3 +19,23 @@ services:
     # to bind both 18081 (base) and 28081 (override).
     ports: !override
       - "28081:8081"
+
+  mirrormaker2:
+    # The base compose `mirrormaker2.command` uses YAML folded-scalar `>`,
+    # which collapses the `\`-continued lines into one. The resulting bash
+    # command parses `\ && kafka-broker-api-versions ...` — a backslash-space
+    # then `&&` — and dies with a syntax error before MM2 ever starts.
+    # Override with the literal-scalar form `|` so newlines are preserved
+    # exactly as written. Without this, no `regional.evaluated_results` ever
+    # lands on kafka-global and the Flink scoring job has no input.
+    command: !override
+      - bash
+      - -c
+      - |
+        echo '[mm2] Waiting for both Kafka clusters to be reachable...'
+        until kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1 \
+          && kafka-broker-api-versions --bootstrap-server kafka-global:29093 >/dev/null 2>&1; do
+          sleep 2
+        done
+        echo '[mm2] Both clusters ready — starting MirrorMaker 2'
+        exec connect-mirror-maker /etc/mm2/mm2.properties

@@ -111,7 +111,9 @@ ensure_flink_job_running() {
     local overview
     overview="$(flink /jobs/overview)"
     local running_count
-    running_count="$(printf "%s" "$overview" | grep -o '"state":"RUNNING"' | wc -l | tr -d ' ')"
+    # `grep -c` plus `|| true` keeps a no-match exit from killing the script
+    # under `set -euo pipefail`.
+    running_count="$(printf "%s" "$overview" | grep -c '"state":"RUNNING"' || true)"
 
     if [ "$running_count" -ge 1 ]; then
         pass "Reusing existing RUNNING Flink job (${running_count} found)"
@@ -121,27 +123,35 @@ ensure_flink_job_running() {
     info "No RUNNING job; building shadowJar"
     (cd "$REPO_ROOT" && ./gradlew :scoring-pipeline:shadowJar -q) \
         || fail "shadowJar build failed"
-    local jar="$REPO_ROOT/scoring-pipeline/build/libs/scoring-pipeline-all.jar"
-    [ -f "$jar" ] || fail "shadowJar not found at $jar"
+    # Gradle's default archiveFileName is `<baseName>-<version>-<classifier>.jar`;
+    # build.gradle pins baseName=scoring-pipeline and classifier=all, but the
+    # project version (e.g. 1.0-SNAPSHOT) shows up in the middle. Glob it.
+    local jar
+    jar="$(ls -t "$REPO_ROOT"/scoring-pipeline/build/libs/scoring-pipeline-*-all.jar 2>/dev/null | head -1)"
+    [ -n "$jar" ] && [ -f "$jar" ] \
+        || fail "shadowJar output not found under $REPO_ROOT/scoring-pipeline/build/libs/"
 
-    info "Uploading scoring-pipeline-all.jar to Flink"
+    info "Uploading $(basename "$jar") to Flink"
     local upload_resp jar_id
     upload_resp="$(curl -fsS -X POST -H "Expect:" \
         -F "jarfile=@${jar}" \
         "http://${FLINK_REST_HOST}:${FLINK_REST_PORT}/jars/upload")"
-    # filename is .../jars/<id>_scoring-pipeline-all.jar
+    # The `id` Flink uses for /jars/<id>/run is the full basename of the upload
+    # — i.e. `<UUID>_<originalFilename>.jar`. The upload-response `filename`
+    # field gives us the absolute path; we want only its basename.
     jar_id="$(printf "%s" "$upload_resp" \
-        | grep -oE '"filename":"[^"]+"' \
-        | sed -E 's@.*/([^/_]+)_scoring-pipeline-all\.jar"@\1@')"
+        | sed -nE 's|.*"filename":"[^"]*/flink-web-upload/([^"]+)".*|\1|p')"
     [ -n "$jar_id" ] || fail "could not parse jar id from upload response: $upload_resp"
 
     info "Submitting job (jar id ${jar_id})"
-    flink "/jars/${jar_id}/run?parallelism=1" >/dev/null \
+    curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' \
+        "http://${FLINK_REST_HOST}:${FLINK_REST_PORT}/jars/${jar_id}/run?parallelism=1" \
+        >/dev/null \
         || fail "Failed to submit Flink job"
 
     # Poll for RUNNING
     local waited=0
-    until [ "$(flink /jobs/overview | grep -o '"state":"RUNNING"' | wc -l | tr -d ' ')" -ge 1 ]; do
+    until [ "$(flink /jobs/overview | grep -c '"state":"RUNNING"' || true)" -ge 1 ]; do
         sleep 2; waited=$((waited+2))
         [ "$waited" -ge 60 ] && fail "Flink job did not reach RUNNING within 60s"
     done
