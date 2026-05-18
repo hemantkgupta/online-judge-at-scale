@@ -1,6 +1,8 @@
 package com.onlinejudge.scoring;
 
+import com.esotericsoftware.kryo.Serializer;
 import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
+import org.apache.flink.api.java.typeutils.runtime.kryo.JavaSerializer;
 import com.onlinejudge.scoring.function.ScoringFunction;
 import com.onlinejudge.scoring.model.ScoreUpdate;
 import com.onlinejudge.scoring.sink.RedisLeaderboardSink;
@@ -48,6 +50,19 @@ public class ScoringJobApplication {
         String checkpointDir  = getEnv("CHECKPOINT_DIR", "file:///tmp/flink-checkpoints");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // ScoreUpdate is a Java record. Flink's POJO type analyzer does not
+        // recognise records (final fields, no setters) and falls back to Kryo.
+        // Kryo's default FieldSerializer uses sun.misc.Unsafe field offsets,
+        // which the JDK forbids on record fields — every sink emit would die
+        // with "can't get field offset on a record class". Use Flink's own
+        // classloader-aware JavaSerializer (the upstream Kryo one calls plain
+        // ObjectInputStream and can't see user-code classes through Flink's
+        // child-first classloader, manifesting as ClassNotFoundException on
+        // deserialize). The record already implements Serializable.
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        Class<? extends Serializer<?>> kryoJavaSerializer = (Class) JavaSerializer.class;
+        env.getConfig().addDefaultKryoSerializer(ScoreUpdate.class, kryoJavaSerializer);
 
         // Exactly-once checkpointing every 30 seconds
         env.enableCheckpointing(30_000);

@@ -27,8 +27,19 @@ public final class SmokeProducer {
     private static final String SENTINEL_PROBLEM = "sentinel-problem";
 
     public static void main(String[] args) throws Exception {
-        String bootstrap = env("KAFKA_BOOTSTRAP", "localhost:9092");
-        String topic     = env("SMOKE_TOPIC",     "evaluated_results");
+        // Happy path: producer → regional Kafka (kafka:9092) on topic `evaluated_results`,
+        // mirrored by MM2 to `regional.evaluated_results` on kafka-global, which the
+        // Flink job consumes. If the local MM2 container is stalled (a known
+        // pre-existing issue in this compose file), set SMOKE_DIRECT_TO_GLOBAL=1
+        // to bypass and write directly to `regional.evaluated_results` on
+        // kafka-global:9093 — Flink picks it up the same way.
+        boolean directToGlobal = "1".equals(env("SMOKE_DIRECT_TO_GLOBAL", "0"))
+                || "true".equalsIgnoreCase(env("SMOKE_DIRECT_TO_GLOBAL", "0"));
+
+        String bootstrap = env("KAFKA_BOOTSTRAP",
+                directToGlobal ? "localhost:9093" : "localhost:9092");
+        String topic     = env("SMOKE_TOPIC",
+                directToGlobal ? "regional.evaluated_results" : "evaluated_results");
         String contestId = required("SMOKE_CONTEST");
         long   baseTsMs  = Long.parseLong(required("SMOKE_BASE_TS_MS"));
 

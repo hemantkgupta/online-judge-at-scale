@@ -55,11 +55,18 @@ SMOKE_CONTEST="${SMOKE_CONTEST:-smoke-contest-$$}"
 # dominates this — 60s is generous.
 ZSCORE_WAIT_SECONDS="${ZSCORE_WAIT_SECONDS:-60}"
 
-# Expected ICPC math (verified against Scorer.java + ScoreEncoder.java):
-#   userA: 200 points, 20 min penalty → 200 * 10_000_000 - 20 = 1_999_999_980
-#   userB: 100 points,  0 min penalty → 100 * 10_000_000      = 1_000_000_000
+# Expected ICPC math (verified against Scorer.java + ScoreEncoder.java).
+# Note: the score-range shard boundaries from ScoreRangeShardRouter.defaultIcpcRouter()
+# are {0, 30M, 60M}, so shard 0 = [0, 30M), shard 1 = [30M, 60M), shard 2 = [60M, ∞).
+# With a SCORE_MULTIPLIER of 10M, a single AC contributes >= 1_000_000_000 to the
+# zsetScore — far above 60M. Both expected users therefore land in shard 2, not
+# shard 0 as the original task description implied.
+#   userA: 200 points, 20 min penalty → 200 * 10_000_000 - 20 = 1_999_999_980  (shard 2)
+#   userB: 100 points,  0 min penalty → 100 * 10_000_000      = 1_000_000_000  (shard 2)
 EXPECTED_SCORE_USER_A="1999999980"
 EXPECTED_SCORE_USER_B="1000000000"
+EXPECTED_SHARD_USER_A="2"
+EXPECTED_SHARD_USER_B="2"
 
 # ---------------- ergonomics ----------------
 
@@ -161,13 +168,26 @@ ensure_flink_job_running() {
 # ---------------- produce + assert ----------------
 
 produce_verdicts() {
-    info "Producing deterministic VerdictEvents to evaluated_results (contest=${SMOKE_CONTEST}, base=${SMOKE_BASE_TS_MS})"
+    # Default: produce to regional Kafka and rely on MM2 to mirror to
+    # `regional.evaluated_results`. Set SMOKE_DIRECT_TO_GLOBAL=1 to skip MM2
+    # and produce directly to kafka-global on the mirrored topic name —
+    # useful when MM2 is broken in this dev environment.
+    if [ "${SMOKE_DIRECT_TO_GLOBAL:-0}" = "1" ]; then
+        info "Producing VerdictEvents DIRECTLY to regional.evaluated_results on kafka-global (MM2 bypass) — contest=${SMOKE_CONTEST}"
+        local bootstrap="${KAFKA_GLOBAL_HOST}:${KAFKA_GLOBAL_PORT}"
+        local topic="regional.evaluated_results"
+    else
+        info "Producing VerdictEvents to evaluated_results on regional Kafka — contest=${SMOKE_CONTEST}, base=${SMOKE_BASE_TS_MS}"
+        local bootstrap="${KAFKA_REGIONAL_HOST}:${KAFKA_REGIONAL_PORT}"
+        local topic="evaluated_results"
+    fi
     (
         cd "$REPO_ROOT" && \
-        KAFKA_BOOTSTRAP="${KAFKA_REGIONAL_HOST}:${KAFKA_REGIONAL_PORT}" \
-        SMOKE_TOPIC=evaluated_results \
+        KAFKA_BOOTSTRAP="$bootstrap" \
+        SMOKE_TOPIC="$topic" \
         SMOKE_CONTEST="$SMOKE_CONTEST" \
         SMOKE_BASE_TS_MS="$SMOKE_BASE_TS_MS" \
+        SMOKE_DIRECT_TO_GLOBAL="${SMOKE_DIRECT_TO_GLOBAL:-0}" \
         ./gradlew :scoring-pipeline:runSmokeProducer -q --console=plain
     ) || fail "runSmokeProducer failed"
     pass "Verdicts produced"
@@ -197,27 +217,26 @@ locate_user_in_shards() {
 }
 
 await_score() {
-    local user="$1" expected="$2"
-    info "Polling ZSCORE for ${user} (expecting ${expected})"
+    local user="$1" expected_score="$2" expected_shard="$3"
+    info "Polling ZSCORE for ${user} (expecting score=${expected_score} on shard ${expected_shard})"
     local waited=0
     local result
     while [ "$waited" -lt "$ZSCORE_WAIT_SECONDS" ]; do
         result="$(locate_user_in_shards "$user")"
         if [ -n "$result" ]; then
-            local actual_score
+            local actual_score actual_shard
+            actual_shard="$(printf "%s" "$result" | awk '{print $1}')"
             actual_score="$(printf "%s" "$result" | awk '{print $2}')"
             # ZSCORE returns a stringified double; compare integer portion.
             actual_score="${actual_score%%.*}"
-            if [ "$actual_score" = "$expected" ]; then
-                local shard
-                shard="$(printf "%s" "$result" | awk '{print $1}')"
-                pass "${user}: zsetScore=${actual_score} on shard ${shard} (after ${waited}s)"
+            if [ "$actual_score" = "$expected_score" ] && [ "$actual_shard" = "$expected_shard" ]; then
+                pass "${user}: zsetScore=${actual_score} on shard ${actual_shard} (after ${waited}s)"
                 return 0
             fi
         fi
         sleep 2; waited=$((waited+2))
     done
-    fail "${user}: ZSCORE did not converge to ${expected} within ${ZSCORE_WAIT_SECONDS}s (last=${result:-<nil>})"
+    fail "${user}: did not converge to score=${expected_score} on shard ${expected_shard} within ${ZSCORE_WAIT_SECONDS}s (last=${result:-<nil>})"
 }
 
 # ---------------- cleanup ----------------
@@ -239,8 +258,8 @@ main() {
     ensure_flink_job_running
     produce_verdicts
 
-    await_score "userA" "$EXPECTED_SCORE_USER_A"
-    await_score "userB" "$EXPECTED_SCORE_USER_B"
+    await_score "userA" "$EXPECTED_SCORE_USER_A" "$EXPECTED_SHARD_USER_A"
+    await_score "userB" "$EXPECTED_SCORE_USER_B" "$EXPECTED_SHARD_USER_B"
 
     cleanup_contest_keys
     printf "${GREEN}OK${NC} scoring-pipeline smoke green (contest=%s)\n" "$SMOKE_CONTEST"
