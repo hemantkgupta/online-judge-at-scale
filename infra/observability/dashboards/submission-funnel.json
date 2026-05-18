@@ -1,0 +1,144 @@
+{
+  "displayName": "OJ — Submission funnel (accept → verdict)",
+  "dashboardFilters": [
+    {
+      "filterType": "RESOURCE_LABEL",
+      "labelKey": "region",
+      "stringValue": "asia-south1",
+      "templateVariable": "region"
+    }
+  ],
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Accept → Outbox (api-gateway) — p50 / p99",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5,  sum by (le) (rate(oj_submission_accept_latency_seconds_bucket{service_name=\"oj-api-gateway\"}[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(oj_submission_accept_latency_seconds_bucket{service_name=\"oj-api-gateway\"}[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p99"
+              }
+            ],
+            "yAxis": { "label": "seconds", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Outbox → Lease (sandbox-manager) — p50 / p99",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5,  sum by (le) (rate(sandbox_lease_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(sandbox_lease_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p99"
+              }
+            ],
+            "yAxis": { "label": "seconds", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Lease → Exec done (execution-worker) — p50 / p99",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5,  sum by (le) (rate(oj_exec_run_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(oj_exec_run_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p99"
+              }
+            ],
+            "yAxis": { "label": "seconds", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "Exec → Verdict published — p50 / p99",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.5,  sum by (le) (rate(oj_verdict_publish_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p50"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "histogram_quantile(0.99, sum by (le) (rate(oj_verdict_publish_latency_seconds_bucket[5m])))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p99"
+              }
+            ],
+            "yAxis": { "label": "seconds", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 8,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "End-to-end submission throughput",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (verdict) (rate(verdict_published_total[1m]))"
+                },
+                "plotType": "STACKED_AREA",
+                "legendTemplate": "${verdict}"
+              }
+            ],
+            "yAxis": { "label": "verdicts / sec", "scale": "LINEAR" }
+          }
+        }
+      }
+    ]
+  }
+}

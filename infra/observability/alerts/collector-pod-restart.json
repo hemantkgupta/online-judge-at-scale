@@ -1,0 +1,25 @@
+{
+  "displayName": "OJ — OTel collector restarted in the last 5 min",
+  "documentation": {
+    "content": "The `oj-otel-collector` container restarted within the past 5 minutes. While the collector is down, ALL telemetry (traces, metrics, logs) is dropped by the JVM agents after their 30 s in-memory buffer. The data plane (submissions) is unaffected. Likely causes: OOM (mem_limit 512m), config-reload failure, GCP exporter auth lapse. Check `docker logs oj-otel-collector` and `docker inspect oj-otel-collector --format '{{.State.OOMKilled}}'`.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "Collector container restart count > 0 in 5 min",
+      "conditionThreshold": {
+        "filter": "resource.type=\"gce_instance\" AND metric.type=\"workload.googleapis.com/container.restart_count\" AND metric.labels.container_name=\"oj-otel-collector\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          { "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_DELTA" }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "1800s" },
+  "enabled": true,
+  "notificationChannels": []
+}

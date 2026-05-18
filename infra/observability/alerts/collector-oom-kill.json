@@ -1,0 +1,25 @@
+{
+  "displayName": "OJ — OTel collector OOM-killed",
+  "documentation": {
+    "content": "The `oj-otel-collector` container was killed by the kernel OOM-killer. The compose-level `mem_limit: 512m` is the cgroup ceiling; the `memory_limiter` processor (limit_mib=384, spike_limit_mib=96) should reject incoming telemetry well before this fires. If we see this, either (a) the spike limit is mis-tuned for the actual load, or (b) the GCP exporter sending queue is backed up. Inspect `system.parts` style queue depth via the collector's self-metrics on :8888.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "Collector OOM-kill count > 0",
+      "conditionThreshold": {
+        "filter": "resource.type=\"gce_instance\" AND metric.type=\"workload.googleapis.com/container.oom_kill_count\" AND metric.labels.container_name=\"oj-otel-collector\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "0s",
+        "aggregations": [
+          { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_DELTA" }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "3600s" },
+  "enabled": true,
+  "notificationChannels": []
+}

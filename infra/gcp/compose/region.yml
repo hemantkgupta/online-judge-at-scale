@@ -27,6 +27,31 @@
 #   APP_SANDBOX_BACKEND etc.   sandbox backend selection
 # =============================================================================
 
+# ---------------------------------------------------------------------------
+# Shared OTel javaagent env. Every JVM service merges this block, then
+# overrides `OTEL_SERVICE_NAME` for itself. Single source so adding a new
+# service can't drift the sampler/exporter/protocol settings out of sync
+# with the design doc in docs/design-docs/otel-collector-deployment.md.
+#
+# `OTEL_JAVAAGENT_ENABLED` stays false by default — the deliberate two-step
+# rollout is "verify collector healthy, THEN flip /opt/oj/.env to true and
+# `compose up -d` to bounce services". Flipping the agent on against an
+# unreachable collector crashes the JVM at autoconfigure.
+# ---------------------------------------------------------------------------
+x-otel-defaults: &otel-defaults
+  OTEL_JAVAAGENT_ENABLED:       ${OTEL_JAVAAGENT_ENABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT:  ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+  OTEL_EXPORTER_OTLP_PROTOCOL:  grpc
+  OTEL_METRICS_EXPORTER:        otlp
+  OTEL_TRACES_EXPORTER:         otlp
+  OTEL_LOGS_EXPORTER:           otlp
+  # 10% head sampling on traces; errors are always sampled regardless via
+  # the agent's built-in error-biased sampler. Tail sampling is a post-launch
+  # follow-up (design doc §Risks).
+  OTEL_TRACES_SAMPLER:          parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG:      "0.1"
+  OTEL_RESOURCE_ATTRIBUTES:     deployment.environment=gcp,service.namespace=online-judge,region=${REGION}
+
 services:
 
   # ---------- OpenTelemetry collector ---------------------------------------
@@ -165,11 +190,11 @@ services:
       APP_KAFKA_TOPIC_EVALUATED-RESULTS: evaluated_results.${REGION}
       APP_KAFKA_TOPIC_ANALYTICS:         analytics_events.${REGION}
       APP_KAFKA_TOPIC_DLQ:               submissions.${REGION}.dlq
-      # OpenTelemetry
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-api-gateway
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      # OpenTelemetry — shared defaults from the x-otel-defaults anchor;
+      # OTEL_SERVICE_NAME is the per-service override and comes last so it
+      # wins over any inherited value.
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-api-gateway
       # api-gateway carries more load than the smaller services — bigger heap.
       JAVA_TOOL_OPTIONS: "-Xmx384m -XX:+ExitOnOutOfMemoryError"
 
@@ -194,10 +219,8 @@ services:
       APP_REGION:            ${REGION:?must set REGION}
       APP_PEER_REGION:       ${PEER_REGION:?must set PEER_REGION}
       JAVA_TOOL_OPTIONS:     "-Xmx256m -XX:+ExitOnOutOfMemoryError"
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-problem-service
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-problem-service
 
   # ---------- contest-service -----------------------------------------------
   oj-contest-service:
@@ -221,10 +244,8 @@ services:
       # for its own initiated traffic.
       APP_KAFKA_TOPIC_SYSTEM:    submissions.${REGION}.system
       JAVA_TOOL_OPTIONS:         "-Xmx256m -XX:+ExitOnOutOfMemoryError"
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-contest-service
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-contest-service
 
   # ---------- leaderboard-service -------------------------------------------
   oj-leaderboard-service:
@@ -246,10 +267,8 @@ services:
       APP_PEER_LEADERBOARD_URL:            http://${PEER_INTERNAL_IP:?must set PEER_INTERNAL_IP}:8082
       APP_KAFKA_TOPIC_EVALUATED-RESULTS:   evaluated_results.${REGION}
       JAVA_TOOL_OPTIONS:                   "-Xmx256m -XX:+ExitOnOutOfMemoryError"
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-leaderboard-service
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-leaderboard-service
 
   # ---------- sandbox-manager (privileged: KVM + Firecracker) ---------------
   oj-sandbox-manager:
@@ -271,10 +290,8 @@ services:
       APP_FIRECRACKER_VSOCK_UDS_DIR: /tmp
       APP_AGENT_VSOCK_CLIENT:        /usr/local/bin/oj-vsock-client
       APP_REGION:                    ${REGION:?must set REGION}
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-sandbox-manager
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-sandbox-manager
 
   # ---------- execution-worker ----------------------------------------------
   oj-execution-worker:
@@ -311,10 +328,8 @@ services:
       APP_KAFKA_TOPIC_ANALYTICS:           analytics_events.${REGION}
       APP_KAFKA_TOPIC_DLQ:                 submissions.${REGION}.dlq
       JAVA_TOOL_OPTIONS:                   "-Xmx384m -XX:+ExitOnOutOfMemoryError"
-      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
-      OTEL_SERVICE_NAME:           oj-execution-worker
-      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      <<: *otel-defaults
+      OTEL_SERVICE_NAME: oj-execution-worker
 
 volumes:
   zookeeper-data:

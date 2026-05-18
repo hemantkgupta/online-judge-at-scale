@@ -585,15 +585,21 @@ Counter + gauge + histogram names below are aspirational — the OTel agent give
 | `worker.idempotency.attempts_max` | gauge | (none) | execution-worker |
 | `gateway.reconciliation.{swept,republished,dlq}_total` | counter | (none) | api-gateway |
 
-### 9.4 Three planned dashboards
+### 9.4 Dashboards and alerts
 
-Per [`design-docs/otel-collector-deployment.md`](./design-docs/otel-collector-deployment.md):
+Shipped as code under `infra/observability/`:
 
-1. **Submission funnel.** Four-panel latency: accept → outbox publish → SM lease → verdict publish. p50 / p99 over the last hour. Tells you where in the pipeline a slowdown is.
-2. **Per-language sandbox pool depth.** Three lines (python / cpp / java) showing `sandbox.pool.ready` over time. Alarms when any drops to 0 for more than 30 s.
-3. **Kafka consumer lag.** Per-topic, per-consumer-group. Tells you if the worker is keeping up with submissions.
+| Dashboard JSON | Panels |
+|---|---|
+| `dashboards/submission-funnel.json` | accept→outbox / outbox→lease / lease→exec-done / exec→verdict — p50 + p99 each, plus end-to-end verdict throughput |
+| `dashboards/sandbox-pool-depth.json` | gauges (python/cpp/java) + per-language pool depth and active leases over time |
+| `dashboards/kafka-consumer-lag.json` | per-group lag panels (`execution-worker.{pretest,system}`, `leaderboard-service.evaluated`, `analytics-clickhouse`) + cross-group sum as the alert source |
 
-The dashboard JSON definitions are TODO — there's no `infra/observability/dashboards/` directory yet.
+Five alert policies under `alerts/`: collector pod restart, collector OOM-kill, accept→verdict p99 > 30 s for 5 min, sandbox pool at 0 for any language for 60 s, consumer-group lag > 10 000 for 5 min.
+
+`scripts/validate.sh` is the offline pre-merge gate — parses every JSON, runs `otelcol-contrib validate` on the collector config when the binary is on `$PATH`, and confirms every JVM service in `region.yml` inherits the shared `x-otel-defaults` YAML anchor. `scripts/{apply-dashboards,apply-alerts}.sh` are the idempotent operator commands (`gcloud monitoring …` under the hood); both match on `displayName` and update in place.
+
+Operator runbook for the OTEL_JAVAAGENT_ENABLED flip lives in `infra/observability/activation-runbook.md`.
 
 ---
 
@@ -860,7 +866,7 @@ Short list — each item points at deeper material.
 | Item | Where it lives | Severity |
 |---|---|---|
 | Single-broker Kafka, single-node CRDB | [`design-docs/kafka-cluster-and-crdb-cluster.md`](./design-docs/kafka-cluster-and-crdb-cluster.md) | High — SPOF for the data plane |
-| OTel collector + metrics catalogue not yet activated in prod | §9; awaits operator flip | Medium — observability blind in prod |
+| OTel collector deployed and configured; dashboards/alerts shipped as code; awaits the `/opt/oj/.env` flip per `infra/observability/activation-runbook.md` | §9 + `design-docs/otel-collector-activation-plan.md` | Low — single-line operator flip; dashboards/alerts apply via `gcloud` |
 | JWT secret + signer SA key both in tfstate, no rotation cron | Roadmap §3.3, §3.4 | Medium — key rotation discipline missing |
 | Auth endpoints share the per-IP rate limit bucket with submission posts | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | Medium — brute-force login eats submission budget |
 | scoring-pipeline not deployed (Flink cluster) | §4.7 + Agent I's audit | Medium — leaderboard-service does a stand-in calculation |
@@ -1009,7 +1015,7 @@ Eight per-feature design docs live in [`docs/design-docs/`](./design-docs/). Eac
 | Doc | Roadmap | Status today | What it covers |
 |---|---|---|---|
 | [`auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | §2.1 | Implemented | Signup / login / refresh / logout endpoints; Argon2id + JWT `kid` rotation; refresh-token storage as SHA-256 hash; rate-limit split between auth and submission buckets (the split itself is still TODO). |
-| [`otel-collector-deployment.md`](./design-docs/otel-collector-deployment.md) | §2.6 | Implemented, awaiting operator activation | OTLP collector pipeline; GCP exporter wiring; the three planned dashboards; the operator activation sequence (collector healthy → flip JVM agents). |
+| [`otel-collector-deployment.md`](./design-docs/otel-collector-deployment.md) + [`otel-collector-activation-plan.md`](./design-docs/otel-collector-activation-plan.md) | §2.6 | Shipped end-to-end; awaits the `OTEL_JAVAAGENT_ENABLED=true` flip | OTLP collector pipeline; GCP exporter wiring; the three dashboards + five alerts under `infra/observability/`; the `x-otel-defaults` YAML anchor every JVM service inherits; the operator runbook in `infra/observability/activation-runbook.md`. |
 | [`kafka-cluster-and-crdb-cluster.md`](./design-docs/kafka-cluster-and-crdb-cluster.md) | §2.7 | Stepping-stone shipped; full 3-broker/3-node not implemented | KRaft single-broker hardening (already in place) + the full 3-broker + 3-node multi-AZ migration; cert handling for inter-node TLS; disk co-tenancy risk (the highest-impact production-incident class). |
 | [`microvm-egress-lockdown.md`](./design-docs/microvm-egress-lockdown.md) | §3.1 | Implemented | Per-microVM netns; iptables belt-and-suspenders; Firecracker machine config sans `network-interfaces`; the Go integration test that validates the lockdown. |
 | [`ci-cd-github-actions.md`](./design-docs/ci-cd-github-actions.md) | §3.11 | Workflows shipped, secrets pending operator | PR / merge-to-main / manual-deploy workflows; WIF auth; rollback story; blue-green follow-up. |

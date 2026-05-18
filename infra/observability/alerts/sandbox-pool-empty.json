@@ -1,0 +1,30 @@
+{
+  "displayName": "OJ — Sandbox pool at 0 for any language (60 s)",
+  "documentation": {
+    "content": "`sandbox_pool_ready` has been 0 for any language (python/cpp/java) for more than 60 s. New leases for that language wait for cold-start (Firecracker boot + rootfs hydration, ~1.5 s) and will queue. Sustained empty state implies submission rate > replenishment rate or a sandbox-manager bug. Check `docker logs oj-sandbox-manager` and the per-language pool replenishment rate. The pool target is configured at startup (`python:2 / cpp:1 / java:1` by default).",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "sandbox_pool_ready == 0 sustained > 60 s",
+      "conditionThreshold": {
+        "filter": "metric.type=\"prometheus.googleapis.com/sandbox_pool_ready/gauge\"",
+        "comparison": "COMPARISON_LT",
+        "thresholdValue": 1,
+        "duration": "60s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MIN",
+            "crossSeriesReducer": "REDUCE_MIN",
+            "groupByFields": ["metric.label.language"]
+          }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "1800s" },
+  "enabled": true,
+  "notificationChannels": []
+}

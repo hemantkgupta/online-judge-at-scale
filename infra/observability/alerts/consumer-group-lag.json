@@ -1,0 +1,30 @@
+{
+  "displayName": "OJ — Kafka consumer-group lag > 10000 (any group)",
+  "documentation": {
+    "content": "A consumer group's total lag has exceeded 10000 messages for more than 5 minutes — the consumer cannot keep up with the producer rate. For `execution-worker.pretest` / `execution-worker.system` this means submissions are queueing past the SLO; for `leaderboard-service.evaluated` it means the leaderboard is stale; for `analytics-clickhouse` it is non-critical (BI only). Inspect `system.kafka_consumers` (ClickHouse) or `kafka-consumer-groups.sh --describe` for the broker view.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "kafka_consumer_lag total > 10000 for 5 min",
+      "conditionThreshold": {
+        "filter": "metric.type=\"prometheus.googleapis.com/kafka_consumer_lag/gauge\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 10000,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MEAN",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": ["metric.label.consumer_group"]
+          }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "1800s" },
+  "enabled": true,
+  "notificationChannels": []
+}
