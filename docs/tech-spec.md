@@ -117,7 +117,7 @@ graph LR
   LB --> R
   LB -->|WebSocket push| U
   U -->|WebSocket subscribe| LB
-  K -->|analytics| AN
+  K -->|analytics_events| AN
   AG -.OTLP.-> OTel
   PS -.OTLP.-> OTel
   EW -.OTLP.-> OTel
@@ -151,7 +151,7 @@ A full submission round-trip is rendered as a sequence diagram in [Appendix A](#
 
 Each subsection follows the same shape: purpose, tech stack, external interfaces, key internal mechanisms, failure modes, configuration knobs of interest, pointers to code.
 
-The four high-complexity services (api-gateway, execution-worker, sandbox-manager, problem-service) each have a **dedicated owner page** under [`docs/services/`](./services/) that goes far deeper than these summaries — full configuration reference, metrics catalogue, runbook, code map. The summary below points to those pages; treat them as the authoritative reference for the service. The four thinner services (contest-service, leaderboard-service, scoring-pipeline, analytics-pipeline) and the cross-cutting modules (common, the Go agent) keep their full description inline here.
+Every service has a **dedicated owner page** under [`docs/services/`](./services/) that goes far deeper than these summaries — full configuration reference, metrics catalogue, runbook, code map. The summaries below are entry-point stubs; treat the per-service pages as the authoritative reference for the implementation. Cross-cutting modules (`common`, the in-guest Go agent) keep their full description inline here because they don't fit the "owned by one team" model — they're shared infrastructure.
 
 ### 4.1 api-gateway
 
@@ -179,82 +179,27 @@ The narrow waist between the `problems` / `test_cases` CRDB rows and the GCS byt
 
 ### 4.5 contest-service
 
-**Purpose.** Contest lifecycle state machine — CREATED → REGISTRATION → ACTIVE → CLOSED. Owns the `contests` table and the `contest_problems` join. On the ACTIVE → CLOSED transition, fans out a system-test replay (roadmap §4.23) that re-publishes every ACCEPTED pretest submission for the contest's problems as `phase=system` events on `submissions.system`.
+Contest lifecycle state machine — CREATED → REGISTRATION → ACTIVE → CLOSED. Owns the `contests` table + the `contest_problems` join (api-gateway Flyway V6 + V7). On ACTIVE → CLOSED transition, fans out a system-test replay (roadmap §4.23) that re-publishes every ACCEPTED pretest submission for the contest's problems as `phase=system` on `submissions.system`. The phase-scoped IdempotencyService keys in the worker dedupe re-runs. Spring Boot 3.2.4, port 8084. Dockerfile + compose entry shipped (commit `6be38f4`); not yet deployed on the live GCP environment.
 
-**Tech stack.** Spring Boot 3.2.4; Spring Kafka producer; JPA against CRDB (`onlinejudge`, `ddl-auto: validate`). No Redis, no inbound Kafka.
-
-**External interfaces.**
-- `POST /api/v1/contests` — create. Body: `{title, start_time, end_time, duration_minutes, problem_ids[]}`.
-- `PUT /api/v1/contests/{id}/state` — admin-driven state transitions (CREATED → REGISTRATION → ACTIVE → CLOSED). Bad transitions are rejected by the state machine.
-- `GET /actuator/health`.
-- Produces `submissions.system` (on ACTIVE → CLOSED) and `contest_events` (lifecycle telemetry).
-
-**Key internal mechanisms.**
-- **State machine.** `ContestStateMachine.transitionTo(target)` validates the source → target edge against an allowed-transitions table. The CLOSED target additionally fires `SystemTestReplayPublisher.replayContest(contest)`. Replay failure does NOT block the transition (the contest still goes CLOSED — replay can be re-driven manually).
-- **Replay query.** For each problem in `contest_problems`, native-SQL select on `onlinejudge.submissions WHERE problem_id=? AND status='ACCEPTED'`. Each row becomes a new `SubmissionEvent` with `phase=system`, original submission/user/code-url/region preserved. Kafka send is `acks=all`.
-- **Idempotency.** Phase-scoped IdempotencyService keys in the worker dedupe — re-running the same `(submissionId, system)` key is a no-op.
-
-**Failure modes & handling.**
-- Replay partial failure → the publisher throws after the failed send; the unsent submissions are not retried automatically. The contest is CLOSED. Operator's runbook: re-invoke `replayContest()` manually (admin endpoint not yet exposed — TODO).
-- CRDB row drift between contest-service and api-gateway → not possible, both connect to the same `onlinejudge` database post-§2.2.
-
-**Configuration knobs.**
-- `app.kafka.topic.{system,contest-events}`.
-- `SPRING_DATASOURCE_URL` → `onlinejudge` DB.
-
-**Status note.** The Dockerfile exists (roadmap §4.19 close-out, commit `6be38f4`) and the image is buildable, but as of the last GCP teardown the service had not been deployed live. The image plus compose entry are ready; the next deploy picks it up. The system-test replay rationale + edge cases are in [`design-docs/contest-close-system-tests-replay.md`](./design-docs/contest-close-system-tests-replay.md).
-
-**Code pointers.**
-- State machine: `contest-service/src/main/java/com/onlinejudge/contest/service/ContestStateMachine.java`
-- Replay: `.../service/{SystemTestReplayPublisher,SubmissionReplayRepository}.java`
-- Entities: `.../model/{Contest,ContestState,ContestProblem,ContestProblemId}.java`
-- Migration: `api-gateway/src/main/resources/db/migration/V6__contests.sql`, `V7__contest_problems.sql`
+→ **Full owner page: [`services/contest-service.md`](./services/contest-service.md)** — state machine + replay flow + encryption hooks, configuration reference, metrics, runbook (5 incidents), tests, code map.
 
 ### 4.6 leaderboard-service
 
-**Purpose.** Consumes `evaluated_results`, maintains a per-contest Redis sorted-set ranking, serves a WebSocket `/ws/leaderboard` endpoint that the future React SPA subscribes to.
+Consumes `evaluated_results`, caches each verdict in Redis (`verdict:{submissionId}` STRING with 24 h TTL), and pushes via STOMP-over-SockJS to subscribed WebSocket sessions. The WebSocket endpoint is `/ws`; clients SUBSCRIBE to `/topic/leaderboard/{contestId}` for contest-wide updates and `/topic/verdicts/{userId}` for per-user verdict feeds. Reads from a **sharded** sorted-set scheme `leaderboard:{contestId}:s{idx}` routed by `ScoreRangeShardRouter` (the single-key model in some early docs is stale). **Important caveat**: this service does NOT today write the leaderboard ZSETs — those writes are owned by scoring-pipeline, which isn't deployed yet. Until scoring-pipeline ships, the read path returns empty; the verdict cache + WebSocket push paths work standalone. Spring Boot 3.2.4, port 8082; Dockerfile + compose entry shipped, not yet deployed.
 
-**Tech stack.** Spring Boot 3.2.4; Spring Kafka consumer (auto-commit, latest offset — fire-and-forget for missed verdicts); Spring Data Redis; Spring WebSocket (SockJS).
+→ **Full owner page: [`services/leaderboard-service.md`](./services/leaderboard-service.md)** — STOMP wiring, score-range sharding, verdict-cache details, configuration reference, metrics, runbook (6 incidents), tests, code map.
 
-**External interfaces.**
-- `GET /api/v1/leaderboard/{contestId}?page=N&size=M` — REST pull for clients that haven't subscribed to the WebSocket.
-- `WS /ws/leaderboard/{contestId}` — push channel; the client receives `{userId, score, rank, lastVerdict}` on every score-changing event.
-- Consumes `evaluated_results`. Produces nothing.
+### 4.7 scoring-pipeline
 
-**Key internal mechanisms.**
-- **Sorted-set scheme.** One key per contest: `leaderboard:{contestId}` → ZSET keyed by userId, scored by points. ZREVRANGE for top-N; ZREVRANK for "where am I" lookups.
-- **Read-replica routing.** When `app.redis.replica.host` is set, reads (ZREVRANGE / ZREVRANK / ZSCORE / ZCARD) route through the replica; writes (ZADD on verdict ingest, plus Pub/Sub fan-out) stay on the primary. Today neither is configured for the production deployment; the wiring is in place for a follow-up.
-- **Pub/Sub fan-out.** On each verdict, the service publishes to `score_updates:{contestId}` and `score_updates:user:{userId}`. Every WebSocket session subscribes to the relevant channel. This is the part that makes the leaderboard "live" — without Pub/Sub the WebSocket would be just a poll.
+Flink DataStream job that would consume `evaluated_results`, apply per-contest scoring rules (first-AC-wins / time-penalty / partial-credit), and write the resulting score deltas to the Redis sorted-set leaderboard. Treats the verdict stream as source of truth and the Redis state as a materialised view. **Status: BLOCKED.** `build.gradle` declares Flink as `compileOnly`; `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()` expecting an external Flink JobManager + TaskManager. No `Dockerfile`, no compose entry, no Flink runtime provisioned. Deploying scoring-pipeline = standing up Flink in compose (or moving to managed Cloud Dataflow), submitting the fat JAR. Until then, [`services/leaderboard-service.md`](./services/leaderboard-service.md) does NOT compute scores (the read path is empty); a future stand-in could be a simple ZADD-by-points in leaderboard-service, but that's not implemented either.
 
-**Failure modes & handling.**
-- Redis down → the Kafka consumer keeps consuming, ZADD operations fail and are logged, the WebSocket clients see stale data. Recovery is graceful — when Redis comes back, the next verdict triggers a fresh ZADD and everything reconciles. There is no replay for the verdicts that landed during the outage — the leaderboard is "best effort" by design; the authoritative score is in CRDB.
-- Worker publishes a verdict with `points=0` (WRONG_ANSWER) → ZINCRBY by 0; the user's score doesn't change but the lastVerdict timestamp does (the WebSocket fans out the verdict event regardless). Useful for "you have a new submission result" UI cues.
-
-**Configuration knobs.**
-- `SPRING_DATA_REDIS_{HOST,PORT}` — primary.
-- `app.redis.replica.{host,port}` — optional read-replica.
-- `app.leaderboard.default-page-size` — defaults 100.
-
-**Status note.** Same as contest-service — Dockerfile + compose entry ready, not yet deployed live.
-
-**Code pointers.**
-- Consumer: `leaderboard-service/src/main/java/com/onlinejudge/leaderboard/consumer/VerdictPushConsumer.java`
-- WebSocket: `.../websocket/LeaderboardWebSocketHandler.java`
-- Redis abstraction: `.../service/{LeaderboardService,RedisService}.java`
-
-### 4.7 scoring-pipeline (BLOCKED)
-
-**Purpose.** Flink DataStream job that consumes `evaluated_results`, applies a contest's scoring rules (first-AC-wins / time-penalty / partial-credit), and writes the resulting score deltas back to the Redis sorted-set leaderboard. Treats the verdict stream as the source of truth and the Redis state as a materialised view.
-
-**Status.** Code exists, integration tests pass (`ScoringEndToEndTest`), but **the module is not deployable as a Spring container**. Its `build.gradle` declares Flink as `compileOnly` and `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()` — it expects an external Flink JobManager + TaskManager pair. The control-plane VM has no Flink runtime. Per Agent I's audit, deploying scoring-pipeline is its own workstream: stand up Flink in compose (or move to managed Dataflow), upload the fat JAR via `POST /jars/upload`, and submit the job. Until then, leaderboard-service performs a simpler "raw points sum" calculation as a stand-in.
-
-**Code pointers.** `scoring-pipeline/src/main/java/com/onlinejudge/scoring/ScoringJobApplication.java`.
+→ **Full owner page: [`services/scoring-pipeline.md`](./services/scoring-pipeline.md)** — Flink topology, scoring rules, deployment path forward, code map.
 
 ### 4.8 analytics-pipeline
 
-**Purpose.** Consumes the `analytics` Kafka topic (one event per verdict, slimmer schema than VerdictEvent) and writes long-lived per-submission rows for offline reporting. Today this is a stub — the topic is produced but no consumer is running.
+Consumes the `analytics_events` Kafka topic (one event per verdict, slimmer schema than VerdictEvent — see §5.1) and writes long-lived rows to **ClickHouse** for offline reporting. The local-dev path uses Spring Boot + HTTP `INSERT ... FORMAT TabSeparated` to `submission_analytics`; the production target per the source's Javadoc is the Kafka Engine + Materialized View pattern with ClickHouse pulling directly from Kafka. **Status: NOT DEPLOYED.** No Dockerfile, no compose entry, no ClickHouse instance, no `submission_analytics` DDL in the repo. The `analytics_events` topic accumulates and ages out per the 7-day Kafka retention.
 
-**Status.** Code exists, no Dockerfile, not in any compose file. Same shape as scoring-pipeline (Flink-based) but simpler.
+→ **Full owner page: [`services/analytics-pipeline.md`](./services/analytics-pipeline.md)** — ClickHouse schema, the production Kafka-Engine pattern, deployment path forward, code map.
 
 ### 4.9 common
 
@@ -374,7 +319,7 @@ Indexes worth knowing about:
 | `submissions.pretest` | 12 | api-gateway (outbox); execution-worker (Phase 1→2 promotion publishes elsewhere); reconciliation scanner | execution-worker pretest consumer (group `execution-worker-pretest`) | 7 d |
 | `submissions.system` | 12 | execution-worker on ACCEPTED; contest-service on CLOSED replay | execution-worker system consumer (group `execution-worker-system`) | 7 d |
 | `evaluated_results` | 12 | execution-worker | leaderboard-service; scoring-pipeline (when wired); analytics-pipeline (when wired) | 7 d |
-| `analytics` | 12 | execution-worker | analytics-pipeline (not deployed) | 7 d |
+| `analytics_events` | 12 | execution-worker | analytics-pipeline (not deployed) | 7 d |
 | `submissions.dlq` | 6 | execution-worker (attempts-cap exceeded); reconciliation scanner (cap exceeded) | (operator-only — manual replay) | 30 d |
 | `contest_events` | 12 | contest-service | leaderboard-service (lifecycle UI cues) | 7 d |
 
@@ -388,12 +333,14 @@ Indexes worth knowing about:
 
 | Pattern | Type | Owner | Purpose |
 |---|---|---|---|
-| `leaderboard:{contestId}` | ZSET | leaderboard-service | Per-contest ranking; userId → points. |
-| `verdict-cache:{submissionId}` | STRING (JSON) | leaderboard-service | Cached last VerdictEvent for the WebSocket bootstrap. TTL 1 h. |
-| `score_updates:{contestId}` | Pub/Sub channel | leaderboard-service | Fan-out to all contest-leaderboard WebSocket sessions. |
-| `score_updates:user:{userId}` | Pub/Sub channel | leaderboard-service | Per-user verdict push. |
+| `leaderboard:{contestId}:s{idx}` | ZSET | (future) scoring-pipeline writes; leaderboard-service reads | Per-contest ranking, score-range-sharded via `ScoreRangeShardRouter` (common module). `{idx}` is the shard ordinal. Reads aggregate across shards. **Not populated today** — scoring-pipeline isn't deployed; reads return empty. |
+| `verdict:{submissionId}` | STRING (JSON) | leaderboard-service | Cached last VerdictEvent for the WebSocket bootstrap. TTL 24 h. |
+| `/topic/leaderboard/{contestId}` | STOMP destination | leaderboard-service | Per-contest WebSocket push channel. Subscribers receive verdict events. |
+| `/topic/verdicts/{userId}` | STOMP destination | leaderboard-service | Per-user verdict push. |
 | `rate-limit:{userId}` | STRING (TTL'd token-bucket state) | api-gateway | Lua-script leaky bucket. |
 | `rate-limit:ip:{ip}` | STRING (same) | api-gateway | Per-IP variant. |
+
+The pub-sub channels `score_updates:{contestId}` and `score_updates:user:{userId}` are referenced in some earlier design material but have no producer in the current code; the fan-out is via STOMP destinations above, dispatched from `SimpMessagingTemplate.convertAndSend(...)`. See [`services/leaderboard-service.md`](./services/leaderboard-service.md) for the full implementation reference.
 
 ### 5.5 GCS layout
 
