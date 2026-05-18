@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #3b82f6; /* Tailwind blue-500 */
+  --color-primary-dark: #2563eb; /* Tailwind blue-600 */
+  --color-background: #0f172a; /* Tailwind slate-900 */
+  --color-surface: #1e293b; /* Tailwind slate-800 */
+  --color-surface-hover: #334155; /* Tailwind slate-700 */
+  --color-text: #f8fafc; /* Tailwind slate-50 */
+  --color-text-muted: #94a3b8; /* Tailwind slate-400 */
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
