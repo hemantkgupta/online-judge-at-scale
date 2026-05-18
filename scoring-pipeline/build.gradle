@@ -57,6 +57,19 @@ test {
     ]
 }
 
+// Used by scripts/scoring-smoke.sh to drive a deterministic VerdictEvent
+// scenario onto the regional Kafka broker. The producer class lives under
+// src/test/java because it is test-infrastructure, not a runtime artifact;
+// the test classpath transitively pulls in kafka-clients via the
+// flink-connector-kafka main dep.
+task runSmokeProducer(type: JavaExec) {
+    group       = 'verification'
+    description = 'Produce a deterministic VerdictEvent scenario to the regional Kafka topic for the scoring-pipeline smoke test.'
+    classpath   = sourceSets.test.runtimeClasspath
+    mainClass.set('com.onlinejudge.scoring.smoke.SmokeProducer')
+    standardInput = System.in
+}
+
 shadowJar {
     archiveBaseName.set('scoring-pipeline')
     archiveClassifier.set('all')

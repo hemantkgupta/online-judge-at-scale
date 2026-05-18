@@ -152,6 +152,24 @@ Run with `./gradlew :scoring-pipeline:test`. The `--add-opens` jvmArgs in `build
 
 **Integration + smoke.** End-to-end submission against a real cluster is not automated. Once a Flink stand-up exists, the smoke is: `./gradlew :scoring-pipeline:shadowJar`, submission curl from §2, produce synthetic `VerdictEvent`s into `evaluated_results`, then `redis-cli ZRANGE leaderboard:contest-1:shard:0 0 -1 WITHSCORES`. Until then, `ScoringEndToEndTest.fullContestScenario_correctLeaderboardOrder` *is* the de-facto contract.
 
+### Local end-to-end smoke
+
+`scripts/scoring-smoke.sh` drives the real wire path against the local compose stack: produces protobuf `VerdictEvent`s onto `evaluated_results` at `kafka:9092`, lets MirrorMaker 2 mirror them to `regional.evaluated_results` on `kafka-global:29093`, lets the Flink job consume + score + write to Redis via atomic Lua ZADD, then asserts `ZSCORE` on each shard of `leaderboard:<contest>:shard:{0..2}`.
+
+```
+docker compose up -d kafka zookeeper kafka-global mirrormaker2 redis jobmanager taskmanager
+./scripts/scoring-smoke.sh
+```
+
+The driver builds and submits the shadowJar only when no `RUNNING` Flink job is present; otherwise it reuses the existing job. Re-running back-to-back is idempotent — cleanup deletes only the contest's shard keys, never cancels the job. The producer source lives at `scoring-pipeline/src/test/java/com/onlinejudge/scoring/smoke/SmokeProducer.java` and is invoked via the `runSmokeProducer` Gradle task; it emits one watermark-sentinel verdict to every Kafka partition so an idle partition cannot stall `BoundedOutOfOrderness(5min)` watermark advance.
+
+Expected ICPC math, verified against [`Scorer.java`](../../scoring-pipeline/src/main/java/com/onlinejudge/scoring/function/Scorer.java) + [`ScoreEncoder.java`](../../scoring-pipeline/src/main/java/com/onlinejudge/scoring/util/ScoreEncoder.java) (`PENALTY_PER_WRONG_ATTEMPT_MINUTES = 20`):
+
+| User | Events                                                                  | totalPoints | penalty (min) | zsetScore       | Shard |
+|------|-------------------------------------------------------------------------|-------------|---------------|-----------------|-------|
+| userA | AC P1 @ t=0; WA P2 @ t+10m; AC P2 @ t+15m                              | 200         | 20            | 1,999,999,980   | 0     |
+| userB | AC P1 @ t=0                                                            | 100         | 0             | 1,000,000,000   | 0     |
+
 ---
 
 ## 10. Relevant design docs

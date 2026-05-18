@@ -1,0 +1,21 @@
+# docker-compose.override.yml — local-only port remap for the scoring-pipeline
+# smoke test. The base `docker-compose.yml` maps the Flink JobManager's REST
+# API (container port 8081) to host port 18081. On dev machines where a parallel
+# multi-region test stand-up is already holding host port 18081 (e.g. a stray
+# `oj-test-crdb-a` Cockroach container from `/tmp/oj-multi-region-test.yml`),
+# compose refuses to start jobmanager.
+#
+# This override remaps jobmanager → host port 28081 without touching the
+# upstream compose topology. The smoke driver picks it up via:
+#   FLINK_REST_PORT=28081 ./scripts/scoring-smoke.sh
+# (or by setting the variable in your shell rc).
+#
+# Drop this file once port 18081 is freed.
+
+services:
+  jobmanager:
+    # `!override` replaces the base file's `ports` list entirely. Without
+    # this tag, compose concatenates list-typed entries, leaving us trying
+    # to bind both 18081 (base) and 28081 (override).
+    ports: !override
+      - "28081:8081"
