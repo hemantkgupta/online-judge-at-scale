@@ -97,6 +97,65 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
 
+  # ---------- ClickHouse (analytics sink — Kafka Engine + Materialized View)
+  # Replaces the not-deployed Spring `analytics-pipeline` module. ClickHouse
+  # owns the consumer group `analytics-clickhouse` and pulls AnalyticsEvent
+  # protobuf records from `analytics_events.${REGION}` directly. See
+  # docs/design-docs/clickhouse-kafka-engine-rollout.md.
+  oj-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: oj-clickhouse
+    hostname: oj-clickhouse
+    restart: unless-stopped
+    depends_on:
+      - oj-kafka
+    ports:
+      - "8123:8123"  # HTTP — BI / curl
+      - "9000:9000"  # native TCP — clickhouse-client
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: onlinejudge
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - /opt/oj/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - /opt/oj/clickhouse/users.d:/etc/clickhouse-server/users.d:ro
+      # Canonical proto file — kafka_schema = 'proto/events.proto:AnalyticsEvent'
+      # resolves against /var/lib/clickhouse/format_schemas.
+      - /opt/oj/clickhouse/format_schemas:/var/lib/clickhouse/format_schemas:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  # One-shot init: apply the analytics DDL (idempotent — every object is
+  # IF NOT EXISTS, so re-running is a no-op). On first deploy only, set
+  # KAFKA_CONSUMER_OFFSET=earliest in /opt/oj/.env to drain the 7-day
+  # buffered topic; the default `latest` skips backfill.
+  oj-clickhouse-init:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: oj-clickhouse-init
+    restart: "no"
+    depends_on:
+      oj-clickhouse:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/opt/oj/clickhouse/apply-ddl.sh"]
+    environment:
+      CH_HOST: oj-clickhouse
+      CH_PORT: "9000"
+      KAFKA_BROKER_LIST: oj-kafka:29092
+      KAFKA_ANALYTICS_TOPIC: analytics_events.${REGION:?must set REGION}
+      KAFKA_GROUP_NAME: analytics-clickhouse
+      KAFKA_CONSUMER_OFFSET: ${KAFKA_CONSUMER_OFFSET:-latest}
+      SCHEMA_FILE: /opt/oj/clickhouse/submission_analytics.sql
+    volumes:
+      - /opt/oj/clickhouse/apply-ddl.sh:/opt/oj/clickhouse/apply-ddl.sh:ro
+      - /opt/oj/clickhouse/submission_analytics.sql:/opt/oj/clickhouse/submission_analytics.sql:ro
+
   # ---------- CockroachDB (2-node multi-region cluster) ---------------------
   # Joins the peer over the GCP private VPC. --locality tags this node with
   # its region so CRDB's replication and lease placement honour geography
@@ -322,3 +381,5 @@ volumes:
   kafka-data:
   cockroachdb-data:
   redis-data:
+  clickhouse-data:
+  clickhouse-logs:
