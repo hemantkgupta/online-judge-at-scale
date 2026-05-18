@@ -59,5 +59,5 @@ public class Submission {
      * republishing and routes the submission to the DLQ (status FAILED).
      */
     @Column(name = "reconcile_attempts", nullable = false)
-    private int reconcileAttempts = 0;
+    private long reconcileAttempts = 0;
 }
