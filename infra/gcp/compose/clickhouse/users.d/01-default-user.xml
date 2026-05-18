@@ -1,0 +1,16 @@
+<clickhouse>
+    <users>
+        <default>
+            <!-- No password: the ClickHouse container is reachable only inside
+                 the docker network and on the host loopback. The control-plane
+                 firewall rule keeps 8123/9000 off the public internet. -->
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+</clickhouse>

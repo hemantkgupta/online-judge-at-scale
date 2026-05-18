@@ -197,9 +197,9 @@ Flink DataStream job that would consume `evaluated_results`, apply per-contest s
 
 ### 4.8 analytics-pipeline
 
-Consumes the `analytics_events` Kafka topic (one event per verdict, slimmer schema than VerdictEvent — see §5.1) and writes long-lived rows to **ClickHouse** for offline reporting. The local-dev path uses Spring Boot + HTTP `INSERT ... FORMAT TabSeparated` to `submission_analytics`; the production target per the source's Javadoc is the Kafka Engine + Materialized View pattern with ClickHouse pulling directly from Kafka. **Status: NOT DEPLOYED.** No Dockerfile, no compose entry, no ClickHouse instance, no `submission_analytics` DDL in the repo. The `analytics_events` topic accumulates and ages out per the 7-day Kafka retention.
+Consumes the `analytics_events` Kafka topic (one event per verdict, slimmer schema than VerdictEvent — see §5.1) and writes long-lived rows to **ClickHouse** for offline reporting. **The Spring Boot module (`analytics-pipeline/`) is deprecated** — kept in-tree for git history only, excluded from the build-and-push image matrix. The production path is **ClickHouse Kafka Engine + Materialized View**: ClickHouse owns the `analytics-clickhouse` consumer group and pulls `AnalyticsEvent` records directly from Kafka, with no JVM consumer in between. DDL lives at `analytics-pipeline/src/main/resources/schema/submission_analytics.sql`; compose wiring (the `oj-clickhouse` + one-shot `oj-clickhouse-init` services) is in `infra/gcp/compose/region.yml`.
 
-→ **Full owner page: [`services/analytics-pipeline.md`](./services/analytics-pipeline.md)** — ClickHouse schema, the production Kafka-Engine pattern, deployment path forward, code map.
+→ **Full owner page: [`services/analytics-pipeline.md`](./services/analytics-pipeline.md)** — ClickHouse schema, the Kafka-Engine wiring, runbook, code map.
 
 ### 4.9 common
 
@@ -869,7 +869,7 @@ Short list — each item points at deeper material.
 | Auth endpoints share the per-IP rate limit bucket with submission posts | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | Medium — brute-force login eats submission budget |
 | scoring-pipeline not deployed (Flink cluster) | §4.7 + Agent I's audit | Medium — leaderboard-service does a stand-in calculation |
 | React SPA not built | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | High for v1 launch — no UI |
-| `analytics-pipeline` not deployed | §4.8 | Low — produces topic data is buffered for later |
+| `analytics-pipeline` Spring module deprecated; replaced by ClickHouse Kafka Engine (see `design-docs/clickhouse-kafka-engine-rollout.md`) | §4.8 | n/a — DDL + compose entry shipped; the JVM module is retained for git history only |
 | `RUNTIME_ERROR` vs INTERNAL_ERROR conflation | §4.2 failure modes | Low — minor UX paper-cut |
 | No DLQ dashboard for the poison topic | Roadmap §3.10 | Medium — operators don't see dead-lettered submissions |
 | No SPOT preemption shutdown script | §11.2 + roadmap §3.8 | Medium for `oj-compute` cost-optimised path |
