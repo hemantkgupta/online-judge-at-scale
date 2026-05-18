@@ -50,11 +50,16 @@ services:
       - "9093:9093"
     environment:
       KAFKA_BROKER_ID: 2
-      # Sharing one ZK ensemble is fine for the demo — separate ZK is a
-      # multi-node production concern. Each broker owns its own data dir
-      # under a distinct cluster ID (KAFKA_BROKER_ID=2 above).
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ZOOKEEPER_CONNECT_NAMESPACE: kafka-global
+      # Sharing one ZK ensemble is fine for the demo, but the two brokers
+      # must be in *separate* Kafka clusters or MM2 mirrors the cluster
+      # onto itself (heartbeats accumulate as `regional.regional.…heartbeats`
+      # and the MM2 internal config/offset topics collide across both
+      # herders, wedging the source-connector tasks after the first
+      # restart). The CP-Kafka image does NOT recognize
+      # `KAFKA_ZOOKEEPER_CONNECT_NAMESPACE`; instead use a ZK chroot in
+      # the connect string itself (`zookeeper:2181/kafka-global`), which
+      # the broker auto-creates on startup.
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181/kafka-global
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-global:29093,PLAINTEXT_HOST://localhost:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -75,6 +80,15 @@ services:
       - kafka-global
     volumes:
       - ./infra/mm2/mm2.properties:/etc/mm2/mm2.properties
+    environment:
+      # The `connect-mirror-maker` wrapper defaults `KAFKA_LOG4J_OPTS` to
+      # `$base_dir/../config/connect-log4j.properties` (→
+      # `/usr/config/connect-log4j.properties`), which does not exist in the
+      # CP-Kafka image — the real file lives under `/etc/kafka/`. Point
+      # log4j there explicitly so MM2 actually emits to stdout. Without
+      # this, `docker logs mirrormaker2` shows only the wrapper's two
+      # banner lines and any stall is invisible.
+      KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/etc/kafka/connect-log4j.properties"
     command: >
       bash -c "
         echo '[mm2] Waiting for both Kafka clusters to be reachable...';
