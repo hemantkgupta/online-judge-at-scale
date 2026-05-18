@@ -258,8 +258,10 @@ main() {
     ensure_flink_job_running
     produce_verdicts
 
-    await_score "userA" "$EXPECTED_SCORE_USER_A" "$EXPECTED_SHARD_USER_A"
-    await_score "userB" "$EXPECTED_SCORE_USER_B" "$EXPECTED_SHARD_USER_B"
+    # SmokeProducer scopes its user/problem ids by the contest id so reruns
+    # don't collide with Flink's per-user state from prior runs.
+    await_score "userA-${SMOKE_CONTEST}" "$EXPECTED_SCORE_USER_A" "$EXPECTED_SHARD_USER_A"
+    await_score "userB-${SMOKE_CONTEST}" "$EXPECTED_SCORE_USER_B" "$EXPECTED_SHARD_USER_B"
 
     cleanup_contest_keys
     printf "${GREEN}OK${NC} scoring-pipeline smoke green (contest=%s)\n" "$SMOKE_CONTEST"

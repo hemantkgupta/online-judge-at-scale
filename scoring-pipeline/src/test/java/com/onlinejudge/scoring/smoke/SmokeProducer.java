@@ -43,6 +43,18 @@ public final class SmokeProducer {
         String contestId = required("SMOKE_CONTEST");
         long   baseTsMs  = Long.parseLong(required("SMOKE_BASE_TS_MS"));
 
+        // ScoringFunction keys state by userId in Flink and by (userId, problemId)
+        // in the per-user state map. Across reruns of the smoke the Flink job is
+        // intentionally NOT restarted, so we must use run-scoped user/problem ids
+        // — otherwise Scorer.apply sees the second run's events as duplicate
+        // replays of the first run (same eventTs, same problemId already
+        // accepted) and emits nothing, and Redis stays empty.
+        String runSuffix  = contestId;
+        String userA      = "userA-"      + runSuffix;
+        String userB      = "userB-"      + runSuffix;
+        String problemP1  = "P1-"         + runSuffix;
+        String problemP2  = "P2-"         + runSuffix;
+
         long tACUserAP1     = baseTsMs;
         long tWAUserAP2     = baseTsMs + TimeUnit.MINUTES.toMillis(10);
         long tACUserAP2     = baseTsMs + TimeUnit.MINUTES.toMillis(15);
@@ -64,14 +76,14 @@ public final class SmokeProducer {
 
         try (Producer<String, byte[]> producer = new KafkaProducer<>(props)) {
 
-            send(producer, topic, "userA",
-                    verdict("sub-A-P1", "userA", "P1", contestId, "ACCEPTED", 100, tACUserAP1));
-            send(producer, topic, "userA",
-                    verdict("sub-A-P2-wa", "userA", "P2", contestId, "WRONG_ANSWER", 0, tWAUserAP2));
-            send(producer, topic, "userA",
-                    verdict("sub-A-P2-ac", "userA", "P2", contestId, "ACCEPTED", 100, tACUserAP2));
-            send(producer, topic, "userB",
-                    verdict("sub-B-P1", "userB", "P1", contestId, "ACCEPTED", 100, tACUserBP1));
+            send(producer, topic, userA,
+                    verdict("sub-A-P1-"    + runSuffix, userA, problemP1, contestId, "ACCEPTED",     100, tACUserAP1));
+            send(producer, topic, userA,
+                    verdict("sub-A-P2-wa-" + runSuffix, userA, problemP2, contestId, "WRONG_ANSWER",   0, tWAUserAP2));
+            send(producer, topic, userA,
+                    verdict("sub-A-P2-ac-" + runSuffix, userA, problemP2, contestId, "ACCEPTED",     100, tACUserAP2));
+            send(producer, topic, userB,
+                    verdict("sub-B-P1-"    + runSuffix, userB, problemP1, contestId, "ACCEPTED",     100, tACUserBP1));
 
             // Watermark sentinel: emit one ACCEPTED for a non-asserted user/problem to
             // EVERY partition at a timestamp comfortably past the latest real event +
