@@ -303,6 +303,7 @@ Owned end-to-end by api-gateway's Flyway migrations under `api-gateway/src/main/
 | V6 | `contests` table | §4.5 |
 | V7 | `contest_problems` (contest ↔ problem join) | §4.5 |
 | V8 | `reconcile_attempts` on submissions + partial index on `(status, created_at) WHERE status='PENDING'` | §4.1 (reconciliation scanner) |
+| V9 | `region` columns on `users` / `contests` / `refresh_tokens` / `auth_events` / `idempotency_keys` + per-table `LOCALITY` (GLOBAL on shared catalog tables; REGIONAL BY ROW on hot-path tables). **Requires** [`infra/scripts/crdb-multiregion-init.sh`](https://github.com/hemantkgupta/online-judge-at-scale/blob/main/infra/scripts/crdb-multiregion-init.sh) to run BEFORE api-gateway boots — V9's `SET LOCALITY` DDL fails on a single-region cluster. | §12 multi-region; [`docs/runbooks/multi-region.md`](./runbooks/multi-region.md) |
 
 Hibernate `ddl-auto=validate` for every JPA-using service post-V3. The CRDB INT type (BIGINT-flavoured) requires Java `long` on entity fields — `Problem.{time_limit_ms,memory_limit_mb,points}`, `IdempotencyKey.attempts`, etc. all retyped accordingly.
 
