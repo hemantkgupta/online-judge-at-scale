@@ -600,78 +600,104 @@ The dashboard JSON definitions are TODO — there's no `infra/observability/dash
 
 ### 10.1 GCP topology
 
-Two VMs in `asia-south1-a`:
+**Two VMs in two regions, each running the FULL application stack.** Replaces the earlier single-region "control plane VM + compute VM" split (commit `<phase-1-sha>`); the trust-zone separation between Sandbox Manager (privileged) and the rest stays a process-level concern, not a host-level one.
 
-| VM | Type | Role | What runs |
-|---|---|---|---|
-| `oj-control-plane` | `e2-medium` (2 vCPU / 4 GB) | Stateful control plane | zookeeper, kafka, cockroachdb, redis, api-gateway, problem-service, otel-collector. With contest + leaderboard wired in (commit `6be38f4`) the VM is at ~4.2 GB committed against 4 GB hardware — bump to `e2-standard-2` (8 GB) before non-developer users land. |
-| `oj-compute` | `n2-standard-2` SPOT (2 vCPU / 8 GB, nested virt) | Per-host execution sandbox host | sandbox-manager + execution-worker. Spot pricing → ~70% off. Preemption is acceptable because submissions are stateless and Kafka offsets live elsewhere. |
+| VM | Region | Zone | Type | What runs |
+|---|---|---|---|---|
+| `oj-region-a` | `var.primary_region` (default `asia-south1`) | `var.primary_zone` (default `asia-south1-a`) | `n2-standard-2` SPOT (2 vCPU / 8 GB, nested-virt) | The full stack: zookeeper, kafka, cockroachdb (locality `region=asia-south1`), redis, api-gateway, problem-service, contest-service, leaderboard-service, otel-collector, sandbox-manager, execution-worker, Firecracker microVMs. |
+| `oj-region-b` | `var.secondary_region` (default `us-central1`) | `var.secondary_zone` (default `us-central1-a`) | `n2-standard-2` SPOT, same shape | Identical software; CRDB locality `region=us-central1`. |
 
-Both VMs have ephemeral external IPs for outbound only (apt / docker pulls). Inbound is IAP-only via the `oj-allow-iap-ssh` firewall rule (source range `35.235.240.0/20`).
+Both VMs have **static internal IPs** allocated via `google_compute_address` (`oj-region-a-internal` and `oj-region-b-internal`) so each VM's startup-script can carry the OTHER VM's IP at plan time — required for CRDB `--join`, Kafka cross-region reach, and the leaderboard-service peer fan-out. Without static IPs, terraform hits a dependency cycle between the two VM resources.
 
-Two Cloud Scheduler jobs stop both VMs nightly at 23:00 IST (cost safety net).
+Network:
+- One global VPC `oj-vpc` with `routing_mode = GLOBAL` (so cross-region private-IP traffic doesn't hairpin via the public internet).
+- Two regional subnets: `oj-subnet-primary` (`10.10.0.0/24`) and `oj-subnet-secondary` (`10.20.0.0/24`).
+- Firewall: `oj-allow-iap-ssh` (IAP SSH source range) + `oj-allow-cross-region` (all TCP/UDP/ICMP between the two subnets). Both VMs tagged `oj-vm`.
+
+Both VMs have ephemeral external IPs for outbound only (apt / docker pulls / AR cross-region pulls). Inbound is IAP-only.
+
+Two Cloud Scheduler jobs (`oj-auto-shutdown-region-a/-b`) stop both VMs nightly at 23:00 IST.
 
 ### 10.2 Terraform inventory
 
-`infra/gcp/terraform/main.tf` is the single source of truth for every billable resource. 27 resources total:
+`infra/gcp/terraform/main.tf` is the single source of truth for every billable resource. The 2-region topology adds resources vs the single-region predecessor:
 
-- 1 VPC (`oj-vpc`) + 1 subnet (`oj-subnet`, 10.0.0.0/24)
-- 2 firewall rules (`oj-allow-iap-ssh`, `oj-allow-internal`)
-- 1 Artifact Registry repo (`oj-images`) + 2 AR-reader IAM bindings
-- 4 service accounts (control-plane, compute, problem-signer, scheduler)
-- 5 project-level IAM bindings (log writer × 2, scheduler admin, metric writer, trace agent)
-- 1 GCS bucket (`oj-test-cases-{projectId}`) + 1 signer IAM binding
-- 1 SA key (problem-signer)
-- 1 Secret Manager secret + 1 version + 1 IAM binding
-- 1 archive_file (agent source tarball injected into compute startup metadata)
+- 1 VPC (`oj-vpc`, global routing) + 2 regional subnets
+- 2 static internal IPs (`google_compute_address`, one per region — breaks the cycle described in §10.1)
+- 2 firewall rules (`oj-allow-iap-ssh`, `oj-allow-cross-region`)
+- 1 Artifact Registry repo (`oj-images`, hosted in the primary region; secondary VM does cross-region pulls)
+- 1 shared region service account (`oj-region`) + 1 AR-reader binding + 3 project-level IAM bindings (logging.logWriter, monitoring.metricWriter, cloudtrace.agent)
+- Existing: 1 GCS bucket + signer SA + Secret Manager wiring (project-global, no regional duplication)
+- 1 archive_file (agent source tarball baked into both VMs' startup-script metadata)
 - 1 random_password (JWT secret)
-- 2 compute instances (control-plane, compute)
-- 2 Cloud Scheduler jobs (nightly stop)
+- 2 `google_compute_instance` resources (`oj_region_a`, `oj_region_b`), both `n2-standard-2` SPOT with nested-virt
+- 1 scheduler SA + 2 Cloud Scheduler jobs (per-region nightly stop)
 
-A `tofu destroy` from a clean apply tears down all 27 in dependency order; verified during the post-session teardown.
+A `tofu destroy` from a clean apply tears down everything in dependency order.
 
-### 10.3 Compose files
+### 10.3 Compose: single consolidated `region.yml`
 
-`infra/gcp/compose/control-plane-compose.yml` and `compute-compose.yml`. Both are checked-in and base64-injected into VM metadata by the terraform `templatefile()` calls; the startup script materialises them on every boot.
+The earlier split (`control-plane-compose.yml` + `compute-compose.yml`) is gone. One file — `infra/gcp/compose/region.yml` — runs on every region VM, parameterised by env vars set by the startup script. Every service's compose entry uses `${REGION}` / `${PEER_REGION}` / `${PEER_INTERNAL_IP}` / `${INTERNAL_IP}` / `${KAFKA_HOST_EXTERNAL}` derived at boot.
 
-Notable env-var contracts (operator-driven via `/opt/oj/.env`):
-- `AR_URL` — Artifact Registry repo URL
-- `KAFKA_HOST_EXTERNAL` — control-plane internal IP (advertised for off-VM Kafka clients)
+CRDB compose command flags (the most material change):
+
+```yaml
+command:
+  - start
+  - --insecure
+  - --advertise-addr=${INTERNAL_IP}
+  - --listen-addr=0.0.0.0:26257
+  - --http-addr=0.0.0.0:8080
+  - --locality=region=${REGION},zone=local
+  - --join=${INTERNAL_IP}:26257,${PEER_INTERNAL_IP}:26257
+  - --max-sql-memory=512MiB
+  - --cache=256MiB
+```
+
+Notable env-var contracts (operator-driven via `/opt/oj/.env`, generated at boot):
+- `AR_URL` — Artifact Registry repo URL (always pulls from primary region's AR)
+- `REGION` — the region this VM is in
+- `PEER_REGION` — the other region's name
+- `PEER_INTERNAL_IP` — the other VM's static internal IP (carried in startup-script metadata; written into `.env`)
+- `INTERNAL_IP` — this VM's own IP (resolved at boot from the GCE metadata service)
+- `KAFKA_HOST_EXTERNAL=${INTERNAL_IP}` — advertised listener
 - `JWT_SECRET` — terraform-generated
-- `REGION` — used for the SubmissionEvent.region stamp
-- `GCS_BUCKET` — test-cases bucket name
-- `CONTROL_PLANE_IP` — for compute VM's Kafka + problem-service URLs
-- `APP_SANDBOX_BACKEND` — `firecracker` on GCP, `docker` for local dev
-- `APP_PROBLEM_SERVICE_REQUIRED` — flip to `false` for smoke tests; `true` in prod
-- `OTEL_JAVAAGENT_ENABLED` — flipped to true after the collector is verified healthy
+- `GCS_BUCKET` — test-cases bucket
+- `APP_SANDBOX_BACKEND=firecracker` (no longer flipped to `docker` since both VMs have nested-virt)
+- `APP_PROBLEM_SERVICE_REQUIRED=true`
+- `APP_PEER_GATEWAY_URL=http://${PEER_INTERNAL_IP}:8088` (api-gateway region-mismatch 307)
+- `APP_PEER_LEADERBOARD_URL=http://${PEER_INTERNAL_IP}:8082` (leaderboard-service global fan-out)
+- `OTEL_JAVAAGENT_ENABLED=false` (operator flips after collector is healthy; same posture as single-region)
 
 ### 10.4 Startup-script flow
 
-`infra/gcp/startup/control-plane.sh.tpl` runs on every boot of `oj-control-plane`. Steps:
+`infra/gcp/startup/region.sh.tpl` runs on every boot of either region VM (terraform passes a different `${region}` parameter to each). Combines the responsibilities of the retired `control-plane.sh.tpl` + `compute.sh.tpl`:
 
-1. Install Docker engine + compose plugin (idempotent — skipped if present).
+1. Install Docker engine + compose plugin (idempotent).
 2. Install gcloud CLI.
-3. `gcloud auth configure-docker` for the AR registry.
-4. Materialise `/opt/oj/control-plane-compose.yml` + `otel-collector-config.yaml` from the base64-injected blobs in instance metadata.
-5. Fetch the problem-signer SA JSON key from Secret Manager → `/opt/oj/gcs-signer.json` (mode 0400).
-6. Generate `/opt/oj/.env` with the variables listed above.
-7. Pre-pull the api-gateway image (so `compose up -d` doesn't have to wait on a 200 MB pull).
-8. Install + start the `oj-control-plane.service` systemd unit that runs `docker compose -f /opt/oj/control-plane-compose.yml up -d`.
-
-`compute.sh.tpl` is the analogous file for the compute VM. Differs in two places: (a) installs Firecracker + the harness rootfs builder + the in-guest agent source tarball, and (b) does NOT need a signer key fetch.
+3. Install Firecracker binary (pinned version) + gVisor (best-effort; non-fatal).
+4. Configure docker auth for AR.
+5. Materialise `/opt/oj/region.yml` + `/opt/oj/otel-collector-config.yaml` from base64 metadata.
+6. Drop `init.sh`, `build-rootfs.sh`, unzip agent source into `/opt/oj/agent/`.
+7. Fetch problem-signer SA JSON from Secret Manager → `/opt/oj/gcs-signer.json` (mode 0400).
+8. Generate `/opt/oj/.env` (the variables in §10.3).
+9. Run `build-rootfs.sh` (idempotent via version marker).
+10. Install + start the `oj-region.service` systemd unit (`docker compose -f /opt/oj/region.yml up -d --remove-orphans`).
 
 ### 10.5 First-boot bootstrap
 
-A *fresh* `tofu apply` produces both VMs in stopped state. The operator's first-time bring-up:
+A fresh `tofu apply` produces both VMs in stopped state. The operator's first-time bring-up:
 
-1. Build + push all 6 service images to AR (the build-and-push GHA workflow does this on push-to-main; the local-build path lives in each module's Dockerfile).
-2. `gcloud compute instances start oj-control-plane oj-compute`.
-3. Wait ~3–5 minutes for the startup script to run end-to-end.
-4. On first connect to CRDB, Flyway runs V1..V8 against an empty `onlinejudge` database. Migration history is created.
-5. Seed a problem: SQL INSERT into `problems` + `test_cases`, then `gcloud storage cp` the input + expected files. See `infra/firecracker/test/problems/sum-of-two/` for a worked example.
-6. Smoke: `python3 infra/firecracker/test/submit-sample.py --code 'print(2+2)' --problem-id <UUID> --expect-verdict ACCEPTED`.
+1. Build + push all service images to AR (build-and-push GHA on push-to-main, OR local `docker buildx`).
+2. `gcloud compute instances start oj-region-a oj-region-b`.
+3. Wait ~3–5 minutes for both startup scripts to complete (rootfs builds in parallel per VM).
+4. SSH into either VM, run `sudo bash /opt/oj/crdb-multiregion-init.sh asia-south1 us-central1` once — declares the CRDB cluster's PRIMARY REGION + adds the secondary. Idempotent; safe to re-run.
+5. api-gateway boots, Flyway runs V1..V9 against `onlinejudge` (V9 applies the multi-region LOCALITY DDL — requires step 4 first; if you start api-gateway before step 4, Flyway crash-loops on the LOCALITY DDL).
+6. Bootstrap Kafka topics on each region: `sudo bash /opt/oj/kafka-bootstrap-topics.sh --region asia-south1` on `oj-region-a`, `--region us-central1` on `oj-region-b`. Each region creates only its own region's topics.
+7. Seed a problem: SQL INSERT into `problems` + `test_cases` (problems table is GLOBAL — write once, both regions see it); `gcloud storage cp` the input + expected files.
+8. Smoke: signup via region A's gateway, log in, `submit-sample.py --expect-verdict ACCEPTED`. Repeat via region B's gateway.
 
-Bringing it back from a torn-down state (e.g. after the session teardown) follows the same flow. ~10 minutes end-to-end.
+Bringing it back from a torn-down state follows the same flow. ~15 minutes end-to-end including the CRDB cluster init step.
 
 ### 10.6 CI/CD (GitHub Actions)
 

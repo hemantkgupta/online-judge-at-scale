@@ -36,6 +36,10 @@ terraform {
 
 provider "google" {
   project = var.project_id
-  region  = var.region
-  zone    = var.zone
+  # Provider default region/zone is the primary region — resources that don't
+  # specify a region (e.g. project-global IAM, Secret Manager auto-replicate)
+  # are fine here. Regional resources (subnets, VMs, scheduler jobs) override
+  # via their own `region`/`zone` argument.
+  region = var.primary_region
+  zone   = var.primary_zone
 }

@@ -1,11 +1,9 @@
 # =============================================================================
 # Input variables.
 #
-# Anything that depends on the operator's environment (project ID, SSH keys,
-# region) is exposed here. Defaults match the blog-grade target described in
-# infra/gcp/README.md: e2-medium control-plane, n2-standard-2 spot compute in
-# Mumbai (asia-south1), 25 GB pd-balanced disks, auto-shutdown at 23:00 IST.
-# Override locally via terraform.tfvars (gitignored) or -var on the CLI.
+# Multi-region setup: two VMs in two regions, each running the full stack.
+# Defaults pick asia-south1 (Mumbai, closest to operator) as primary and
+# us-central1 (cheap US region) as secondary. Override via terraform.tfvars.
 # =============================================================================
 
 variable "project_id" {
@@ -14,34 +12,42 @@ variable "project_id" {
   default     = "online-judge-hk"
 }
 
-variable "region" {
-  description = "GCP region (Mumbai is closest to the operator; us-central1 is cheapest)"
+# ---------- Region selection ------------------------------------------------
+
+variable "primary_region" {
+  description = "Primary GCP region (closest to operator)."
   type        = string
   default     = "asia-south1"
 }
 
-variable "zone" {
-  description = "GCP zone within the region"
+variable "primary_zone" {
+  description = "Primary GCP zone within primary_region."
   type        = string
   default     = "asia-south1-a"
 }
 
-# ---------- VM sizing -------------------------------------------------------
-
-variable "control_plane_machine_type" {
-  description = "Machine type for the control-plane VM (Kafka, CRDB, Redis, api-gateway in docker-compose)"
+variable "secondary_region" {
+  description = "Secondary GCP region (geographically distant for multi-region demo / DR)."
   type        = string
-  default     = "e2-medium" # 2 vCPU / 4 GB, ~$0.034/hr running
+  default     = "us-central1"
 }
 
-variable "compute_machine_type" {
-  description = "Machine type for the compute VM. MUST support nested virtualization (n1/n2/c2/c3 families)."
+variable "secondary_zone" {
+  description = "Secondary GCP zone within secondary_region."
+  type        = string
+  default     = "us-central1-a"
+}
+
+# ---------- VM sizing -------------------------------------------------------
+
+variable "region_machine_type" {
+  description = "Machine type for both region VMs. MUST support nested virtualization (n1/n2/c2/c3) — both VMs run Firecracker."
   type        = string
   default     = "n2-standard-2" # 2 vCPU / 8 GB, ~$0.107/hr on-demand or ~$0.026/hr spot
 }
 
-variable "compute_use_spot" {
-  description = "Use spot pricing for the compute VM. Cheaper (~70% off) but preemptible with 30s notice."
+variable "region_use_spot" {
+  description = "Use spot pricing for both region VMs. Cheaper (~70% off) but preemptible with 30s notice."
   type        = bool
   default     = true
 }
@@ -69,7 +75,7 @@ variable "ssh_public_key_path" {
 # ---------- Auto-shutdown safety net ----------------------------------------
 
 variable "auto_shutdown_cron" {
-  description = "Daily auto-shutdown schedule (Asia/Kolkata). Protects against 'forgot to stop the VMs'."
+  description = "Daily auto-shutdown schedule. Protects against 'forgot to stop the VMs'."
   type        = string
   default     = "0 23 * * *" # 11:00 PM IST
 }
@@ -83,21 +89,21 @@ variable "auto_shutdown_timezone" {
 # ---------- Artifact Registry -----------------------------------------------
 
 variable "artifact_repo_name" {
-  description = "Artifact Registry repository name for Docker images."
+  description = "Artifact Registry repository name for Docker images. Hosted in primary_region; secondary VM pulls cross-region."
   type        = string
   default     = "oj-images"
 }
 
-# ---------- Sandbox backend selection (compute VM) --------------------------
-# Flip these without rebuilding images. The compute VM startup script writes
-# them to /opt/oj/.env which docker-compose picks up. After `tofu apply` the
-# VM will need a restart (or `systemctl restart oj-compute.service`) for the
-# new values to take effect.
+# ---------- Sandbox backend selection ---------------------------------------
+# Flip these without rebuilding images. The startup script writes them to
+# /opt/oj/.env which docker-compose picks up. After `tofu apply` the VM
+# needs a restart (or `systemctl restart oj-region.service`) for the new
+# values to take effect.
 
 variable "sandbox_backend" {
   description = "Which sandbox backend the execution-worker uses: docker or firecracker."
   type        = string
-  default     = "docker"
+  default     = "firecracker"
   validation {
     condition     = contains(["docker", "firecracker"], var.sandbox_backend)
     error_message = "sandbox_backend must be one of: docker, firecracker."

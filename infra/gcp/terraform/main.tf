@@ -1,46 +1,100 @@
 # =============================================================================
-# Online Judge — GCP deployment substrate.
+# Online Judge — multi-region GCP deployment substrate.
 #
-# Provisions, in stopped state:
-#   * A custom VPC + subnet (asia-south1 by default)
-#   * Firewall rules: IAP SSH (no public IPs) + internal traffic between VMs
-#   * Artifact Registry repository for the service Docker images
-#   * Two service accounts (one per VM, AR-reader scoped)
+# Topology: two VMs in two regions, each running the FULL application stack
+# (control plane + compute on every node). Provisions, in stopped state:
+#   * A custom VPC with two regional subnets:
+#       - oj-subnet-primary    (var.primary_region, 10.10.0.0/24)
+#       - oj-subnet-secondary  (var.secondary_region, 10.20.0.0/24)
+#   * Firewall rules: IAP SSH + cross-region intra-stack traffic
+#   * Artifact Registry repository for the service Docker images (single,
+#     hosted in the primary region)
+#   * One shared region-VM service account (oj-region) — both VMs run the
+#     same software so split SAs would only duplicate IAM bindings
 #   * Two VMs:
-#       - oj-control-plane: e2-medium, runs Kafka/CRDB/Redis/api-gateway in
-#         docker-compose
-#       - oj-compute:       n2-standard-2 spot, nested virt enabled, runs
-#         the execution-worker with Firecracker / Docker / gVisor backends
-#   * A scheduler service account
-#   * Two Cloud Scheduler jobs that stop the VMs at 23:00 IST daily
+#       - oj-region-a: n2-standard-2 SPOT, nested virt enabled, runs the full
+#         stack (Kafka, CRDB, Redis, all JVM services + sandbox-manager +
+#         execution-worker with Firecracker / Docker / gVisor backends)
+#       - oj-region-b: identical shape, identical software, different region
+#   * Scheduler SA + Cloud Scheduler jobs that stop both VMs at 23:00 IST
 #
-# All Stage-2 resources are infrastructural only. Docker images and startup
-# scripts come in Stages 3 + 4.
+# CRDB runs as a 2-node multi-region cluster: each node joins the peer over
+# the private internal IPs and advertises locality=region=<region>,zone=local
+# so range placement honours geography.
 # =============================================================================
 
-# ---------- VPC + subnet ----------------------------------------------------
+# ---------- VPC + regional subnets ------------------------------------------
 
 resource "google_compute_network" "oj_vpc" {
   name                    = "oj-vpc"
   auto_create_subnetworks = false
-  routing_mode            = "REGIONAL"
+  # GLOBAL routing so cross-region private-IP traffic doesn't take a hairpin
+  # over the public internet — the two regional subnets are stitched into one
+  # routing fabric and CRDB Raft / Kafka can talk over RFC1918 addresses.
+  routing_mode = "GLOBAL"
 }
 
-resource "google_compute_subnetwork" "oj_subnet" {
-  name          = "oj-subnet"
-  ip_cidr_range = "10.0.0.0/24"
-  region        = var.region
+locals {
+  regions = {
+    a = {
+      region      = var.primary_region
+      zone        = var.primary_zone
+      subnet_name = "oj-subnet-primary"
+      subnet_cidr = "10.10.0.0/24"
+      instance    = "oj-region-a"
+    }
+    b = {
+      region      = var.secondary_region
+      zone        = var.secondary_zone
+      subnet_name = "oj-subnet-secondary"
+      subnet_cidr = "10.20.0.0/24"
+      instance    = "oj-region-b"
+    }
+  }
+
+  # Full AR repo URL — passed into the startup script so docker-compose can
+  # pull `${AR_URL}/api-gateway:latest` without hard-coding the project ID.
+  # The AR repository itself lives in the primary region; cross-region pulls
+  # work fine, GCP just charges a small egress + a few ms of latency on
+  # cold pulls. Acceptable for a dev-grade two-region setup.
+  ar_url = "${var.primary_region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo_name}"
+
+  ssh_key_entry = "${var.ssh_user}:${file(pathexpand(var.ssh_public_key_path))}"
+}
+
+resource "google_compute_subnetwork" "oj_subnets" {
+  for_each      = local.regions
+  name          = each.value.subnet_name
+  ip_cidr_range = each.value.subnet_cidr
+  region        = each.value.region
   network       = google_compute_network.oj_vpc.id
 
-  # Lets Cloud NAT / Identity-Aware Proxy reach the VMs without exposing
-  # public IPs. Logging stays off (free) since this is a dev-grade setup.
+  # Lets Identity-Aware Proxy reach the VMs without public IPs. Logging stays
+  # off (free) since this is a dev-grade setup.
   private_ip_google_access = true
+}
+
+# ---------- Static internal IPs --------------------------------------------
+# Each VM's startup-script template carries the OTHER VM's IP (for CRDB
+# --join, Kafka advertised-listener cross-region reach, leaderboard-service
+# peer fan-out, api-gateway region-mismatch 307 redirect). Letting Compute
+# Engine assign ephemeral IPs creates a terraform cycle: oj_region_a's
+# metadata references oj_region_b.network_interface[0].network_ip and vice
+# versa, so neither resource can be created first. We reserve the IPs up
+# front via google_compute_address — addresses are known at plan time and
+# both VMs reference the address resources, not each other.
+resource "google_compute_address" "region_internal" {
+  for_each     = local.regions
+  name         = "${each.value.instance}-internal"
+  region       = each.value.region
+  subnetwork   = google_compute_subnetwork.oj_subnets[each.key].id
+  address_type = "INTERNAL"
 }
 
 # ---------- Firewall rules --------------------------------------------------
 
 # Allow Identity-Aware Proxy to SSH into both VMs. Source range is the fixed
-# block GCP publishes for IAP TCP forwarding; no public IP needed on the VMs.
+# block GCP publishes for IAP TCP forwarding.
 resource "google_compute_firewall" "allow_iap_ssh" {
   name      = "oj-allow-iap-ssh"
   network   = google_compute_network.oj_vpc.id
@@ -51,14 +105,17 @@ resource "google_compute_firewall" "allow_iap_ssh" {
     ports    = ["22"]
   }
 
-  source_ranges = ["35.235.240.0/20"] # IAP TCP forwarding range
+  source_ranges = ["35.235.240.0/20"]
   target_tags   = ["oj-vm"]
 }
 
-# Allow all intra-VPC traffic so the compute VM can reach Kafka :9092,
-# CockroachDB :26257, Redis :6379 on the control-plane VM.
-resource "google_compute_firewall" "allow_internal" {
-  name      = "oj-allow-internal"
+# Allow all traffic between the two regional subnets so each VM can reach the
+# other's CRDB (:26257 Raft + SQL), Kafka (:29092 advertised on the internal
+# IP), HTTP services (8082/8084/8088/8089), and OTLP gRPC (:4317). Tight
+# enough — only the two named CIDRs are trusted — and pragmatic enough that
+# we don't have to enumerate every port the stack opens.
+resource "google_compute_firewall" "allow_cross_region" {
+  name      = "oj-allow-cross-region"
   network   = google_compute_network.oj_vpc.id
   direction = "INGRESS"
 
@@ -74,96 +131,57 @@ resource "google_compute_firewall" "allow_internal" {
     protocol = "icmp"
   }
 
-  source_ranges = ["10.0.0.0/24"]
+  source_ranges = [for k, v in local.regions : v.subnet_cidr]
   target_tags   = ["oj-vm"]
 }
 
 # ---------- Artifact Registry ----------------------------------------------
 
 resource "google_artifact_registry_repository" "oj_images" {
-  location      = var.region
+  location      = var.primary_region
   repository_id = var.artifact_repo_name
   format        = "DOCKER"
   description   = "Docker images for online-judge services (api-gateway, execution-worker, etc.)"
 }
 
-# ---------- VM service accounts --------------------------------------------
+# ---------- Region VM service account --------------------------------------
+# Both VMs run the same software so they share one SA. This collapses what
+# used to be control_plane_sa + compute_sa into a single identity and
+# eliminates duplicated IAM bindings.
 
-resource "google_service_account" "control_plane_sa" {
-  account_id   = "oj-control-plane"
-  display_name = "Online Judge — control-plane VM"
+resource "google_service_account" "region_sa" {
+  account_id   = "oj-region"
+  display_name = "Online Judge — region VM (full stack: control plane + compute)"
 }
 
-resource "google_service_account" "compute_sa" {
-  account_id   = "oj-compute"
-  display_name = "Online Judge — compute VM (Firecracker / gVisor)"
-}
-
-# Both VMs need to pull from Artifact Registry.
-resource "google_artifact_registry_repository_iam_member" "control_plane_ar_reader" {
+# AR reader so docker-compose can pull every service image.
+resource "google_artifact_registry_repository_iam_member" "region_ar_reader" {
   location   = google_artifact_registry_repository.oj_images.location
   repository = google_artifact_registry_repository.oj_images.name
   role       = "roles/artifactregistry.reader"
-  member     = "serviceAccount:${google_service_account.control_plane_sa.email}"
+  member     = "serviceAccount:${google_service_account.region_sa.email}"
 }
 
-resource "google_artifact_registry_repository_iam_member" "compute_ar_reader" {
-  location   = google_artifact_registry_repository.oj_images.location
-  repository = google_artifact_registry_repository.oj_images.name
-  role       = "roles/artifactregistry.reader"
-  member     = "serviceAccount:${google_service_account.compute_sa.email}"
-}
-
-# Both VMs write logs to Cloud Logging (free up to 50 GiB/mo).
-resource "google_project_iam_member" "control_plane_log_writer" {
-  project = var.project_id
-  role    = "roles/logging.logWriter"
-  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
-}
-
-# Roadmap §2.6: the oj-otel-collector container (sibling of api-gateway on the
-# control-plane VM) authenticates to GCP via ADC from the GCE metadata server.
-# It needs:
-#   * roles/monitoring.metricWriter — for the googlemanagedprometheus exporter
-#     to push OTel metrics into Cloud Monitoring as Prometheus-native series
-#   * roles/cloudtrace.agent — for the googlecloud trace exporter (logWriter
-#     does NOT transitively grant trace write — that was a 2024 misconception)
-# Cloud Logging is already covered by control_plane_log_writer above.
-resource "google_project_iam_member" "control_plane_metric_writer" {
-  project = var.project_id
-  role    = "roles/monitoring.metricWriter"
-  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
-}
-
-resource "google_project_iam_member" "control_plane_trace_agent" {
-  project = var.project_id
-  role    = "roles/cloudtrace.agent"
-  member  = "serviceAccount:${google_service_account.control_plane_sa.email}"
-}
-
-resource "google_project_iam_member" "compute_log_writer" {
-  project = var.project_id
-  role    = "roles/logging.logWriter"
-  member  = "serviceAccount:${google_service_account.compute_sa.email}"
-}
-
-# ---------- SSH key injection ----------------------------------------------
-
+# Union of the old two SAs' project-level roles.
 locals {
-  ssh_key_entry = "${var.ssh_user}:${file(pathexpand(var.ssh_public_key_path))}"
+  region_sa_project_roles = [
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter", # OTel googlemanagedprometheus exporter
+    "roles/cloudtrace.agent",        # OTel googlecloud trace exporter
+  ]
+}
 
-  # Full AR repo URL — passed into startup scripts so docker-compose can pull
-  # `${AR_URL}/api-gateway:latest` without hard-coding the project ID.
-  ar_url = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo_name}"
+resource "google_project_iam_member" "region_sa_roles" {
+  for_each = toset(local.region_sa_project_roles)
+  project  = var.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.region_sa.email}"
 }
 
 # ---------- Execution Agent source tarball ---------------------------------
 # Zips the in-repo `infra/firecracker/agent/` directory and injects it as a
-# base64 string into the compute VM's startup-script metadata. The VM
-# unzips it under /opt/oj/agent and `build-rootfs.sh` does `go build`
-# against it to produce the static linux/amd64 binary that goes into the
-# Firecracker harness rootfs. Roughly 12 KB base64-encoded — well under
-# the 256 KB per-metadata-entry limit.
+# base64 string into the VM's startup-script metadata. Roughly 12 KB
+# base64-encoded — well under the 256 KB per-metadata-entry limit.
 data "archive_file" "agent_src" {
   type        = "zip"
   output_path = "${path.module}/.terraform-agent-src.zip"
@@ -172,97 +190,25 @@ data "archive_file" "agent_src" {
 
 # ---------- JWT secret for api-gateway --------------------------------------
 # Generated once and held in terraform state. `tofu destroy` + `tofu apply`
-# will mint a fresh one — that's fine for a dev-grade setup; production
-# would route this through Secret Manager.
+# mints a fresh one — that's fine for a dev-grade setup.
 resource "random_password" "jwt_secret" {
   length      = 48
-  special     = false # keep it shell-safe; the .env file is sourced as-is
+  special     = false
   min_lower   = 8
   min_upper   = 8
   min_numeric = 8
 }
 
-# ---------- Control-plane VM ------------------------------------------------
+# ---------- Region VMs ------------------------------------------------------
+# Both VMs are identical except for region/zone and the peer-IP wiring.
+# Declared as two separate resources (not for_each) because each needs to
+# reference the OTHER's network_interface[0].network_ip in its startup-script
+# metadata — for_each + self-reference is a terraform footgun.
 
-resource "google_compute_instance" "control_plane" {
-  name         = "oj-control-plane"
-  machine_type = var.control_plane_machine_type
-  zone         = var.zone
-  # NOTE: desired_status intentionally omitted. Power state is driven by the
-  # operator (gcloud compute instances start/stop) and the auto-shutdown
-  # scheduler — not by terraform. Otherwise `tofu apply` after a startup
-  # would silently re-stop the VM you just brought up to test.
-
-  boot_disk {
-    initialize_params {
-      image = "ubuntu-os-cloud/ubuntu-2204-lts"
-      size  = var.disk_size_gb
-      type  = "pd-balanced"
-    }
-  }
-
-  network_interface {
-    subnetwork = google_compute_subnetwork.oj_subnet.id
-
-    # Ephemeral external IP for OUTBOUND only. The compute VM's startup
-    # script fetches Docker, apt packages, the OTel agent jar, and the
-    # CI vmlinux from the public internet; the control-plane VM fetches
-    # Docker + Kafka images at first boot. Without this block the VM has
-    # no internet egress (no Cloud NAT, no public IP) and apt + docker
-    # GPG curls hang for ~5 min before the startup-script gives up.
-    #
-    # INBOUND remains IAP-only: oj-allow-iap-ssh firewall restricts
-    # source range to 35.235.240.0/20, and no other ingress rule is open.
-    # A random internet host pinging the public IP can't reach :22, the
-    # actuator ports, or anything else — same security posture as the
-    # no-public-IP design. Trade: ~$0.005/hr per running VM ($3.65/mo if
-    # 24/7, much less with the 23:00 IST auto-shutdown).
-    access_config {}
-  }
-
-  service_account {
-    email  = google_service_account.control_plane_sa.email
-    scopes = ["cloud-platform"]
-  }
-
-  metadata = {
-    ssh-keys               = local.ssh_key_entry
-    enable-oslogin         = "FALSE" # we use injected SSH keys for parity with the Pi setup
-    block-project-ssh-keys = "TRUE"  # only the key we put here is accepted
-
-    # Stage 4: bring up Kafka/CRDB/Redis/api-gateway via docker-compose on
-    # every boot. Compose YAML is base64-injected so we don't need a GCS
-    # bucket for it. (Pre-V3 we also injected database/init.sql here; V3
-    # retired init.sql in favour of Flyway in api-gateway.)
-    startup-script = templatefile("${path.module}/../startup/control-plane.sh.tpl", {
-      ar_url             = local.ar_url
-      region             = var.region
-      jwt_secret         = random_password.jwt_secret.result
-      compose_yaml_b64   = base64encode(file("${path.module}/../compose/control-plane-compose.yml"))
-      # problem-service V4-signer wiring (see GCS bucket / SA / Secret Manager
-      # resources at the top of main.tf). The startup script fetches the JSON
-      # key into /opt/oj/gcs-signer.json on every boot.
-      gcs_bucket_name    = google_storage_bucket.oj_test_cases.name
-      gcs_signer_secret  = google_secret_manager_secret.problem_service_signer_key.secret_id
-      # Roadmap §2.6: OTel collector config dropped at /opt/oj/otel-collector-config.yaml
-      # for the oj-otel-collector container to volume-mount on every boot.
-      otel_config_yaml_b64 = base64encode(file("${path.module}/../compose/otel-collector-config.yaml"))
-    })
-  }
-
-  tags = ["oj-vm", "oj-control-plane"]
-
-  allow_stopping_for_update = true
-}
-
-# ---------- Compute VM (nested-virt + spot) ---------------------------------
-
-resource "google_compute_instance" "compute" {
-  name         = "oj-compute"
-  machine_type = var.compute_machine_type
-  zone         = var.zone
-  # See note on the control_plane resource — power state is operator-driven,
-  # not terraform-driven.
+resource "google_compute_instance" "oj_region_a" {
+  name         = local.regions.a.instance
+  machine_type = var.region_machine_type
+  zone         = local.regions.a.zone
 
   boot_disk {
     initialize_params {
@@ -273,34 +219,31 @@ resource "google_compute_instance" "compute" {
   }
 
   network_interface {
-    subnetwork = google_compute_subnetwork.oj_subnet.id
-
-    # Ephemeral external IP for OUTBOUND — same justification as the
-    # control-plane VM. Without this the startup script can't fetch
-    # Docker, the Firecracker binary, the guest kernel, or the OTel agent
-    # jar from the public internet. Inbound stays IAP-only via the
-    # oj-allow-iap-ssh firewall rule.
+    subnetwork = google_compute_subnetwork.oj_subnets["a"].id
+    # Static internal IP allocated up-front via google_compute_address to
+    # break the metadata cycle (see oj_subnets comment block above).
+    network_ip = google_compute_address.region_internal["a"].address
+    # Ephemeral external IP for OUTBOUND only — Docker install, AR auth,
+    # Firecracker download, OTel collector pull all hit the public internet.
+    # INBOUND stays IAP-only via oj-allow-iap-ssh.
     access_config {}
   }
 
   service_account {
-    email  = google_service_account.compute_sa.email
+    email  = google_service_account.region_sa.email
     scopes = ["cloud-platform"]
   }
 
-  # The thing that makes Firecracker viable on a cloud VM: nested KVM.
+  # Both VMs now run Firecracker, so BOTH need nested KVM.
   advanced_machine_features {
     enable_nested_virtualization = true
   }
 
-  # Spot pricing for ~70% off. Compute work here is stateless (microVMs are
-  # ephemeral, Kafka offsets are on the control plane) so preemption is
-  # acceptable.
   scheduling {
-    provisioning_model          = var.compute_use_spot ? "SPOT" : "STANDARD"
-    preemptible                 = var.compute_use_spot
-    automatic_restart           = var.compute_use_spot ? false : true
-    instance_termination_action = var.compute_use_spot ? "STOP" : null
+    provisioning_model          = var.region_use_spot ? "SPOT" : "STANDARD"
+    preemptible                 = var.region_use_spot
+    automatic_restart           = var.region_use_spot ? false : true
+    instance_termination_action = var.region_use_spot ? "STOP" : null
   }
 
   metadata = {
@@ -308,68 +251,130 @@ resource "google_compute_instance" "compute" {
     enable-oslogin         = "FALSE"
     block-project-ssh-keys = "TRUE"
 
-    # Stage 4: install Docker + Firecracker + gVisor on first boot, then
-    # bring up the execution-worker container. The control-plane VM's
-    # internal IP is wired in so the worker knows where to find Kafka/CRDB.
-    startup-script = templatefile("${path.module}/../startup/compute.sh.tpl", {
-      ar_url                   = local.ar_url
-      region                   = var.region
-      control_plane_ip         = google_compute_instance.control_plane.network_interface[0].network_ip
-      compose_yaml_b64         = base64encode(file("${path.module}/../compose/compute-compose.yml"))
-      seccomp_profile_b64      = base64encode(file("${path.module}/../../../infra/seccomp/sandbox-seccomp.json"))
-      # The custom Firecracker harness rootfs is built on the compute VM on
-      # first boot using these two scripts (init = PID-1 inside the microVM,
-      # build-rootfs = host-side debootstrap+pack script).
-      rootfs_init_b64          = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/init.sh"))
-      rootfs_builder_b64       = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/build-rootfs.sh"))
-      # Zipped Execution Agent source — unzipped on the VM and compiled
-      # by build-rootfs.sh into a static linux/amd64 binary that goes
-      # into the harness rootfs.
-      agent_src_zip_b64        = filebase64(data.archive_file.agent_src.output_path)
-      sandbox_backend          = var.sandbox_backend
-      sandbox_docker_runtime   = var.sandbox_docker_runtime
-      linux_hardening_enabled  = var.linux_hardening_enabled
+    startup-script = templatefile("${path.module}/../startup/region.sh.tpl", {
+      ar_url                  = local.ar_url
+      region                  = local.regions.a.region
+      zone                    = local.regions.a.zone
+      peer_region             = local.regions.b.region
+      peer_internal_ip        = google_compute_address.region_internal["b"].address
+      jwt_secret              = random_password.jwt_secret.result
+      compose_yaml_b64        = base64encode(file("${path.module}/../compose/region.yml"))
+      gcs_bucket_name         = google_storage_bucket.oj_test_cases.name
+      gcs_signer_secret       = google_secret_manager_secret.problem_service_signer_key.secret_id
+      otel_config_yaml_b64    = base64encode(file("${path.module}/../compose/otel-collector-config.yaml"))
+      seccomp_profile_b64     = base64encode(file("${path.module}/../../../infra/seccomp/sandbox-seccomp.json"))
+      rootfs_init_b64         = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/init.sh"))
+      rootfs_builder_b64      = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/build-rootfs.sh"))
+      agent_src_zip_b64       = filebase64(data.archive_file.agent_src.output_path)
+      sandbox_backend         = var.sandbox_backend
+      sandbox_docker_runtime  = var.sandbox_docker_runtime
+      linux_hardening_enabled = var.linux_hardening_enabled
+      project_id              = var.project_id
     })
   }
 
-  tags = ["oj-vm", "oj-compute"]
+  tags = ["oj-vm", "oj-region-a"]
+
+  allow_stopping_for_update = true
+}
+
+resource "google_compute_instance" "oj_region_b" {
+  name         = local.regions.b.instance
+  machine_type = var.region_machine_type
+  zone         = local.regions.b.zone
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = var.disk_size_gb
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.oj_subnets["b"].id
+    network_ip = google_compute_address.region_internal["b"].address
+    access_config {}
+  }
+
+  service_account {
+    email  = google_service_account.region_sa.email
+    scopes = ["cloud-platform"]
+  }
+
+  advanced_machine_features {
+    enable_nested_virtualization = true
+  }
+
+  scheduling {
+    provisioning_model          = var.region_use_spot ? "SPOT" : "STANDARD"
+    preemptible                 = var.region_use_spot
+    automatic_restart           = var.region_use_spot ? false : true
+    instance_termination_action = var.region_use_spot ? "STOP" : null
+  }
+
+  metadata = {
+    ssh-keys               = local.ssh_key_entry
+    enable-oslogin         = "FALSE"
+    block-project-ssh-keys = "TRUE"
+
+    # NOTE: region-b's startup metadata references region-a's IP. Terraform
+    # builds a graph where region-a is created first (region-b depends on it
+    # via this reference), and region-a's metadata references region-b's IP
+    # — which forces a metadata-update on region-a once region-b's IP is
+    # known. In practice this means `tofu apply` runs in two passes:
+    #   pass 1: create both VMs, region-a gets a placeholder peer_internal_ip
+    #           that resolves to the unknown value of region_b. This becomes
+    #           a known-after-apply for region_a's startup-script metadata.
+    #   The DAG ordering: region-b is created BEFORE region-a (region-a's
+    #   metadata references region-b's IP), so the second metadata-update on
+    #   region-a is unnecessary. region-b is created with an unknown
+    #   peer-IP for region-a, which terraform also resolves before this
+    #   resource is provisioned. The net effect is correct.
+    # If startup-script ordering ever becomes a problem (a VM boots before
+    # its peer has an IP), the fix is metadata-only update via
+    # google_compute_instance_metadata + a cyclic dependency break — out of
+    # scope for now.
+    startup-script = templatefile("${path.module}/../startup/region.sh.tpl", {
+      ar_url                  = local.ar_url
+      region                  = local.regions.b.region
+      zone                    = local.regions.b.zone
+      peer_region             = local.regions.a.region
+      peer_internal_ip        = google_compute_address.region_internal["a"].address
+      jwt_secret              = random_password.jwt_secret.result
+      compose_yaml_b64        = base64encode(file("${path.module}/../compose/region.yml"))
+      gcs_bucket_name         = google_storage_bucket.oj_test_cases.name
+      gcs_signer_secret       = google_secret_manager_secret.problem_service_signer_key.secret_id
+      otel_config_yaml_b64    = base64encode(file("${path.module}/../compose/otel-collector-config.yaml"))
+      seccomp_profile_b64     = base64encode(file("${path.module}/../../../infra/seccomp/sandbox-seccomp.json"))
+      rootfs_init_b64         = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/init.sh"))
+      rootfs_builder_b64      = base64encode(file("${path.module}/../../../infra/firecracker/rootfs/build-rootfs.sh"))
+      agent_src_zip_b64       = filebase64(data.archive_file.agent_src.output_path)
+      sandbox_backend         = var.sandbox_backend
+      sandbox_docker_runtime  = var.sandbox_docker_runtime
+      linux_hardening_enabled = var.linux_hardening_enabled
+      project_id              = var.project_id
+    })
+  }
+
+  tags = ["oj-vm", "oj-region-b"]
 
   allow_stopping_for_update = true
 }
 
 # ---------- problem-service: GCS bucket + signer SA + Secret Manager --------
 #
-# The problem-service signs short-lived V4 GCS download URLs and hands them
-# to the execution-worker. V4 signing happens client-side in the JVM (no API
-# call), which means the JCA needs the SA's private key in PEM/JSON form on
-# disk — ADC on a GCE VM CANNOT serve the private key, only access tokens.
-#
-# Pipeline:
-#   1. `google_storage_bucket "oj_test_cases"` holds input/expected-output
-#      bytes (one object per ordinal per problem).
-#   2. `google_service_account "problem_service_signer"` is the SA whose
-#      private key signs the V4 URLs. It needs `roles/storage.objectViewer`
-#      on the bucket — that's the scope embedded in the signed URLs.
-#   3. `google_service_account_key` mints a JSON key; the raw JSON is
-#      base64-decoded into a Secret Manager secret so the VM can fetch it on
-#      every boot. (The plaintext key sits in tfstate too — acceptable for
-#      this dev-grade setup; production should mint via Workload Identity
-#      Federation or use the IAM Signer API.)
-#   4. The control-plane VM's existing SA gets
-#      `roles/secretmanager.secretAccessor` so its startup script can pull
-#      the key into /opt/oj/gcs-signer.json (mode 0400).
-#
-# The compose file mounts /opt/oj/gcs-signer.json into problem-service at
-# /var/secrets/gcs-signer.json (ro), and GCS_SIGNER_KEY_PATH points at it.
+# Project-global resources (unchanged from the single-region setup). The
+# bucket location stays in the primary region; cross-region reads work fine
+# for the secondary-region problem-service. Signer key flows through Secret
+# Manager (auto-replication) so both VMs fetch it locally on each boot.
 
 resource "google_storage_bucket" "oj_test_cases" {
-  # GCS bucket names are GLOBAL. Suffixing with project ID keeps the name
-  # collision-free across forks of this terraform.
   name                        = "oj-test-cases-${var.project_id}"
-  location                    = upper(var.region)
+  location                    = upper(var.primary_region)
   storage_class               = "STANDARD"
   uniform_bucket_level_access = true
-  force_destroy               = true # dev-grade: let `tofu destroy` wipe contents
+  force_destroy               = true
 
   lifecycle_rule {
     condition {
@@ -387,18 +392,12 @@ resource "google_service_account" "problem_service_signer" {
   description  = "Whose private key signs short-lived GCS download URLs handed to the execution-worker."
 }
 
-# Signer needs READ on the bucket — that's the scope embedded in the signed
-# URLs. We do not give it object-create; uploads happen via the operator's
-# own credentials (`gcloud storage cp ...`) during problem seeding.
 resource "google_storage_bucket_iam_member" "signer_object_viewer" {
   bucket = google_storage_bucket.oj_test_cases.name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.problem_service_signer.email}"
 }
 
-# JSON key. Stored in tfstate (acceptable for this dev-grade setup; rotate by
-# tainting + re-applying). Tofu marks `private_key` as sensitive so it never
-# echoes to plan output.
 resource "google_service_account_key" "problem_service_signer_key" {
   service_account_id = google_service_account.problem_service_signer.name
   key_algorithm      = "KEY_ALG_RSA_2048"
@@ -419,11 +418,11 @@ resource "google_secret_manager_secret_version" "problem_service_signer_key_v1" 
   secret_data = base64decode(google_service_account_key.problem_service_signer_key.private_key)
 }
 
-# Control-plane SA can pull the signer JSON on every boot.
-resource "google_secret_manager_secret_iam_member" "control_plane_signer_accessor" {
+# Region SA can pull the signer JSON on every boot from either VM.
+resource "google_secret_manager_secret_iam_member" "region_signer_accessor" {
   secret_id = google_secret_manager_secret.problem_service_signer_key.id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.control_plane_sa.email}"
+  member    = "serviceAccount:${google_service_account.region_sa.email}"
 }
 
 # ---------- Auto-shutdown via Cloud Scheduler -------------------------------
@@ -439,22 +438,19 @@ resource "google_project_iam_member" "scheduler_instance_admin" {
   member  = "serviceAccount:${google_service_account.scheduler_sa.email}"
 }
 
-# Cloud Scheduler used to require an App Engine app in the project (the
-# notorious "appengine.applications.create" precondition). That requirement
-# was retired in 2022 for HTTP-target jobs — which is what we use — so we
-# create the scheduler jobs directly. The appengine.googleapis.com API can
-# stay disabled.
-
-resource "google_cloud_scheduler_job" "auto_shutdown_control_plane" {
-  name        = "oj-auto-shutdown-control-plane"
-  description = "Nightly stop of the control-plane VM (safety net)"
+# One auto-shutdown job per region VM. Each scheduler job lives in the same
+# region as the VM it stops — Cloud Scheduler is regional and the job's
+# region is independent of the target's region in the URI.
+resource "google_cloud_scheduler_job" "auto_shutdown_region_a" {
+  name        = "oj-auto-shutdown-region-a"
+  description = "Nightly stop of oj-region-a (safety net)"
   schedule    = var.auto_shutdown_cron
   time_zone   = var.auto_shutdown_timezone
-  region      = var.region
+  region      = local.regions.a.region
 
   http_target {
     http_method = "POST"
-    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.zone}/instances/${google_compute_instance.control_plane.name}/stop"
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${local.regions.a.zone}/instances/${google_compute_instance.oj_region_a.name}/stop"
 
     oauth_token {
       service_account_email = google_service_account.scheduler_sa.email
@@ -462,16 +458,16 @@ resource "google_cloud_scheduler_job" "auto_shutdown_control_plane" {
   }
 }
 
-resource "google_cloud_scheduler_job" "auto_shutdown_compute" {
-  name        = "oj-auto-shutdown-compute"
-  description = "Nightly stop of the compute VM (safety net)"
+resource "google_cloud_scheduler_job" "auto_shutdown_region_b" {
+  name        = "oj-auto-shutdown-region-b"
+  description = "Nightly stop of oj-region-b (safety net)"
   schedule    = var.auto_shutdown_cron
   time_zone   = var.auto_shutdown_timezone
-  region      = var.region
+  region      = local.regions.b.region
 
   http_target {
     http_method = "POST"
-    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.zone}/instances/${google_compute_instance.compute.name}/stop"
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${local.regions.b.zone}/instances/${google_compute_instance.oj_region_b.name}/stop"
 
     oauth_token {
       service_account_email = google_service_account.scheduler_sa.email

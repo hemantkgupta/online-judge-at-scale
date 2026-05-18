@@ -1,0 +1,324 @@
+# =============================================================================
+# Region VM compose stack — runs on EVERY region VM (oj-region-a + oj-region-b).
+#
+# Each VM hosts the FULL application stack: control plane services (Kafka,
+# CRDB, Redis, api-gateway, problem-service, contest-service, leaderboard-
+# service) plus compute services (sandbox-manager, execution-worker with
+# Firecracker / Docker / gVisor backends).
+#
+# CockroachDB joins the peer's CRDB node into a 2-node multi-region cluster.
+# Each broker runs as a single-broker Kafka per region (KRaft migration is
+# tracked in §2.7 of the roadmap). Topics are per-region:
+#   submissions.${REGION}.pretest, evaluated_results.${REGION}, etc.
+#
+# Cross-region traffic (CRDB Raft :26257, peer api-gateway redirects, peer
+# leaderboard fan-out) goes over the GCP private VPC via INTERNAL_IP /
+# PEER_INTERNAL_IP, gated by the oj-allow-cross-region firewall rule.
+#
+# Environment file (set by region.sh):
+#   REGION                     this VM's region (e.g. asia-south1)
+#   PEER_REGION                the other VM's region
+#   INTERNAL_IP                this VM's RFC1918 IP
+#   PEER_INTERNAL_IP           the other VM's RFC1918 IP
+#   KAFKA_HOST_EXTERNAL=${INTERNAL_IP}
+#   AR_URL                     Artifact Registry repo URL
+#   JWT_SECRET                 48-byte secret for api-gateway
+#   GCS_BUCKET, PROJECT_ID     for problem-service
+#   APP_SANDBOX_BACKEND etc.   sandbox backend selection
+# =============================================================================
+
+services:
+
+  # ---------- OpenTelemetry collector ---------------------------------------
+  # Receives OTLP from every JVM service on this VM. ADC from the GCE
+  # metadata server provides the SA credentials for Cloud Monitoring / Trace
+  # / Logging exporters (terraform binds the roles to the region SA).
+  oj-otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: oj-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - /opt/oj/otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "8888:8888"
+      - "13133:13133"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.5
+
+  # ---------- Kafka (single-broker per region, ZooKeeper for now) -----------
+  # Migration to KRaft is roadmap §2.7 — leaving Zookeeper here for parity
+  # with the existing setup. Topics are per-region; bootstrap script
+  # `infra/scripts/kafka-bootstrap-topics.sh` creates them on first run.
+  oj-zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: oj-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+
+  oj-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: oj-kafka
+    restart: unless-stopped
+    depends_on:
+      - oj-zookeeper
+    ports:
+      - "9092:9092"   # exposed on host LAN for cross-region in case ever needed
+      - "29092:29092" # advertised on the internal IP for in-region clients
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: oj-zookeeper:2181
+      # Two listeners:
+      #   PLAINTEXT (29092) — what api-gateway / execution-worker etc. on
+      #     THIS VM use, via the docker network host alias `oj-kafka`.
+      #   PLAINTEXT_HOST (9092) — advertised on the VM's internal IP for
+      #     potential cross-region reach (kept for parity with the previous
+      #     setup; not used by the per-region topic design).
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://oj-kafka:29092,PLAINTEXT_HOST://${KAFKA_HOST_EXTERNAL:-127.0.0.1}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # ---------- CockroachDB (2-node multi-region cluster) ---------------------
+  # Joins the peer over the GCP private VPC. --locality tags this node with
+  # its region so CRDB's replication and lease placement honour geography
+  # (relevant once we promote tables to REGIONAL BY ROW / GLOBAL).
+  #
+  # First-time bring-up runbook: SSH into EITHER VM after both are up and
+  # run `docker exec oj-cockroachdb cockroach init --insecure --host=localhost`
+  # — initialisation only needs to happen ONCE for the whole cluster.
+  oj-cockroachdb:
+    image: cockroachdb/cockroach:v24.1.10
+    container_name: oj-cockroachdb
+    restart: unless-stopped
+    command:
+      - start
+      - --insecure
+      - --advertise-addr=${INTERNAL_IP:?must set INTERNAL_IP via /opt/oj/.env}
+      - --listen-addr=0.0.0.0:26257
+      - --http-addr=0.0.0.0:8080
+      - --locality=region=${REGION:?must set REGION},zone=local
+      - --join=${INTERNAL_IP:?must set INTERNAL_IP}:26257,${PEER_INTERNAL_IP:?must set PEER_INTERNAL_IP}:26257
+      - --max-sql-memory=512MiB
+      - --cache=256MiB
+    ports:
+      - "26257:26257" # SQL + Raft (firewall scoped to cross-region subnets)
+      - "8080:8080"   # admin UI
+    volumes:
+      - cockroachdb-data:/cockroach/cockroach-data
+
+  oj-redis:
+    image: redis:7.2
+    container_name: oj-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # ---------- api-gateway ---------------------------------------------------
+  oj-api-gateway:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/api-gateway:latest
+    container_name: oj-api-gateway
+    restart: unless-stopped
+    depends_on:
+      - oj-kafka
+      - oj-cockroachdb
+      - oj-redis
+    ports:
+      - "8088:8088"
+    environment:
+      SERVER_PORT: 8088
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://oj-cockroachdb:26257/onlinejudge?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATA_REDIS_HOST: oj-redis
+      SPRING_DATA_REDIS_PORT: 6379
+      APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_BASELINE_VERSION:    "0"
+      # Multi-region wiring
+      APP_REGION:                  ${REGION:?must set REGION}
+      APP_PEER_REGION:             ${PEER_REGION:?must set PEER_REGION}
+      APP_PEER_GATEWAY_URL:        http://${PEER_INTERNAL_IP:?must set PEER_INTERNAL_IP}:8088
+      # Per-region Kafka topics (publisher routes to the submission's home region).
+      APP_KAFKA_TOPIC_PRETEST:           submissions.${REGION}.pretest
+      APP_KAFKA_TOPIC_EVALUATED-RESULTS: evaluated_results.${REGION}
+      APP_KAFKA_TOPIC_ANALYTICS:         analytics_events.${REGION}
+      APP_KAFKA_TOPIC_DLQ:               submissions.${REGION}.dlq
+      # OpenTelemetry
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-api-gateway
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+      # api-gateway carries more load than the smaller services — bigger heap.
+      JAVA_TOOL_OPTIONS: "-Xmx384m -XX:+ExitOnOutOfMemoryError"
+
+  # ---------- problem-service -----------------------------------------------
+  oj-problem-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/problem-service:latest
+    container_name: oj-problem-service
+    restart: unless-stopped
+    depends_on:
+      - oj-cockroachdb
+    ports:
+      - "8089:8089"
+    volumes:
+      - /opt/oj/gcs-signer.json:/var/secrets/gcs-signer.json:ro
+    environment:
+      SERVER_PORT: 8089
+      DB_URL: jdbc:postgresql://oj-cockroachdb:26257/onlinejudge?sslmode=disable
+      DB_USER: root
+      GCS_PROJECT_ID:        ${PROJECT_ID:-online-judge-hk}
+      GCS_BUCKET:            ${GCS_BUCKET:?must set GCS_BUCKET via /opt/oj/.env}
+      GCS_SIGNER_KEY_PATH:   /var/secrets/gcs-signer.json
+      APP_REGION:            ${REGION:?must set REGION}
+      APP_PEER_REGION:       ${PEER_REGION:?must set PEER_REGION}
+      JAVA_TOOL_OPTIONS:     "-Xmx256m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-problem-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+
+  # ---------- contest-service -----------------------------------------------
+  oj-contest-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/contest-service:latest
+    container_name: oj-contest-service
+    restart: unless-stopped
+    depends_on:
+      - oj-cockroachdb
+      - oj-kafka
+    ports:
+      - "8084:8084"
+    environment:
+      SERVER_PORT: 8084
+      SPRING_DATASOURCE_URL: jdbc:postgresql://oj-cockroachdb:26257/onlinejudge?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      APP_REGION:                ${REGION:?must set REGION}
+      APP_PEER_REGION:           ${PEER_REGION:?must set PEER_REGION}
+      # Default — the EW publisher overrides per submission based on the
+      # submission's home region. Contest-service still needs a sane default
+      # for its own initiated traffic.
+      APP_KAFKA_TOPIC_SYSTEM:    submissions.${REGION}.system
+      JAVA_TOOL_OPTIONS:         "-Xmx256m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-contest-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+
+  # ---------- leaderboard-service -------------------------------------------
+  oj-leaderboard-service:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/leaderboard-service:latest
+    container_name: oj-leaderboard-service
+    restart: unless-stopped
+    depends_on:
+      - oj-kafka
+      - oj-redis
+    ports:
+      - "8082:8082"
+    environment:
+      SERVER_PORT: 8082
+      SPRING_DATA_REDIS_HOST: oj-redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      APP_REGION:                          ${REGION:?must set REGION}
+      APP_PEER_REGION:                     ${PEER_REGION:?must set PEER_REGION}
+      APP_PEER_LEADERBOARD_URL:            http://${PEER_INTERNAL_IP:?must set PEER_INTERNAL_IP}:8082
+      APP_KAFKA_TOPIC_EVALUATED-RESULTS:   evaluated_results.${REGION}
+      JAVA_TOOL_OPTIONS:                   "-Xmx256m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-leaderboard-service
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+
+  # ---------- sandbox-manager (privileged: KVM + Firecracker) ---------------
+  oj-sandbox-manager:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/sandbox-manager:latest
+    container_name: oj-sandbox-manager
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    volumes:
+      - /usr/local/bin/firecracker:/usr/local/bin/firecracker:ro
+      - /var/lib/firecracker:/var/lib/firecracker:ro
+      - /tmp:/tmp
+    environment:
+      APP_FIRECRACKER_BINARY:        /usr/local/bin/firecracker
+      APP_FIRECRACKER_KERNEL_IMAGE:  /var/lib/firecracker/vmlinux
+      APP_FIRECRACKER_ROOTFS_IMAGE:  /var/lib/firecracker/rootfs.ext4
+      APP_FIRECRACKER_API_SOCK_DIR:  /tmp
+      APP_FIRECRACKER_VSOCK_UDS_DIR: /tmp
+      APP_AGENT_VSOCK_CLIENT:        /usr/local/bin/oj-vsock-client
+      APP_REGION:                    ${REGION:?must set REGION}
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-sandbox-manager
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+
+  # ---------- execution-worker ----------------------------------------------
+  oj-execution-worker:
+    image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
+    container_name: oj-execution-worker
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp
+      - /etc/seccomp:/etc/seccomp:ro
+    depends_on:
+      - oj-sandbox-manager
+      - oj-kafka
+      - oj-cockroachdb
+      - oj-problem-service
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://oj-cockroachdb:26257/onlinejudge?sslmode=disable
+      SPRING_DATASOURCE_USERNAME: root
+      APP_SANDBOX_BACKEND:                 ${APP_SANDBOX_BACKEND:-firecracker}
+      APP_SANDBOX_DOCKER_RUNTIME:          ${APP_SANDBOX_DOCKER_RUNTIME:-runc}
+      APP_SANDBOX_LINUX_HARDENING_ENABLED: ${APP_SANDBOX_LINUX_HARDENING_ENABLED:-false}
+      APP_SANDBOX_MANAGER_URL:             http://oj-sandbox-manager:9100
+      # Multi-region wiring
+      APP_REGION:                          ${REGION:?must set REGION}
+      APP_PEER_REGION:                     ${PEER_REGION:?must set PEER_REGION}
+      # problem-service is now LOCAL on every VM — service discovery via docker DNS.
+      APP_PROBLEM_SERVICE_REQUIRED:        ${APP_PROBLEM_SERVICE_REQUIRED:-true}
+      APP_PROBLEM_SERVICE_URL:             ${APP_PROBLEM_SERVICE_URL:-http://oj-problem-service:8089}
+      # Per-region topics
+      APP_KAFKA_TOPIC_PRETEST:             submissions.${REGION}.pretest
+      APP_KAFKA_TOPIC_SYSTEM:              submissions.${REGION}.system
+      APP_KAFKA_TOPIC_EVALUATED-RESULTS:   evaluated_results.${REGION}
+      APP_KAFKA_TOPIC_ANALYTICS:           analytics_events.${REGION}
+      APP_KAFKA_TOPIC_DLQ:                 submissions.${REGION}.dlq
+      JAVA_TOOL_OPTIONS:                   "-Xmx384m -XX:+ExitOnOutOfMemoryError"
+      OTEL_JAVAAGENT_ENABLED:      ${OTEL_JAVAAGENT_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://oj-otel-collector:4317}
+      OTEL_SERVICE_NAME:           oj-execution-worker
+      OTEL_RESOURCE_ATTRIBUTES:    deployment.environment=gcp,region=${REGION}
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  cockroachdb-data:
+  redis-data:
