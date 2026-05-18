@@ -1,0 +1,29 @@
+{
+  "displayName": "OJ — accept → verdict p99 latency > 30 s",
+  "documentation": {
+    "content": "End-to-end p99 latency from submission accepted at the API gateway to verdict published on `evaluated_results` is above 30 s, sustained for 5 minutes. The submission funnel dashboard breaks this down into the four span segments — start there. Common causes: sandbox pool depleted (see the sandbox-pool-depth dashboard), Kafka consumer-lag spike on `execution-worker.pretest`, CRDB outbox flush stalled.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "p99 of (verdict.publish - submission.accept) > 30 s",
+      "conditionThreshold": {
+        "filter": "metric.type=\"prometheus.googleapis.com/oj_submission_to_verdict_latency_seconds/histogram\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 30,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA",
+            "crossSeriesReducer": "REDUCE_PERCENTILE_99"
+          }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "1800s" },
+  "enabled": true,
+  "notificationChannels": []
+}

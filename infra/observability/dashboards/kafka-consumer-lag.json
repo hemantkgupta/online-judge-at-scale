@@ -1,0 +1,108 @@
+{
+  "displayName": "OJ — Kafka consumer lag",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "execution-worker.pretest — lag per partition",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (partition) (kafka_consumer_lag{consumer_group=\"execution-worker.pretest\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p${partition}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "execution-worker.system — lag per partition",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (partition) (kafka_consumer_lag{consumer_group=\"execution-worker.system\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p${partition}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "leaderboard-service.evaluated — lag per partition",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (partition) (kafka_consumer_lag{consumer_group=\"leaderboard-service.evaluated\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p${partition}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "xPos": 6,
+        "yPos": 4,
+        "width": 6,
+        "height": 4,
+        "widget": {
+          "title": "analytics-clickhouse — lag per partition",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (partition) (kafka_consumer_lag{consumer_group=\"analytics-clickhouse\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "p${partition}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 8,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "Total lag across all groups (alert source)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (consumer_group) (kafka_consumer_lag)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${consumer_group}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      }
+    ]
+  }
+}

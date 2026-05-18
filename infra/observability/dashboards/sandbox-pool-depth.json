@@ -1,0 +1,101 @@
+{
+  "displayName": "OJ — Sandbox pool depth per language",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "python — warm pool",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(sandbox_pool_ready{language=\"python\"})"
+            },
+            "thresholds": [
+              { "value": 1, "color": "YELLOW", "direction": "BELOW" },
+              { "value": 0, "color": "RED",    "direction": "BELOW" }
+            ],
+            "gaugeView": { "lowerBound": 0, "upperBound": 4 }
+          }
+        }
+      },
+      {
+        "xPos": 4,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "cpp — warm pool",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(sandbox_pool_ready{language=\"cpp\"})"
+            },
+            "thresholds": [
+              { "value": 1, "color": "YELLOW", "direction": "BELOW" },
+              { "value": 0, "color": "RED",    "direction": "BELOW" }
+            ],
+            "gaugeView": { "lowerBound": 0, "upperBound": 4 }
+          }
+        }
+      },
+      {
+        "xPos": 8,
+        "width": 4,
+        "height": 4,
+        "widget": {
+          "title": "java — warm pool",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "prometheusQuery": "sum(sandbox_pool_ready{language=\"java\"})"
+            },
+            "thresholds": [
+              { "value": 1, "color": "YELLOW", "direction": "BELOW" },
+              { "value": 0, "color": "RED",    "direction": "BELOW" }
+            ],
+            "gaugeView": { "lowerBound": 0, "upperBound": 4 }
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "Pool depth over time (per language)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (language) (sandbox_pool_ready)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${language}"
+              }
+            ],
+            "yAxis": { "label": "warm microVMs", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 8,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "Active leases (per language)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (language) (sandbox_leases_active)"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${language}"
+              }
+            ],
+            "yAxis": { "label": "active leases", "scale": "LINEAR" }
+          }
+        }
+      }
+    ]
+  }
+}
