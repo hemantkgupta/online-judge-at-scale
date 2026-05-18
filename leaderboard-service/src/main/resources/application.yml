@@ -21,11 +21,26 @@ spring:
       enable-auto-commit: true           # fire-and-forget; missed verdicts fall back to HTTP polling
 
 app:
+  # Region this instance lives in. Stamped on emitted metrics and used to derive
+  # the per-region Kafka topic + consumer group below. Each region has its own
+  # broker(s); leaderboard-service in region X consumes only evaluated_results.X.
+  region: ${APP_REGION:asia-south1}
+
+  # Peer leaderboard URL — sibling region's leaderboard-service base URL
+  # (e.g. http://oj-leaderboard-us-central1:8082). When blank, the global=true
+  # fan-out gracefully degrades to local-only with X-Peer-Region-Unreachable: true.
+  # Wired by the terraform / compose layer; not hardcoded here.
+  peer-leaderboard:
+    url: ${APP_PEER_LEADERBOARD_URL:}
+
   leaderboard:
     default-page-size: 100
   kafka:
+    consumer-group: leaderboard-verdict-push
     topic:
-      evaluated-results: evaluated_results
+      # Per-region verdict source. Two regions → two topics; this instance
+      # only subscribes to its own. e.g. evaluated_results.asia-south1.
+      evaluated-results: evaluated_results.${app.region}
   # Read-replica routing (Part 9 of the blog).
   #   - host/port left empty → reads fall through to the primary (single-node mode).
   #   - With a replica running (docker-compose redis-replica on :6380), set

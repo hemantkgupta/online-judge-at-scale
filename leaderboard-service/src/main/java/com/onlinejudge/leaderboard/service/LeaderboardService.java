@@ -1,6 +1,7 @@
 package com.onlinejudge.leaderboard.service;
 
 import com.onlinejudge.common.sharding.ScoreRangeShardRouter;
+import com.onlinejudge.leaderboard.dto.LeaderboardEntry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
@@ -180,6 +181,26 @@ public class LeaderboardService {
         result.put("points", zsetScore != null ? decodePoints(zsetScore) : 0);
         result.put("penaltyMinutes", zsetScore != null ? decodePenalty(zsetScore) : 0);
         return result;
+    }
+
+    /**
+     * Returns a leaderboard page as typed {@link LeaderboardEntry} rows (no region tag).
+     * Thin adapter over {@link #getLeaderboardPage(String, int, int)} for the
+     * cross-region merge path in the controller. The {@code region} field is
+     * left null here; the caller stamps it.
+     */
+    public List<LeaderboardEntry> getTop(String contestId, int page, int size) {
+        List<Map<String, Object>> raw = getLeaderboardPage(contestId, page, size);
+        List<LeaderboardEntry> out = new ArrayList<>(raw.size());
+        for (Map<String, Object> row : raw) {
+            long rank = ((Number) row.get("rank")).longValue();
+            String userId = (String) row.get("userId");
+            Double zsetScore = (Double) row.get("zsetScore");
+            long points = ((Number) row.get("points")).longValue();
+            long penalty = ((Number) row.get("penaltyMinutes")).longValue();
+            out.add(new LeaderboardEntry(rank, userId, zsetScore, points, penalty, null));
+        }
+        return out;
     }
 
     /** Total participants on the leaderboard: sum of ZCARD across all shards. */

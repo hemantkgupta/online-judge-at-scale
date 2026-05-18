@@ -55,9 +55,15 @@ public class VerdictPushConsumer {
     private final ObjectMapper objectMapper;
     private final VerdictConnectionRegistry connectionRegistry;
 
+    // Group is region-namespaced so two regions' leaderboard-services do NOT
+    // share a consumer group. If they did, Kafka would partition-rebalance
+    // across regions and the verdict for a user in region-A could land in
+    // region-B's leaderboard-service, which has no WebSocket session for that
+    // user — silently broken. Sticky-region routing requires sticky-region
+    // consumer groups. The topic is also per-region (see application.yml).
     @KafkaListener(
             topics = "${app.kafka.topic.evaluated-results}",
-            groupId = "leaderboard-verdict-push"
+            groupId = "${app.kafka.consumer-group:leaderboard-verdict-push}-${app.region}"
     )
     public void onVerdict(ConsumerRecord<String, byte[]> record) {
         try {

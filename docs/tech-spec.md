@@ -790,7 +790,14 @@ Topics are created by [`infra/scripts/kafka-bootstrap-topics.sh --region <name>`
 
 ### 12.3 Leaderboard global view
 
-Leaderboard reads are global — a contestant in asia-south1 sees the same ordering as one in us-central1. The leaderboard-service subscribes to **both** regions' `evaluated_results` topics and updates the same Redis ZSET keys. Writes to Redis stay in the local region (each region has its own Redis primary); the leaderboard-service fan-out to the peer happens via `${APP_PEER_LEADERBOARD_URL}` for the WebSocket push. Details in §4.6 + the [leaderboard-service owner page](./services/leaderboard-service.md).
+Leaderboard reads can be region-local (default) or global. Each region's leaderboard-service consumes **only its own** `evaluated_results.<region>` topic and writes to its own Redis ZSET — there is no cross-region Kafka subscription. The global view is layered on top via HTTP fan-out:
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /api/v1/leaderboard/{contestId}?global=false` (default) | Returns this region's ZSET only. This is also the path the peer hits in step 2 below. |
+| `GET /api/v1/leaderboard/{contestId}?global=true` | The controller first reads its own region's ZSET, then issues an HTTP `GET` to `${app.peer-leaderboard.url}/api/v1/leaderboard/{contestId}?global=false` with a 5 s read timeout, merges the two pages by score, and returns the combined view. On peer failure (timeout, 5xx, URL blank), the response degrades to local-only with header `X-Peer-Region-Unreachable: true`. |
+
+Topics are created per region by [`infra/scripts/kafka-bootstrap-topics.sh --region <name>`](https://github.com/hemantkgupta/online-judge-at-scale/blob/main/infra/scripts/kafka-bootstrap-topics.sh). Details in §4.6 + the [leaderboard-service owner page](./services/leaderboard-service.md).
 
 ### 12.4 What's live today vs deferred
 
@@ -800,7 +807,7 @@ Leaderboard reads are global — a contestant in asia-south1 sees the same order
 | JWT region claim + 307 mismatch redirect | **Live** — `RegionMismatchFilter` + `JwtTokenProvider.extractRegion` |
 | Per-region Kafka topic naming | **Live** — `submissions.<region>.{pretest,system}`, `contest_events.<region>`, `evaluated_results.<region>` |
 | Worker region affinity | **Live** — `app.region` env var drives the topic subscription |
-| Leaderboard global view via dual subscription | **Live** — leaderboard-service consumes both regions' `evaluated_results` |
+| Leaderboard global view via peer HTTP merge | **Live** — `?global=true` fans out to peer; degrades gracefully on failure |
 | Region-aware system-test replay | **Live** — `SystemTestReplayPublisher` reads `row.region` and routes per row |
 | GCS Cloud DNS geo-routed entry | **Deferred** — clients today talk to a region's external IP directly; multi-region DNS is a §3.x roadmap item |
 | 3-broker Kafka / 3-node CRDB per region | **Deferred** — single-broker / single-node per region; RF=1 today, RF=3 after the cluster bump (see §14) |
