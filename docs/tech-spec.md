@@ -724,19 +724,19 @@ scoring-pipeline is explicitly excluded from the build-and-push matrix — it ha
 
 ## 11. Operations
 
-### 11.1 Common runbooks (planned, not yet authored)
+### 11.1 Common runbooks
 
-Per the roadmap, one Markdown file per canonical incident:
+One Markdown file per canonical incident under [`docs/runbooks/`](./runbooks/). Each follows the same shape as [`runbooks/multi-region.md`](./runbooks/multi-region.md): when-to-run, detection, diagnosis, mitigation, rollback, related incidents, escalation.
 
-| Incident | Trigger | First diagnostic step | Mitigation |
-|---|---|---|---|
-| Kafka broker died | producer errors, consumer lag spike | `docker exec oj-kafka kafka-broker-api-versions` | restart container; for the 3-broker future, ISR validation |
-| CRDB lease lost | api-gateway 503s, error log "lost connection" | `cockroach node status` | restart cockroachdb container |
-| Warm pool empty > 30 s | `sandbox.pool.ready{language=X} == 0` alert | sandbox-manager logs for "Failed to provision" | inspect KVM availability; restart SM |
-| Firecracker jailer chroot failure | SM logs "jailer exec failed" | `dmesg` for kernel-side errors | rebuild rootfs |
-| Signer key rotated, problem-service 401-ing | worker `test-case GET HTTP 401` | check `/opt/oj/gcs-signer.json` exists + is non-zero | re-fetch from Secret Manager |
+| Incident | Trigger | First diagnostic step | Mitigation | Runbook |
+|---|---|---|---|---|
+| Kafka broker died | producer errors, consumer lag spike | `docker exec oj-kafka kafka-broker-api-versions` | restart container; for the 3-broker future, ISR validation | [`runbooks/kafka-broker-down.md`](./runbooks/kafka-broker-down.md) |
+| CRDB lease lost | api-gateway 503s, error log "lost connection" | `cockroach node status` | restart cockroachdb container | [`runbooks/crdb-lease-lost.md`](./runbooks/crdb-lease-lost.md) |
+| Warm pool empty > 30 s | `sandbox.pool.ready{language=X} == 0` alert | sandbox-manager logs for "Failed to provision" | inspect KVM availability; restart SM | [`runbooks/warm-pool-empty.md`](./runbooks/warm-pool-empty.md) |
+| Firecracker jailer chroot failure | SM logs "jailer exec failed" | `dmesg` for kernel-side errors | rebuild rootfs | [`runbooks/firecracker-jailer-failure.md`](./runbooks/firecracker-jailer-failure.md) |
+| Signer key rotated, problem-service 401-ing | worker `test-case GET HTTP 401` | check `/opt/oj/gcs-signer.json` exists + is non-zero | re-fetch from Secret Manager | [`runbooks/signer-key-rotated.md`](./runbooks/signer-key-rotated.md) |
 
-None of these are written yet. Roadmap item §3.14.
+Multi-region CRDB bring-up + per-region incidents are covered separately in [`runbooks/multi-region.md`](./runbooks/multi-region.md). Roadmap §3.14 (common runbooks) is now closed.
 
 ### 11.2 SPOT preemption (compute VM)
 
