@@ -20,6 +20,18 @@ dependencies {
     // inputs/expected-outputs. Matches the version Workstreams A + G use.
     implementation 'com.google.cloud:google-cloud-storage:2.40.1'
 
+    // L5 (tech-spec §5.1): the worker accepts s3:// + r2:// source-code
+    // URLs in addition to data:/gs://. R2 uses the same S3 API with a
+    // different endpoint, so a single AWS SDK dep covers both schemes.
+    // NOTE: this adds ~12-15 MB to the shaded jar (S3 client + transitives).
+    // If multi-cloud is out of scope for a deployment, set
+    // app.source.s3.enabled=false and leave app.source.r2.endpoint unset
+    // and the beans are not instantiated — but the jar bloat is unavoidable
+    // at compile time. The http(s):// scheme uses java.net.http (JDK-built-in)
+    // and has zero classpath cost.
+    implementation platform('software.amazon.awssdk:bom:2.25.30')
+    implementation 'software.amazon.awssdk:s3'
+
     // OpenTelemetry API on the runtime classpath. The -javaagent jar does
     // auto-instrumentation but does NOT expose its bundled API classes to
     // the application classloader; WorkerMetrics's API imports would

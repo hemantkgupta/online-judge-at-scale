@@ -2,6 +2,8 @@ package com.onlinejudge.worker.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.common.events.Events.SubmissionEvent;
+import com.onlinejudge.worker.service.source.SourceCodeResolver;
+import com.onlinejudge.worker.service.source.UnsupportedSourceSchemeException;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -27,8 +29,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SubmissionEnvelopeTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    // Pass a data:-only resolver: the consumer in this test exercises the
+    // parseSubmissionEvent / data:-URL paths only, so no remote fetchers
+    // are required. The resolver tolerates null fetchers by raising
+    // UnsupportedSourceSchemeException — which is exactly what the
+    // local:// regression check below asserts.
+    private final SourceCodeResolver resolver = new SourceCodeResolver(null, null, null, null);
     private final SubmissionConsumer consumer = new SubmissionConsumer(
-            null, null, null, objectMapper, null, null, null);
+            null, null, null, objectMapper, null, resolver, null);
 
     @Test
     void protoBytes_areParsedDirectly() throws Exception {
@@ -98,8 +106,11 @@ class SubmissionEnvelopeTest {
 
     @Test
     void localUrlWithoutEmbeddedSource_isRejected() {
+        // local:// is structurally invalid (no embedded source). The resolver
+        // surfaces it as UnsupportedSourceSchemeException so the consumer's
+        // catch-all path routes it to the DLQ on attempts-cap exhaustion.
         assertThatThrownBy(() -> consumer.resolveSourceCode("local://submissions/1/code"))
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("data: URLs");
+                .isInstanceOf(UnsupportedSourceSchemeException.class)
+                .hasMessageContaining("data:");
     }
 }

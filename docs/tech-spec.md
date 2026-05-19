@@ -251,7 +251,7 @@ The canonical wire on Kafka. Schema in `common/src/main/proto/events.proto`. pro
 | 2 | `user_id` | string | UUID; used as Kafka key for partitioning. |
 | 3 | `problem_id` | string | UUID; lookup key into problem-service. |
 | 4 | `contest_id` | string | UUID; empty string when not contest-scoped. |
-| 5 | `s3_code_url` | string | Where to fetch the contestant source. Schemes: `data:` (inline, for smoke tests), `gs://` (production), `s3://`/`r2://`/`http(s)://` (TODO). |
+| 5 | `s3_code_url` | string | Where to fetch the contestant source. Schemes: `data:` (inline, for smoke tests), `gs://` (GCP production), `s3://` (AWS), `r2://` (Cloudflare R2), `http(s)://` (authenticated HTTPS proxy / partner LMS). All schemes share a single tech-spec §7.2 size-cap path; dispatch lives in `execution-worker`'s `SourceCodeResolver`. |
 | 6 | `language` | string | `python`/`java`/`cpp`. |
 | 7 | `gateway_ts_ms` | int64 | Wall-clock at gateway accept; used downstream for late-arrival ordering in Flink. |
 | 8 | `region` | string | Region the api-gateway pod was pinned to; becomes the REGIONAL BY ROW key on the CRDB write (multi-region future). |
