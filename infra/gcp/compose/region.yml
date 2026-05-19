@@ -357,6 +357,12 @@ services:
     image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/execution-worker:latest
     container_name: oj-execution-worker
     restart: unless-stopped
+    # Tech-spec §11.2 — bind the SPOT preempt-drain endpoint to the VM's
+    # loopback only. 127.0.0.1:8083 → container 8083 keeps the endpoint
+    # off the VM's external interface; spot-preempt-drain.sh on the host
+    # POSTs to http://127.0.0.1:8083/actuator/preempt-drain.
+    ports:
+      - "127.0.0.1:8083:8083"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp:/tmp
@@ -386,6 +392,14 @@ services:
       APP_KAFKA_TOPIC_EVALUATED-RESULTS:   evaluated_results.${REGION}
       APP_KAFKA_TOPIC_ANALYTICS:           analytics_events.${REGION}
       APP_KAFKA_TOPIC_DLQ:                 submissions.${REGION}.dlq
+      # Tech-spec §11.2 — SPOT preempt drain. Bind 0.0.0.0 inside the
+      # container so the published 127.0.0.1:8083 host port reaches us;
+      # the host-side bind on the compose ports line is what keeps this
+      # off the external interface. APP_PREEMPT_TOKEN must come from the
+      # operator's .env (Secret Manager) — blank disables the endpoint.
+      APP_PREEMPT_ENDPOINT_HOST:           0.0.0.0
+      APP_PREEMPT_ENDPOINT_PORT:           8083
+      APP_PREEMPT_TOKEN:                   ${APP_PREEMPT_TOKEN:-}
       JAVA_TOOL_OPTIONS:                   "-Xmx384m -XX:+ExitOnOutOfMemoryError"
       <<: *otel-defaults
       OTEL_SERVICE_NAME: oj-execution-worker

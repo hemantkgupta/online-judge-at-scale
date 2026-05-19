@@ -8,6 +8,7 @@ import com.onlinejudge.common.events.Events.PerTestVerdict;
 import com.onlinejudge.common.events.Events.SubmissionEvent;
 import com.onlinejudge.common.events.Events.VerdictEvent;
 import com.onlinejudge.worker.observability.WorkerMetrics;
+import com.onlinejudge.worker.preempt.InFlightTracker;
 import com.onlinejudge.worker.service.AgentClient.PerTestResult;
 import com.onlinejudge.worker.service.ExecutionBackend;
 import com.onlinejudge.worker.service.GcsClient;
@@ -79,6 +80,12 @@ public class SubmissionConsumer {
     private final GcsClient gcsClient;
     /** Workstream B: resolves test-case URLs and SHA-256s expected outputs. Nullable in tests. */
     private final TestCaseFetcher testCaseFetcher;
+    /**
+     * Tech-spec §11.2 — bookkeeping for the SPOT preempt drain. Nullable in
+     * unit tests that don't exercise the drain path; null is treated as
+     * "no-op tracker" by the consumer.
+     */
+    private final InFlightTracker inFlightTracker;
 
     @Value("${app.kafka.topic.evaluated-results}")
     private String evaluatedResultsTopic;
@@ -232,6 +239,13 @@ public class SubmissionConsumer {
                 return;
             }
 
+            // Tech-spec §11.2 — record the in-flight submission so the SPOT
+            // preempt drain can publish a WORKER_PREEMPTED verdict if the
+            // VM is reclaimed before execute() returns. Deregistration is
+            // mirrored on every exit branch below.
+            registerInFlight(submissionId, userId, problemId, contestId, region, phase,
+                    gatewayTsMs, claim.leaseStartedAt());
+
             ExecutionBackend.ExecutionResult result;
             try {
                 result = executionService.execute(
@@ -244,6 +258,7 @@ public class SubmissionConsumer {
                 // gets a fresh CLAIMED row and the attempts cap doesn't
                 // burn for resource-shortage retries.
                 idempotencyService.releaseClaim(submissionId, phase, claim.leaseStartedAt());
+                deregisterInFlight(submissionId, phase);
                 long backoff = Math.max(50L, pex.retryAfterMs());
                 ack.nack(Duration.ofMillis(backoff));
                 log.warn("[worker:{}] Pool exhausted submission={} retryAfterMs={}",
@@ -325,13 +340,38 @@ public class SubmissionConsumer {
             if (!idempotencyService.markCompleted(submissionId, phase, claim.leaseStartedAt())) {
                 throw new IllegalStateException("Lost idempotency claim before completion");
             }
+            deregisterInFlight(submissionId, phase);
             ack.acknowledge();
 
         } catch (Exception ex) {
             log.error("[worker:{}] Error processing submission={}: {}",
                     phase, submissionId, ex.getMessage(), ex);
+            if (submissionId != null) {
+                // The in-flight slot is cleared on the error path too — the
+                // preempt drain only owns submissions whose verdict is still
+                // genuinely possible. A redelivery will re-register.
+                deregisterInFlight(submissionId, phase);
+            }
             ack.nack(Duration.ofSeconds(5));
         }
+    }
+
+    private void registerInFlight(String submissionId, String userId, String problemId,
+                                  String contestId, String region, String phase,
+                                  long gatewayTsMs, java.time.Instant leaseStartedAt) {
+        if (inFlightTracker == null) {
+            return;
+        }
+        inFlightTracker.register(new InFlightTracker.InFlightSubmission(
+                submissionId, userId, problemId, contestId, region, phase,
+                gatewayTsMs, leaseStartedAt));
+    }
+
+    private void deregisterInFlight(String submissionId, String phase) {
+        if (inFlightTracker == null) {
+            return;
+        }
+        inFlightTracker.deregister(submissionId, phase);
     }
 
     /**

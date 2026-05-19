@@ -1,0 +1,51 @@
+# oj-preempt-drain.service — SPOT preemption drain hook for oj-compute.
+#
+# Tech-spec §11.2. GCP delivers SIGTERM to PID 1 about 30 s before
+# reclaiming a SPOT VM. systemd treats that as a system-wide stop, which
+# stops every active unit. By BindsTo=oj-region.service + Before=, this
+# unit guarantees its ExecStop runs before the docker-compose stack (and
+# the execution-worker container) is torn down.
+#
+# Type=oneshot + RemainAfterExit=yes is the canonical pattern for "do
+# nothing on start, do work on stop": systemctl start brings the unit to
+# active; the ExecStop= hook fires when the unit is stopped or when the
+# system is shutting down.
+#
+# Deploy:
+#   sudo cp infra/gcp/systemd/oj-preempt-drain.service /etc/systemd/system/
+#   sudo cp infra/gcp/scripts/spot-preempt-drain.sh /opt/oj/bin/
+#   sudo chmod 0755 /opt/oj/bin/spot-preempt-drain.sh
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now oj-preempt-drain.service
+#
+# Verify: `systemctl stop oj-preempt-drain.service` and check
+# `journalctl -u oj-preempt-drain --since '1m ago'` — the drain
+# should print its JSON summary.
+
+[Unit]
+Description=Drain execution-worker in-flight submissions before SPOT preemption
+# Run before the compose stack stops so the worker is still alive to receive
+# the loopback POST. Both lines are needed: BindsTo couples lifecycle, Before
+# enforces ordering on the stop edge.
+BindsTo=oj-region.service
+Before=oj-region.service
+# Don't bother trying to drain if the worker container never came up.
+After=oj-region.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# /opt/oj/.env is written by the startup script (infra/gcp/startup/region.sh.tpl)
+# from Secret Manager. APP_PREEMPT_TOKEN MUST be present there — without it
+# the drain script exits 0 without doing anything (endpoint is disabled).
+EnvironmentFile=-/opt/oj/.env
+ExecStart=/bin/true
+ExecStop=/opt/oj/bin/spot-preempt-drain.sh
+# Bounded by the script's --max-time (28 s) so systemd won't wait past
+# the GCP preempt window.
+TimeoutStopSec=30s
+# Drain failures are loud but non-blocking — the VM is going away regardless.
+SuccessExitStatus=0 2 3 4
+
+[Install]
+WantedBy=multi-user.target
