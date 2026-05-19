@@ -69,6 +69,27 @@ app:
   idempotency:
     processing-lease-seconds: 300
     max-attempts: 5
+
+  # Tech-spec §11.2 / roadmap §3.8 — SPOT preemption drain.
+  #
+  # On GCP, oj-compute is a SPOT VM: Google can reclaim it with 30 s notice.
+  # A systemd unit (infra/gcp/systemd/oj-preempt-drain.service) catches that
+  # signal and POSTs to the loopback endpoint below; the worker stops
+  # pulling from Kafka, publishes WORKER_PREEMPTED verdicts for every
+  # in-flight submission, then exits cleanly.
+  #
+  # The endpoint is bound to 127.0.0.1 only (PreemptDrainEndpoint refuses
+  # to start on a non-loopback host) and requires the shared-secret
+  # X-Preempt-Token header. Blank APP_PREEMPT_TOKEN disables the endpoint
+  # entirely — that's the default for unit tests and the local dev compose.
+  preempt:
+    drain-timeout-ms: 25000          # GCP gives 30 s; leave 5 s for stop overhead
+    listener-stop-ms: 5000
+    endpoint:
+      host: 127.0.0.1
+      port: 8082
+      path: /actuator/preempt-drain
+      token: ${APP_PREEMPT_TOKEN:}   # operator secret; unset → endpoint disabled
   execution:
     timeout-seconds: 5
     memory-limit-mb: 256

@@ -261,8 +261,84 @@ TimeoutStartSec=900
 WantedBy=multi-user.target
 UNIT
 
+# ---------- SPOT preemption drain hook --------------------------------------
+# Tech-spec §11.2 / roadmap §3.8 — on GCP SPOT VMs Google gives 30 s notice
+# before reclaim. The oj-preempt-drain.service unit catches that stop edge
+# and POSTs to the worker's loopback endpoint so in-flight submissions get
+# a WORKER_PREEMPTED verdict instead of stale-reclaiming into the DLQ.
+#
+# The script + unit are version-controlled at:
+#   infra/gcp/scripts/spot-preempt-drain.sh
+#   infra/gcp/systemd/oj-preempt-drain.service
+# and dropped here verbatim. APP_PREEMPT_TOKEN must already be in /opt/oj/.env
+# (added below) for the endpoint to actually be live.
+install -d -m 0755 /opt/oj/bin
+
+cat > /opt/oj/bin/spot-preempt-drain.sh <<'DRAIN'
+#!/usr/bin/env bash
+set -uo pipefail
+ENDPOINT_HOST="$${APP_PREEMPT_HOST:-127.0.0.1}"
+ENDPOINT_PORT="$${APP_PREEMPT_PORT:-8083}"
+ENDPOINT_PATH="$${APP_PREEMPT_PATH:-/actuator/preempt-drain}"
+TOKEN="$${APP_PREEMPT_TOKEN:-}"
+TIMEOUT_S="$${APP_PREEMPT_CURL_TIMEOUT:-28}"
+if [ -z "$TOKEN" ]; then
+    echo "[preempt-drain] APP_PREEMPT_TOKEN not set — skipping" >&2
+    exit 0
+fi
+URL="http://$${ENDPOINT_HOST}:$${ENDPOINT_PORT}$${ENDPOINT_PATH}"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+HTTP_CODE="$(curl -sS -o "$TMP" -w '%{http_code}' \
+    --max-time "$TIMEOUT_S" \
+    -X POST \
+    -H "X-Preempt-Token: $${TOKEN}" \
+    -H "Content-Length: 0" \
+    "$URL" || echo "000")"
+case "$HTTP_CODE" in
+    200) cat "$TMP"; echo; echo "[preempt-drain] OK" ;;
+    401) echo "[preempt-drain] FAIL: 401 unauthorized" >&2; exit 2 ;;
+    000) echo "[preempt-drain] FAIL: endpoint unreachable" >&2; exit 3 ;;
+    *)   echo "[preempt-drain] FAIL: HTTP $HTTP_CODE" >&2; cat "$TMP" >&2 || true; exit 4 ;;
+esac
+DRAIN
+chmod 0755 /opt/oj/bin/spot-preempt-drain.sh
+
+cat > /etc/systemd/system/oj-preempt-drain.service <<'UNIT'
+[Unit]
+Description=Drain execution-worker in-flight submissions before SPOT preemption
+BindsTo=oj-region.service
+Before=oj-region.service
+After=oj-region.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/opt/oj/.env
+ExecStart=/bin/true
+ExecStop=/opt/oj/bin/spot-preempt-drain.sh
+TimeoutStopSec=30s
+SuccessExitStatus=0 2 3 4
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Bootstrap APP_PREEMPT_TOKEN. We re-use jwt_secret as a sufficiently-random
+# shared secret — the same terraform output that gates the gateway's JWT
+# signing key is fine for a single-VM-local trigger, since the only thing
+# the token guards is the loopback endpoint on this VM.
+# Operators wanting a distinct secret can override APP_PREEMPT_TOKEN_OVERRIDE
+# in terraform; until then this stays in lock-step with the existing
+# Secret-Manager backed rotation cadence (see roadmap §3.3 / §3.4).
+if ! grep -q '^APP_PREEMPT_TOKEN=' /opt/oj/.env; then
+  echo "APP_PREEMPT_TOKEN=${jwt_secret}" >> /opt/oj/.env
+fi
+
 systemctl daemon-reload
 systemctl enable oj-region.service
+systemctl enable oj-preempt-drain.service
 systemctl restart oj-region.service
+systemctl restart oj-preempt-drain.service
 
 echo "[oj-startup] $(date -Iseconds) — region.sh done"

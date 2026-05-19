@@ -101,7 +101,8 @@ class SubmissionConsumerRegionTest {
                 new com.fasterxml.jackson.databind.ObjectMapper(),
                 metrics,
                 /* gcsClient */ null,
-                /* testCaseFetcher */ null);
+                /* testCaseFetcher */ null,
+                /* inFlightTracker */ null);
 
         // Inject @Value-bound fields by reflection — simulates Spring's
         // post-construction property binding from a us-central1 environment.
@@ -178,7 +179,7 @@ class SubmissionConsumerRegionTest {
                 idempotency, backend, kafkaTemplate,
                 new com.fasterxml.jackson.databind.ObjectMapper(),
                 mock(WorkerMetrics.class),
-                null, null);
+                null, null, null);
 
         org.springframework.test.util.ReflectionTestUtils.setField(
                 consumer, "evaluatedResultsTopic", "evaluated_results.eu-west1");

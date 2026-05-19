@@ -740,9 +740,23 @@ None of these are written yet. Roadmap item §3.14.
 
 ### 11.2 SPOT preemption (compute VM)
 
-`oj-compute` is SPOT — Google can reclaim it with 30 s notice. Today's behaviour on preemption: in-flight submissions die without publishing a verdict; the next start brings the warm pool back up; the killed submissions' idempotency rows stale-reclaim and eventually go POISON → DLQ.
+`oj-compute` is SPOT — Google can reclaim it with 30 s notice.
 
-The right fix is a shutdown script that drains the SubmissionConsumer (commits all in-flight submissions' offsets after publishing a `WORKER_PREEMPTED` verdict). Roadmap §3.8.
+**Drain hook (live).** A systemd unit `oj-preempt-drain.service` is wired
+into the VM's stop edge via `BindsTo=oj-region.service` +
+`Before=oj-region.service`. Its `ExecStop=` runs
+`/opt/oj/bin/spot-preempt-drain.sh`, which POSTs to the execution-worker's
+loopback-only endpoint `http://127.0.0.1:8083/actuator/preempt-drain` with
+the shared-secret `X-Preempt-Token` header (sourced from `/opt/oj/.env`,
+written by the startup script). The worker's `PreemptionDrainService`
+then: (1) pauses + stops every Kafka listener container, (2) publishes a
+`VerdictEvent(result=WORKER_PREEMPTED)` keyed by `userId` for every
+in-flight idempotency row tracked by `InFlightTracker`, (3) marks those
+rows `poisoned` so the next worker start doesn't double-execute, and
+(4) flushes the producer. Wall-clock cap: 25 s, leaving 5 s headroom
+under the 30 s preempt window. Source: `execution-worker/.../preempt/`,
+`infra/gcp/scripts/spot-preempt-drain.sh`, `infra/gcp/systemd/oj-preempt-drain.service`.
+Roadmap §3.8 (closed).
 
 ### 11.3 Auto-shutdown
 
@@ -878,7 +892,7 @@ Short list — each item points at deeper material.
 | `analytics-pipeline` Spring module deprecated; replaced by ClickHouse Kafka Engine (see `design-docs/clickhouse-kafka-engine-rollout.md`) | §4.8 | n/a — DDL + compose entry shipped; the JVM module is retained for git history only |
 | `RUNTIME_ERROR` vs INTERNAL_ERROR conflation | §4.2 failure modes | Low — minor UX paper-cut |
 | No DLQ dashboard for the poison topic | Roadmap §3.10 | Medium — operators don't see dead-lettered submissions |
-| No SPOT preemption shutdown script | §11.2 + roadmap §3.8 | Medium for `oj-compute` cost-optimised path |
+| ~~No SPOT preemption shutdown script~~ — drain hook live (PreemptionDrainService + oj-preempt-drain.service) | §11.2 + roadmap §3.8 | Closed |
 | `network-policy` rules on `oj-allow-internal` too permissive (`0-65535/tcp`) | Roadmap §3.5 | Low — intra-VPC, no public ingress |
 | `pre-test ≤ ordinal 10` is a magic number | Constants in `TestCase` entity + worker | Low — refactor to config |
 | `idempotency_keys.processing-lease-seconds` is 300 s; not tunable per-problem | §8.3 | Low |
