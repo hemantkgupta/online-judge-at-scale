@@ -41,3 +41,13 @@ output "stop_all" {
   description = "Command to stop both region VMs."
   value       = "gcloud compute instances stop ${google_compute_instance.oj_region_a.name} --zone=${var.primary_zone} && gcloud compute instances stop ${google_compute_instance.oj_region_b.name} --zone=${var.secondary_zone}"
 }
+
+output "rotate_jwt_key_now" {
+  description = "Manually trigger an out-of-cycle JWT key rotation. Used for emergency rotations after a leak (see docs/design-docs/key-rotation.md#rollback)."
+  value       = "gcloud functions call ${google_cloudfunctions2_function.rotate_jwt_key.name} --region=${var.primary_region}"
+}
+
+output "rotate_signer_key_now" {
+  description = "Manually trigger an out-of-cycle GCS signer-SA key rotation."
+  value       = "gcloud functions call ${google_cloudfunctions2_function.rotate_signer_key.name} --region=${var.primary_region}"
+}

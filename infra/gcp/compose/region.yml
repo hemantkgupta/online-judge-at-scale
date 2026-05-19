@@ -230,6 +230,14 @@ services:
       - oj-redis
     ports:
       - "8088:8088"
+    volumes:
+      # JWT key rotation — see docs/design-docs/key-rotation.md. The host
+      # file is owned by the systemd timer oj-jwt-keys.timer which mirrors
+      # Secret Manager every 60 s. JwtKeyStore polls the in-container path
+      # at the same cadence; "stale" worst-case is one Secret Manager hop +
+      # one in-process poll = ~2 minutes after the Cloud Function writes a
+      # new version. Fine — the overlap window is 7 days, not 2 minutes.
+      - /opt/oj/jwt-keys.json:/var/secrets/jwt-keys.json:ro
     environment:
       SERVER_PORT: 8088
       SPRING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
@@ -238,6 +246,8 @@ services:
       SPRING_DATA_REDIS_HOST: oj-redis
       SPRING_DATA_REDIS_PORT: 6379
       APP_JWT_SECRET: ${JWT_SECRET:?must set JWT_SECRET via /opt/oj/.env}
+      JWT_KEY_STORE_PATH: /var/secrets/jwt-keys.json
+      JWT_KEY_STORE_POLL_INTERVAL_MS: "60000"
       SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
       SPRING_FLYWAY_BASELINE_VERSION:    "0"
       # Multi-region wiring
