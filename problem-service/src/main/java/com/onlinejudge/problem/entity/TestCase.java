@@ -18,9 +18,12 @@ import java.util.UUID;
  *  - Delivered to execution workers via short-lived V4-signed GCS URLs.
  *  - Never exposed to contestants directly.
  *
- * Ordering matters. By convention:
- *  ordinal 1–10:  pretests   (Phase 1 — run during contest, fast)
- *  ordinal 11+:   system tests (Phase 2 — exhaustive, post-contest)
+ * Ordering matters. The split between pretests and system tests is now
+ * configurable (tech-spec §14 L3) — see
+ * {@code app.problem.pretest-ordinal-threshold} in {@code application.yml}.
+ * The default preserves the original blog contract:
+ *  ordinal 1–N:   pretests   (Phase 1 — run during contest, fast; N=10 by default)
+ *  ordinal N+1+:  system tests (Phase 2 — exhaustive, post-contest)
  *
  * Indexed by {@code (problem_id, ordinal)} so the read path (worker fetching
  * pretests for a submission) is a single index scan.

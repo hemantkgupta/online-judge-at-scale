@@ -44,6 +44,16 @@ public class Problem {
     @Column(nullable = false)
     private long points;
 
+    /**
+     * Tech-spec §14 L4: optional per-problem override for the worker's
+     * idempotency processing-lease duration ({@code app.idempotency
+     * .processing-lease-seconds}, default 300 s). NULL means "use the
+     * worker's global default" — backwards-compatible. CRDB CHECK
+     * constraint enforces 30..3600 s.
+     */
+    @Column(name = "lease_seconds_override")
+    private Long leaseSecondsOverride;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 

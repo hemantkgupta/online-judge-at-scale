@@ -10,6 +10,7 @@ import com.onlinejudge.problem.repository.ProblemRepository;
 import com.onlinejudge.problem.repository.TestCaseRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -36,12 +37,37 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ProblemService {
 
-    /** Ordinals 1–10 are pretests. Matches the contract in the blog post. */
-    public static final int PRETEST_MAX_ORDINAL = 10;
+    /**
+     * Default ordinal threshold separating pretests (ordinal &le; threshold,
+     * Phase 1) from system tests (ordinal &gt; threshold, Phase 2). Tunable
+     * via {@code app.problem.pretest-ordinal-threshold} (tech-spec §14 L3);
+     * the previous compile-time constant {@code 10} is now this field's
+     * default so behaviour is unchanged when the property is unset.
+     */
+    public static final int DEFAULT_PRETEST_ORDINAL_THRESHOLD = 10;
+
+    /**
+     * @deprecated tech-spec §14 L3: the threshold is now a config knob,
+     *     {@link #pretestOrdinalThreshold}. Kept as a constant for any
+     *     external consumers that statically referenced it. New code
+     *     should read the instance field.
+     */
+    @Deprecated
+    public static final int PRETEST_MAX_ORDINAL = DEFAULT_PRETEST_ORDINAL_THRESHOLD;
 
     private final ProblemRepository problemRepository;
     private final TestCaseRepository testCaseRepository;
     private final GcsSigner gcsSigner;
+
+    /**
+     * Configurable pretest/system-test ordinal split. Tech-spec §14 L3:
+     * was a hard-coded {@code 10}. Default preserves prior behaviour;
+     * operators can widen the pretest band (e.g. for problems with more
+     * fast-fail cases) by setting
+     * {@code app.problem.pretest-ordinal-threshold} in the environment.
+     */
+    @Value("${app.problem.pretest-ordinal-threshold:" + DEFAULT_PRETEST_ORDINAL_THRESHOLD + "}")
+    int pretestOrdinalThreshold = DEFAULT_PRETEST_ORDINAL_THRESHOLD;
 
     public List<Problem> listProblems() {
         return problemRepository.findAll();
@@ -117,7 +143,7 @@ public class ProblemService {
                 .orElseThrow(() -> new NoSuchElementException("Problem not found: " + problemId));
 
         List<TestCase> rows = pretestOnly
-                ? testCaseRepository.findByProblemIdAndOrdinalLessThanEqualOrderByOrdinal(problemId, PRETEST_MAX_ORDINAL)
+                ? testCaseRepository.findByProblemIdAndOrdinalLessThanEqualOrderByOrdinal(problemId, pretestOrdinalThreshold)
                 : testCaseRepository.findByProblemIdOrderByOrdinal(problemId);
 
         List<TestCaseUrlsDto> urls = new ArrayList<>(rows.size());
@@ -135,9 +161,12 @@ public class ProblemService {
         // Entity fields are `long` (CRDB BIGINT); the wire DTO and execution-
         // worker both speak `int`. Narrow with Math.toIntExact so any future
         // out-of-range value blows up loudly rather than wrapping silently.
+        // Tech-spec §14 L4: pass through the optional per-problem
+        // idempotency-lease override (NULL == use worker global).
         return new TestCaseBundleDto(
                 Math.toIntExact(problem.getTimeLimitMs()),
                 Math.toIntExact(problem.getMemoryLimitMb()),
-                urls);
+                urls,
+                problem.getLeaseSecondsOverride());
     }
 }

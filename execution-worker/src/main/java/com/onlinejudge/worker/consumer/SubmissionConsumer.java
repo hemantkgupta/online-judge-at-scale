@@ -179,12 +179,16 @@ public class SubmissionConsumer {
             List<TestCaseSpec> testCases;
             int timeLimitMs;
             int memoryLimitMb;
+            // Tech-spec §14 L4: optional per-problem idempotency lease
+            // override. NULL → fall back to global processing-lease-seconds.
+            Long leaseSecondsOverride = null;
             if (testCaseFetcher != null && problemServiceRequired) {
                 try {
                     ProblemSpec spec = testCaseFetcher.fetch(event.getProblemId(), phase);
-                    testCases     = spec.testCases();
-                    timeLimitMs   = spec.timeLimitMs();
-                    memoryLimitMb = spec.memoryLimitMb();
+                    testCases            = spec.testCases();
+                    timeLimitMs          = spec.timeLimitMs();
+                    memoryLimitMb        = spec.memoryLimitMb();
+                    leaseSecondsOverride = spec.leaseSecondsOverride();
                 } catch (Exception ex) {
                     log.error("[worker:{}] test-case fetch failed submission={} problem={}: {}",
                             phase, submissionId, event.getProblemId(), ex.getMessage());
@@ -207,7 +211,7 @@ public class SubmissionConsumer {
             // and it releases below. That's a wasted lease, not a
             // correctness bug.
             IdempotencyService.ClaimDecision claim =
-                    idempotencyService.claimSubmission(submissionId, phase);
+                    idempotencyService.claimSubmission(submissionId, phase, leaseSecondsOverride);
             if (claim.status() == IdempotencyService.ClaimStatus.COMPLETED) {
                 ack.acknowledge();
                 return;
@@ -401,11 +405,23 @@ public class SubmissionConsumer {
                 .build();
     }
 
-    private String determineVerdict(ExecutionBackend.ExecutionResult result, int timeLimitMs) {
+    /**
+     * Tech-spec §4.2 failure modes: disambiguate user-attributable
+     * {@code RUNTIME_ERROR} (contestant code crashed inside the sandbox —
+     * segfault, exception, non-zero exit) from operator-attributable
+     * {@code INTERNAL_ERROR} (worker bug, sandbox-manager fault, jailer
+     * failure, disk full). Pre-tech-spec-§14-L1 the worker conflated both
+     * into {@code RUNTIME_ERROR}, which surfaced operator faults as
+     * contestant code bugs on the leaderboard / scorecard. The two
+     * categories must remain distinct end-to-end so analytics and ops
+     * dashboards can split them.
+     */
+    static String determineVerdict(ExecutionBackend.ExecutionResult result, int timeLimitMs) {
         return switch (result.status()) {
             case "TIME_LIMIT_EXCEEDED" -> "TIME_LIMIT_EXCEEDED";
-            case "RUNTIME_ERROR"       -> "RUNTIME_ERROR";
-            case "INTERNAL_ERROR"      -> "RUNTIME_ERROR";
+            case "RUNTIME_ERROR"       -> "RUNTIME_ERROR";   // user-attributable
+            case "INTERNAL_ERROR"      -> "INTERNAL_ERROR";  // operator-attributable
+            case "COMPILE_ERROR"       -> "COMPILE_ERROR";
             case "OK" -> result.executionTimeMs() > timeLimitMs
                     ? "TIME_LIMIT_EXCEEDED" : "ACCEPTED";
             default -> "WRONG_ANSWER";

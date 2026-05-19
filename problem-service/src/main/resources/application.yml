@@ -48,3 +48,13 @@ gcs:
   project-id: ${GCS_PROJECT_ID:online-judge-hk}
   bucket: ${GCS_BUCKET:oj-test-cases}
   signer-credentials-path: ${GCS_SIGNER_KEY_PATH:}
+
+# --- Problem service tunables -------------------------------------------------
+# Tech-spec §14 L3: the ordinal split between pretests (Phase 1, run during
+# the contest) and system tests (Phase 2, run post-acceptance / post-contest)
+# was a hard-coded `10`. It's now a knob so we can widen the pretest band on a
+# per-cluster basis without rebuilding the JAR. The default preserves the
+# original contract.
+app:
+  problem:
+    pretest-ordinal-threshold: ${APP_PROBLEM_PRETEST_ORDINAL_THRESHOLD:10}

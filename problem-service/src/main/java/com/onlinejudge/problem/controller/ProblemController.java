@@ -80,7 +80,8 @@ public class ProblemController {
      * }
      * </pre>
      *
-     * @param pretestOnly if true, only ordinals 1–10 are returned
+     * @param pretestOnly if true, only ordinals 1..{@code app.problem.pretest-ordinal-threshold}
+     *                    are returned (default 10, tech-spec §14 L3)
      */
     @GetMapping("/{id}/test-cases")
     public TestCaseBundleDto getTestCaseBundle(@PathVariable UUID id,
