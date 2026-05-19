@@ -219,6 +219,91 @@ services:
     volumes:
       - redis-data:/data
 
+  # ---------- Flink (scoring-pipeline runtime) ------------------------------
+  # Session-mode JM + TM pair. The scoring-pipeline shadowJar is uploaded and
+  # submitted out-of-band via `infra/gcp/scripts/scoring-deploy.sh` against the
+  # JM REST API on :18081 — application mode is not used here because the JAR
+  # is built on the operator host (or a one-shot CI step) and needs to be
+  # POSTed in, not baked into the JM image.
+  #
+  # Parallelism = TaskManager slots. v1 ships a single TM with 2 slots; raise
+  # `taskmanager.numberOfTaskSlots` here and the job's `parallelism` arg in
+  # scoring-deploy.sh together when scaling out.
+  #
+  # Checkpoints land on the `flink-checkpoints` named volume by default. This
+  # is durable across container restarts on the SAME VM but does NOT survive
+  # VM rebuild — production target is GCS (`gs://<bucket>/flink-checkpoints`),
+  # gated on uploading the `flink-gs-fs-hadoop` plugin and wiring
+  # `state.checkpoints.dir` to the gs:// URI. See
+  # docs/services/scoring-pipeline.md §10 for the cutover plan.
+  #
+  # Memory budget (`docs/tech-spec.md` §10.1): the region VM is
+  # `n2-standard-2` (8 GB). JM ≈ 600 MB and TM ≈ 1.2 GB on top of the existing
+  # control-plane footprint sits within budget — co-located on `oj-region-a`
+  # / `oj-region-b` rather than a separate VM. If memory pressure emerges, the
+  # follow-up is to bump to `e2-standard-4` (16 GB) before splitting Flink off.
+  oj-flink-jobmanager:
+    image: flink:1.18.1-java17
+    container_name: oj-flink-jobmanager
+    hostname: oj-flink-jobmanager
+    restart: unless-stopped
+    depends_on:
+      - oj-kafka
+      - oj-redis
+    ports:
+      - "18081:8081"  # REST API + Web UI (scoring-deploy.sh targets this)
+    command: jobmanager
+    environment:
+      # Job runtime config — read by ScoringJobApplication.main(). Defaults
+      # in the JAR (localhost / file:///tmp/...) are wrong inside compose;
+      # these env vars are what makes the job runnable in this network.
+      SCORING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      SCORING_INPUT_TOPIC:             evaluated_results.${REGION:?must set REGION}
+      SCORING_GROUP_ID:                scoring-pipeline
+      REDIS_HOST:                      oj-redis
+      REDIS_PORT:                      6379
+      CHECKPOINT_DIR:                  file:///flink-checkpoints
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: oj-flink-jobmanager
+        jobmanager.memory.process.size: 600m
+        state.backend: filesystem
+        state.checkpoints.dir: file:///flink-checkpoints
+        rest.flamegraph.enabled: true
+    volumes:
+      - flink-checkpoints:/flink-checkpoints
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/overview >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    mem_limit: 768m
+
+  oj-flink-taskmanager:
+    image: flink:1.18.1-java17
+    container_name: oj-flink-taskmanager
+    hostname: oj-flink-taskmanager
+    restart: unless-stopped
+    depends_on:
+      oj-flink-jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      SCORING_KAFKA_BOOTSTRAP_SERVERS: oj-kafka:29092
+      SCORING_INPUT_TOPIC:             evaluated_results.${REGION:?must set REGION}
+      SCORING_GROUP_ID:                scoring-pipeline
+      REDIS_HOST:                      oj-redis
+      REDIS_PORT:                      6379
+      CHECKPOINT_DIR:                  file:///flink-checkpoints
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: oj-flink-jobmanager
+        taskmanager.memory.process.size: 1280m
+        taskmanager.numberOfTaskSlots: 2
+        state.backend: filesystem
+        state.checkpoints.dir: file:///flink-checkpoints
+    volumes:
+      - flink-checkpoints:/flink-checkpoints
+    mem_limit: 1536m
+
   # ---------- api-gateway ---------------------------------------------------
   oj-api-gateway:
     image: ${AR_URL:?must set AR_URL via /opt/oj/.env}/api-gateway:latest
@@ -398,3 +483,7 @@ volumes:
   redis-data:
   clickhouse-data:
   clickhouse-logs:
+  # Local filesystem checkpoint store for the Flink scoring-pipeline job.
+  # Sufficient for v1; production target is GCS — see the JM entry above and
+  # docs/services/scoring-pipeline.md §10.
+  flink-checkpoints:

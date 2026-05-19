@@ -6,7 +6,7 @@
 >
 > Read this page if you are: (a) about to stand up a Flink JobManager and submit this job for the first time, (b) changing scoring rules in `scoring-pipeline/`, (c) trying to understand why two services appear to write to the same Redis sorted-set keys.
 
-> **Status (2026-05-18): BLOCKED.** This module compiles and has unit tests (including `ScoringEndToEndTest` driving the scoring algorithm directly), but is NOT deployable as a Spring container. `build.gradle` declares Flink as `compileOnly` and `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()`, which expects an external Flink runtime. Deploying scoring-pipeline = standing up a Flink JobManager + TaskManager pair (in compose, or moving to managed Cloud Dataflow), uploading the fat JAR via `POST /jars/upload`, and submitting the job. Until then, [`./leaderboard-service.md`](./leaderboard-service.md) performs a simpler ZADD-by-points calculation as a stand-in.
+> **Status (2026-05-19): Flink runtime live in compose; writer cutover pending.** The Flink JobManager + TaskManager pair now ships in `infra/gcp/compose/region.yml` (session mode, 1 JM + 1 TM × 2 slots, filesystem checkpoints on the `flink-checkpoints` named volume). The shadowJar is uploaded and the job submitted out-of-band by `infra/gcp/scripts/scoring-deploy.sh` (idempotent — skips submission if a RUNNING job is already present). The leaderboard-service writer is still the live source of truth for the leaderboard ZSETs; the cutover (disable LB writer → observe `oj.scoring.score_updates_total` parity → flip) is tracked in the **Follow-up** section below.
 
 ---
 
@@ -77,7 +77,7 @@ Not touched: CRDB. The ZSET overlap is the architecture shift the deployment req
 
 | Failure | Detection | Behaviour |
 |---|---|---|
-| **No Flink runtime today** | Job never submitted; `scoring-pipeline` group has no consumers | leaderboard-service's ZADD-by-points is live; ICPC penalty math is not in effect |
+| **Writer cutover pending** | Both leaderboard-service and scoring-pipeline write to the same `leaderboard:{contestId}:shard:{i}` ZSETs while the Flink job bakes. Identify via `redis-cli MONITOR \| grep leaderboard:` — both writer sources visible | Safe transitional state — Lua sink is idempotent, ZADD is last-write-wins on value. Final state after the LB writer flips off is single-writer (scoring-pipeline). See "Follow-up: leaderboard-service writer cutover" |
 | JM / TM crash | Supervisor restarts job from last checkpoint | Kafka source rewinds to checkpointed offsets; replayed ZADDs are idempotent |
 | Redis sink unreachable | Jedis throws; Flink retries via job restart strategy | Job stalls at the failed barrier; Kafka-side lag visible |
 | Late VerdictEvent (event-time before watermark) | Bytes flow through; `Scorer.apply` consumes them | Order-independent: late WA before accepted raises penalty; earlier-event-time ACCEPTED lowers `acceptedAtMs`. Correct under cross-region Cluster-Linking lag |
@@ -174,12 +174,31 @@ Expected ICPC math, verified against [`Scorer.java`](../../scoring-pipeline/src/
 
 ## 10. Relevant design docs
 
-There is no dedicated design doc for scoring-pipeline today. The deployment blocker is documented inline in [`../tech-spec.md`](../tech-spec.md) §4.7 and §11.4 (the prod-readiness gap table). The path forward divides cleanly into two options:
+There is no dedicated design doc for scoring-pipeline today. The path-forward decision is captured here.
 
-- **Stand up Flink in compose alongside the control plane.** Add a `flink-jobmanager` + `flink-taskmanager` block to `infra/gcp/compose/control-plane-compose.yml` (or a dedicated `flink-compose.yml`). The control-plane VM is memory-tight (`tech-spec.md` §10.1); either bump to `e2-standard-2` or host Flink on a separate VM.
-- **Move to managed Cloud Dataflow.** Recompile against the Dataflow runner, submit via `gcloud dataflow flex-template run`. Avoids running Flink in the control plane; pays managed-cloud pricing.
+**Decision (2026-05-19): compose on the region VMs, not managed Cloud Dataflow.** Two candidates were considered:
 
-Cross-reference: [`../design-docs/kafka-cluster-and-crdb-cluster.md`](../design-docs/kafka-cluster-and-crdb-cluster.md) covers the Kafka cluster layout this job's source depends on. [`./leaderboard-service.md`](./leaderboard-service.md) is the present-day stand-in and the writer that must be disabled on cutover.
+- **Stand up Flink in compose alongside the existing per-region stack.** Chosen. Matches existing IaC patterns (single `region.yml` per VM, no new GCP product surface), cheaper, and re-uses the smoke harness's wiring almost verbatim. Co-located on `oj-region-a` / `oj-region-b` (`n2-standard-2`, 8 GB). The JM is capped at `mem_limit: 768m` (`jobmanager.memory.process.size: 600m`) and the TM at `mem_limit: 1536m` (`taskmanager.memory.process.size: 1280m`) — total ≈ 2.3 GB on top of the existing ~5 GB control-plane footprint, leaving headroom. **No VM bump required for v1.** If memory pressure shows up under contest load, the follow-up is `n2-standard-2 → e2-standard-4` (16 GB) before splitting Flink onto its own VM.
+- **Move to managed Cloud Dataflow.** Rejected for v1: requires re-compiling against the Dataflow runner, adds a new IAM / billing surface, and pays managed-cloud pricing. Worth re-visiting if the per-region VM cannot host Flink at scale.
+
+**Mode: session, not application.** The shadowJar is built on the operator host (or a one-shot CI step) and POSTed to `<flink-jm>:18081/jars/upload` via `infra/gcp/scripts/scoring-deploy.sh`. Application mode would mean baking the JAR into a custom JM image — heavier rebuild loop and breaks the "JAR build is decoupled from cluster lifecycle" property the smoke harness already relies on.
+
+**Checkpoint storage.** v1 uses a Docker named volume (`flink-checkpoints`) — durable across container restarts on the same VM, lost on VM rebuild. **Production target is GCS** (`gs://<bucket>/flink-checkpoints`) once the `flink-gs-fs-hadoop` plugin is staged on the JM/TM images and `state.checkpoints.dir` is repointed at the gs:// URI. Filed as a follow-up; not on the critical path for closing the M1 deployment gap.
+
+Cross-reference: [`../design-docs/kafka-cluster-and-crdb-cluster.md`](../design-docs/kafka-cluster-and-crdb-cluster.md) covers the Kafka cluster layout this job's source depends on. [`./leaderboard-service.md`](./leaderboard-service.md) is the present-day stand-in and the writer that must be disabled on cutover (see Follow-up below).
+
+---
+
+## Follow-up: leaderboard-service writer cutover
+
+The infrastructure half of M1 is closed by the changes shipped alongside this page (compose entry + JAR-submission script). The **writer cutover** — turning off leaderboard-service's `KafkaListener`-driven ZADD path so scoring-pipeline owns the ZSETs alone — is a separate, coordinated PR that should land **only after operator validates parity**. Sequence:
+
+1. **Deploy & let it bake.** `docker compose -f infra/gcp/compose/region.yml up -d oj-flink-jobmanager oj-flink-taskmanager`, then `./infra/gcp/scripts/scoring-deploy.sh`. The job comes up writing to the same `leaderboard:{contestId}:shard:{i}` ZSETs that leaderboard-service is already writing — both writers coexist safely because the Lua sink is idempotent in score-encoding space (`totalPoints * 10_000_000 - penaltyMinutes`) and ZADD is last-write-wins on the value.
+2. **Observe parity** on `oj.scoring.score_updates_total` vs the leaderboard-service's writer counter for at least one contest's worth of traffic. Divergence on penalty math is the expected signal (LB writer does ZADD-by-points only — no twenty-minute penalty per pre-AC WA). Parity *on the totalPoints column* with the scoring-pipeline showing additional penalty correction means both writers are running healthily.
+3. **Flip leaderboard-service writer off.** Separate PR: gate the `KafkaListener` in `leaderboard-service` behind a feature flag (`APP_WRITE_LEADERBOARD_ENABLED`, default `false` after the flip). Reader + WebSocket fan-out path stays on. Risk: low — both writers wrote to the same keys with the same encoding; turning one off is a strict subset of the prior state.
+4. **Update the §14 gap table row** for scoring-pipeline from "Live in compose; leaderboard-service writer cutover pending" to "Closed".
+
+Until step 3 lands, `redis-cli MONITOR | grep leaderboard:` should show writes from both sources. That is the expected, safe transitional state.
 
 ---
 
@@ -197,4 +216,5 @@ Cross-reference: [`../design-docs/kafka-cluster-and-crdb-cluster.md`](../design-
 | End-to-end contest simulation | `.../test/java/com/onlinejudge/scoring/integration/ScoringEndToEndTest.java` |
 | Gradle build (shadowJar, Flink `compileOnly`) | `scoring-pipeline/build.gradle` |
 | Dockerfile | **none** — Flink job, not a Spring container; excluded from the docker build matrix per `tech-spec.md` §6.7 |
-| Compose entry | **none** — a Flink JobManager + TaskManager block is the missing deployment prerequisite |
+| Compose entry (JM + TM) | `infra/gcp/compose/region.yml` services `oj-flink-jobmanager` + `oj-flink-taskmanager` |
+| JAR submission script | `infra/gcp/scripts/scoring-deploy.sh` — idempotent build + upload + run |
