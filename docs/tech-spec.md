@@ -861,6 +861,26 @@ The "ACCEPTED on live GCP" smoke is the final integration check — running `sub
 
 `infra/scripts/test-multi-region-local.sh` is a self-contained, host-local harness that stands up two regions of the stack (kafka, two CRDB nodes with locality, two redis, two api-gateways, two leaderboard-services) via `infra/compose/test-multi-region.yml` and exercises three failure paths: (S1) 307 region-mismatch redirect from `RegionMismatchFilter` when a request lands on the wrong-region gateway; (S2) leaderboard `global=true` graceful peer degradation — `X-Peer-Region-Unreachable: true` when the peer leaderboard is down; (S3) per-region Kafka topic isolation — `submissions.<region>.pretest` etc. exist for both regions after `kafka-bootstrap-topics.sh` runs. Each scenario logs `PASS`/`FAIL` and the script exits non-zero on any failure. First run ~15 min (Gradle Docker builds), subsequent runs ~5 min. Operator playbook: `docs/runbooks/multi-region.md` §5.
 
+### 13.6 Pre-deploy readiness smoke (PRs #5–#15)
+
+`scripts/oj-readiness-smoke.sh` is the **operator-facing pre-deploy gate** that exercises a single region's full feature surface against the readiness checklist tracked by the #5–#15 PR cluster. It stands up the regional compose stack from `infra/gcp/compose/region.yml` (kafka, redis, crdb, clickhouse, otel-collector, api-gateway, contest-service, problem-service, sandbox-manager, execution-worker, leaderboard-service) and runs seven scenarios:
+
+| # | Surface | Owner PR |
+|---|---|---|
+| S1 | Auth flow + rate-limit split — 11 logins from one IP → 11th = 429 AND 11 submissions in the same window → first 10 = 202, 11th = 429 (independent buckets) | #9 |
+| S2 | Submission → verdict → leaderboard — POST a `data:` URL python `sum-two-numbers` solution → ACCEPTED within 30 s AND `ZCARD leaderboard:<contest>` ≥ 1 | core |
+| S3 | Code URL schemes — POST with `http://` source URL pointing at an in-process `python3 http.server` fixture (`s3://`/`r2://` gated by `APP_SOURCE_S3_ENABLED`) | #14 |
+| S4 | Analytics path — `SELECT count() FROM onlinejudge.submission_analytics WHERE submission_id='<sid>'` ≥ 1 within 35 s | core (`1a2b4b3`) |
+| S5 | DLQ + observability dashboards validate — `bash infra/observability/scripts/validate.sh` exits 0 AND a `dashboards/dlq*.json` exists | #6 |
+| S6 | SPOT preemption drain endpoint — `POST /actuator/preempt-drain` returns 200 AND worker log shows `preemption drain complete` | #13 |
+| S7 | Metrics catalogue — five §9.3 metric names registered (`submission.accepted`, `submission.rejected.size_too_large`, `verdict.published_total`, `sandbox.lease.latency_seconds`, `sandbox.pool.ready`) | #11 |
+
+Each scenario does a presence probe before asserting; when a feature isn't yet shipped (per §14 known limitations) the scenario emits `SKIP: <reason>` instead of FAIL, so the smoke runs green on substrate-only today and individual SKIPs flip to PASS as PRs land. The release gate uses `--strict`, which promotes every SKIP to FAIL.
+
+Exit code = failed-scenario count. First run ~10–15 min (image pulls + Gradle Docker builds + ClickHouse Kafka-Engine first poll on the 7-day analytics topic), subsequent runs ~3–5 min. Operator playbook: `docs/runbooks/oj-readiness-smoke.md`.
+
+This is the third member of the local-harness family alongside `scripts/scoring-smoke.sh` (Flink scoring-pipeline end-to-end) and `infra/scripts/test-multi-region-local.sh` (cross-region failure paths). The three are complementary: scoring-smoke covers the scoring DAG, multi-region-local covers cross-region, oj-readiness-smoke covers a single region's whole feature matrix.
+
 ---
 
 ## 14. Known limitations and debt

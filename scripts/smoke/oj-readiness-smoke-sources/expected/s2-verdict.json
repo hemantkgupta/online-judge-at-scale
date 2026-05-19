@@ -1,0 +1,6 @@
+{
+  "comment": "Canonical S2 verdict body. Asserted loosely by oj-readiness-smoke.sh — only the verdict field is checked.",
+  "verdict": "ACCEPTED",
+  "phase": "pretest",
+  "language": "python"
+}

@@ -1,0 +1,8 @@
+# Canonical metric names from docs/tech-spec.md §9.3.
+# oj-readiness-smoke.sh S7 greps the live /metrics endpoint for each of these
+# (the otel-prometheus exporter rewrites '.' to '_'; the script accepts both).
+submission.accepted
+submission.rejected.size_too_large
+verdict.published_total
+sandbox.lease.latency_seconds
+sandbox.pool.ready
