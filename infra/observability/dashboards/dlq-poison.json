@@ -1,0 +1,74 @@
+{
+  "displayName": "OJ — DLQ poison topic (submissions.dlq)",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "submissions.dlq — total messages on topic (sum of partition end-offsets)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum(kafka_topic_partition_current_offset{topic=\"submissions.dlq\"}) - sum(kafka_topic_partition_oldest_offset{topic=\"submissions.dlq\"})"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "messages on topic"
+              },
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum(rate(kafka_topic_partition_current_offset{topic=\"submissions.dlq\"}[5m]))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "arrival rate (msg/s, 5m)"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 4,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "Age of oldest message in submissions.dlq (lag-style — seconds since oldest offset's timestamp)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "(time() - min(kafka_topic_partition_oldest_offset_timestamp_seconds{topic=\"submissions.dlq\"}))"
+                },
+                "plotType": "LINE",
+                "legendTemplate": "oldest message age (s)"
+              }
+            ],
+            "yAxis": { "label": "seconds", "scale": "LINEAR" }
+          }
+        }
+      },
+      {
+        "yPos": 8,
+        "width": 12,
+        "height": 4,
+        "widget": {
+          "title": "submissions.dlq — messages per partition (DLQ envelope is JSON, not Kafka headers — per-error breakdown lives in last_error field; see runbook)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "prometheusQuery": "sum by (partition) (kafka_topic_partition_current_offset{topic=\"submissions.dlq\"} - kafka_topic_partition_oldest_offset{topic=\"submissions.dlq\"})"
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "p${partition}"
+              }
+            ],
+            "yAxis": { "label": "messages", "scale": "LINEAR" }
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "displayName": "OJ — DLQ arrivals on submissions.dlq sustained > 0 (5 min)",
+  "documentation": {
+    "content": "The poison topic `submissions.dlq` has received at least one new message in every 1-minute window for the past 5 minutes — i.e. the worker is dead-lettering submissions at a non-zero rate. Per §8.3 a submission reaches the DLQ only after cycling through the idempotency `max-attempts` reclaim cap, so a sustained non-zero arrival rate means real submissions are failing terminally (not a transient blip). Open the `OJ — DLQ poison topic (submissions.dlq)` dashboard: panel 1 shows arrival rate + topic depth, panel 2 shows the age of the oldest unreplayed message, panel 3 shows per-partition spread. The envelope payload (`submission_id`, `phase`, `last_error`, base64 `raw_event_b64`) is JSON inside the message body — `kcat -C -t submissions.dlq -o -10 -e` is the fastest forensic peek. Common upstream causes: problem-service unreachable for the whole reclaim window, repeated SM pool-exhausted that escapes the carve-out, or a poison input that wedges the agent. Replay (once the underlying issue is fixed) is operator-only — there is no auto-consumer on this topic.",
+    "mimeType": "text/markdown"
+  },
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "submissions.dlq arrival rate > 0 sustained 5 min",
+      "conditionThreshold": {
+        "filter": "metric.type=\"prometheus.googleapis.com/kafka_topic_partition_current_offset/gauge\" AND metric.label.topic=\"submissions.dlq\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": ["metric.label.topic"]
+          }
+        ]
+      }
+    }
+  ],
+  "alertStrategy": { "autoClose": "1800s" },
+  "enabled": true,
+  "notificationChannels": []
+}
