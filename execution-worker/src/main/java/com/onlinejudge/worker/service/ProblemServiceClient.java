@@ -40,8 +40,9 @@ import java.util.List;
  * </pre>
  *
  * <p>The {@code pretestOnly} flag tells the service to return only the first
- * 10 ordinals (Phase 1 / live during contest) vs the full suite (Phase 2 /
- * system tests).
+ * N ordinals (Phase 1 / live during contest) vs the full suite (Phase 2 /
+ * system tests). N is configured at the problem-service via
+ * {@code app.problem.pretest-ordinal-threshold} (default 10).
  */
 @Slf4j
 @Component
@@ -98,10 +99,18 @@ public class ProblemServiceClient {
                 }
                 int timeLimitMs   = root.path("time_limit_ms").asInt(0);
                 int memoryLimitMb = root.path("memory_limit_mb").asInt(0);
+                // Tech-spec §14 L4: optional per-problem idempotency lease
+                // override. Missing or null → null on the wire → fall back
+                // to the worker's global processing-lease-seconds.
+                Long leaseOverride = null;
+                JsonNode leaseNode = root.get("lease_seconds_override");
+                if (leaseNode != null && !leaseNode.isNull()) {
+                    leaseOverride = leaseNode.asLong();
+                }
                 List<TestCaseUrls> rows = readRows(arr);
-                log.debug("[problem-service] bundle problem={} pretestOnly={} cases={} t={}ms m={}MiB",
-                        problemId, pretestOnly, rows.size(), timeLimitMs, memoryLimitMb);
-                return new TestCaseBundle(timeLimitMs, memoryLimitMb, rows);
+                log.debug("[problem-service] bundle problem={} pretestOnly={} cases={} t={}ms m={}MiB leaseOverride={}",
+                        problemId, pretestOnly, rows.size(), timeLimitMs, memoryLimitMb, leaseOverride);
+                return new TestCaseBundle(timeLimitMs, memoryLimitMb, rows, leaseOverride);
             }
 
             // Legacy shape: bare JSON array. Limits unknown — let
@@ -110,7 +119,7 @@ public class ProblemServiceClient {
                 List<TestCaseUrls> rows = readRows(root);
                 log.debug("[problem-service] legacy array shape problem={} pretestOnly={} cases={}",
                         problemId, pretestOnly, rows.size());
-                return new TestCaseBundle(0, 0, rows);
+                return new TestCaseBundle(0, 0, rows, null);
             }
 
             throw new IOException("problem-service returned unexpected body: " + resp.body());
@@ -139,7 +148,18 @@ public class ProblemServiceClient {
      * list. {@code timeLimitMs} and {@code memoryLimitMb} are 0 only when the
      * server is on the pre-2.3 array shape; callers MUST treat 0 as
      * "unknown — fall back to backend defaults".
+     *
+     * <p>{@code leaseSecondsOverride} (tech-spec §14 L4) is null when the
+     * problem has no override OR when the server is on a build that doesn't
+     * emit the field — both cases mean "use the worker's global
+     * {@code app.idempotency.processing-lease-seconds}".
      */
     public record TestCaseBundle(int timeLimitMs, int memoryLimitMb,
-                                 List<TestCaseUrls> testCases) {}
+                                 List<TestCaseUrls> testCases,
+                                 Long leaseSecondsOverride) {
+        /** Back-compat 3-arg form — used by tests that predate the §14 L4 field. */
+        public TestCaseBundle(int timeLimitMs, int memoryLimitMb, List<TestCaseUrls> testCases) {
+            this(timeLimitMs, memoryLimitMb, testCases, null);
+        }
+    }
 }

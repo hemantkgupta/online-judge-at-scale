@@ -75,6 +75,21 @@ public class IdempotencyService {
 
     @Transactional
     public ClaimDecision claimSubmission(String submissionId, String phase) {
+        return claimSubmission(submissionId, phase, null);
+    }
+
+    /**
+     * Tech-spec §14 L4: variant that accepts a per-problem override for the
+     * processing-lease window. When {@code leaseSecondsOverride} is non-null
+     * AND within the CRDB CHECK bounds (30..3600 s), it replaces the global
+     * {@code app.idempotency.processing-lease-seconds} for the staleness
+     * calculation on this single claim. {@code null} or out-of-band values
+     * fall back to the global — backwards-compatible with callers that
+     * don't pass an override.
+     */
+    @Transactional
+    public ClaimDecision claimSubmission(String submissionId, String phase,
+                                         Long leaseSecondsOverride) {
         String compositeKey = compositeKey(submissionId, phase);
         UUID sid = UUID.fromString(submissionId);
         Instant claimedAt = nowForDatabase();
@@ -98,7 +113,30 @@ public class IdempotencyService {
             log.info("[idempotency] Concurrent claim lost for submission={} phase={}", submissionId, phase);
         }
 
-        return claimExisting(compositeKey, submissionId, phase, claimedAt);
+        long effectiveLeaseSeconds = effectiveLeaseSeconds(leaseSecondsOverride, submissionId);
+        return claimExisting(compositeKey, submissionId, phase, claimedAt, effectiveLeaseSeconds);
+    }
+
+    /**
+     * Resolve the lease window for this claim. Override wins when it is
+     * non-null and within the CRDB CHECK bounds; otherwise fall back to the
+     * global. Out-of-band values are logged + ignored rather than rejected
+     * because the worker is downstream of problem-service and a malformed
+     * row shouldn't take the consumer offline.
+     */
+    long effectiveLeaseSeconds(Long override, String submissionId) {
+        if (override == null) {
+            return processingLeaseSeconds;
+        }
+        long v = override;
+        if (v < 30L || v > 3600L) {
+            log.warn("[idempotency] lease override out of bounds submission={} value={} (using global {})",
+                    submissionId, v, processingLeaseSeconds);
+            return processingLeaseSeconds;
+        }
+        log.debug("[idempotency] using per-problem lease override submission={} value={}",
+                submissionId, v);
+        return v;
     }
 
     @Transactional
@@ -165,8 +203,9 @@ public class IdempotencyService {
     }
 
     private ClaimDecision claimExisting(String compositeKey, String submissionId,
-                                        String phase, Instant claimedAt) {
-        Instant staleBefore = claimedAt.minus(Duration.ofSeconds(processingLeaseSeconds));
+                                        String phase, Instant claimedAt,
+                                        long effectiveLeaseSeconds) {
+        Instant staleBefore = claimedAt.minus(Duration.ofSeconds(effectiveLeaseSeconds));
 
         // Roadmap §2.5: only reclaim when attempts is still under the cap.
         // The UPDATE bumps attempts atomically; if max-attempts is already

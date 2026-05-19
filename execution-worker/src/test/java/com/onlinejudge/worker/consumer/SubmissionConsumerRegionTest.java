@@ -79,7 +79,9 @@ class SubmissionConsumerRegionTest {
     @SuppressWarnings("unchecked")
     void verdictAndPromotionPublishToRegionalTopics() throws Exception {
         IdempotencyService idempotency = mock(IdempotencyService.class);
-        when(idempotency.claimSubmission(anyString(), anyString()))
+        // Match both the legacy two-arg form and the §14 L4 three-arg form
+        // (with the lease-override) so this test is stable across the rollout.
+        when(idempotency.claimSubmission(anyString(), anyString(), any()))
                 .thenReturn(new IdempotencyService.ClaimDecision(
                         IdempotencyService.ClaimStatus.CLAIMED, java.time.Instant.now()));
         when(idempotency.markCompleted(anyString(), anyString(), any())).thenReturn(true);
@@ -159,7 +161,9 @@ class SubmissionConsumerRegionTest {
     @SuppressWarnings("unchecked")
     void verdictPayloadCarriesRegion() throws Exception {
         IdempotencyService idempotency = mock(IdempotencyService.class);
-        when(idempotency.claimSubmission(anyString(), anyString()))
+        // Match both the legacy two-arg form and the §14 L4 three-arg form
+        // (with the lease-override) so this test is stable across the rollout.
+        when(idempotency.claimSubmission(anyString(), anyString(), any()))
                 .thenReturn(new IdempotencyService.ClaimDecision(
                         IdempotencyService.ClaimStatus.CLAIMED, java.time.Instant.now()));
         when(idempotency.markCompleted(anyString(), anyString(), any())).thenReturn(true);

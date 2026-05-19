@@ -50,9 +50,10 @@ import java.util.List;
  * If a future problem class needs binary stdin we move {@code input} to
  * base64 in the wire format.
  *
- * <p>Sequential fetching for now — pretest ordinals ≤ 10, so the latency cost
- * is bounded. Parallelism is a TODO once system-test ordinals (≤ 100) move
- * through this path.
+ * <p>Sequential fetching for now — pretest ordinals stay below the configured
+ * threshold ({@code app.problem.pretest-ordinal-threshold}, default 10), so the
+ * latency cost is bounded. Parallelism is a TODO once system-test ordinals
+ * (≤ 100) move through this path.
  */
 @Slf4j
 @Component
@@ -89,7 +90,8 @@ public class TestCaseFetcher {
      * requested phase.
      *
      * @param problemId problem UUID string
-     * @param phase     {@code "pretest"} → pretestOnly=true (ordinals 1–10);
+     * @param phase     {@code "pretest"} → pretestOnly=true (ordinals
+     *                  1..{@code app.problem.pretest-ordinal-threshold});
      *                  any other value → pretestOnly=false (full suite)
      */
     /**
@@ -113,10 +115,11 @@ public class TestCaseFetcher {
 
             out.add(new TestCaseSpec(u.ordinal(), input, expectedHash));
         }
-        log.debug("[test-fetcher] problem={} phase={} testCases={} t={}ms m={}MiB",
+        log.debug("[test-fetcher] problem={} phase={} testCases={} t={}ms m={}MiB leaseOverride={}",
                 problemId, phase, out.size(),
-                bundle.timeLimitMs(), bundle.memoryLimitMb());
-        return new ProblemSpec(bundle.timeLimitMs(), bundle.memoryLimitMb(), out);
+                bundle.timeLimitMs(), bundle.memoryLimitMb(), bundle.leaseSecondsOverride());
+        return new ProblemSpec(bundle.timeLimitMs(), bundle.memoryLimitMb(), out,
+                bundle.leaseSecondsOverride());
     }
 
     /**
@@ -183,7 +186,12 @@ public class TestCaseFetcher {
      * budgets from the {@code problems} row through to the agent / sandbox
      * manager. A value of 0 means the upstream server is on the pre-2.3
      * array-shaped response and the consumer must apply its backend default.
+     *
+     * <p>{@code leaseSecondsOverride} (tech-spec §14 L4) is the optional
+     * per-problem override for the idempotency processing-lease window.
+     * {@code null} means "use the worker's global default".
      */
     public record ProblemSpec(int timeLimitMs, int memoryLimitMb,
-                              List<TestCaseSpec> testCases) {}
+                              List<TestCaseSpec> testCases,
+                              Long leaseSecondsOverride) {}
 }

@@ -264,6 +264,41 @@ class IdempotencyServiceTest {
     }
 
     @Test
+    void effectiveLeaseSeconds_usesOverrideWhenInBand() {
+        // Default lease = 300; an in-band override (60..3600) should win.
+        long resolved = idempotencyService.effectiveLeaseSeconds(900L, submissionId);
+        assertThat(resolved).isEqualTo(900L);
+    }
+
+    @Test
+    void effectiveLeaseSeconds_fallsBackToGlobalForNullOrOutOfBoundOverride() {
+        // Null → global.
+        assertThat(idempotencyService.effectiveLeaseSeconds(null, submissionId)).isEqualTo(300L);
+        // Out-of-band low (CRDB CHECK lower bound is 30) → global, not propagated.
+        assertThat(idempotencyService.effectiveLeaseSeconds(5L, submissionId)).isEqualTo(300L);
+        // Out-of-band high (CRDB CHECK upper bound is 3600) → global.
+        assertThat(idempotencyService.effectiveLeaseSeconds(99_999L, submissionId)).isEqualTo(300L);
+    }
+
+    @Test
+    void claimSubmission_threeArgOverloadIsBackwardsCompatible() {
+        // The two-arg call must continue to behave exactly like the new
+        // three-arg form with a null override — backwards compat for any
+        // caller that hasn't been redeployed past tech-spec §14 L4.
+        when(entityManager.createNativeQuery(anyString())).thenReturn(insertQuery);
+        when(insertQuery.setParameter(anyString(), any())).thenReturn(insertQuery);
+        when(insertQuery.executeUpdate()).thenReturn(1);
+
+        IdempotencyService.ClaimDecision twoArg =
+                idempotencyService.claimSubmission(submissionId, "pretest");
+        IdempotencyService.ClaimDecision threeArgNull =
+                idempotencyService.claimSubmission(submissionId, "pretest", null);
+
+        assertThat(twoArg.status()).isEqualTo(IdempotencyService.ClaimStatus.CLAIMED);
+        assertThat(threeArgNull.status()).isEqualTo(IdempotencyService.ClaimStatus.CLAIMED);
+    }
+
+    @Test
     void markPoison_flipsStatusToPoisoned() {
         when(entityManager.createNativeQuery(anyString())).thenReturn(updateQuery);
         when(updateQuery.setParameter(anyString(), any())).thenReturn(updateQuery);
