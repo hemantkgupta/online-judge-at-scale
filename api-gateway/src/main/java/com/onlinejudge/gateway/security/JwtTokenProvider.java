@@ -4,12 +4,10 @@ import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jws;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
@@ -19,19 +17,25 @@ import java.util.Map;
 /**
  * Signs and validates HS256 JWTs used by the API gateway.
  *
- * <p>Supports a {@code kid} (key ID) header so we can rotate signing keys
- * without invalidating every outstanding token on the wire. The provider
- * keeps a {@code current} key (used to sign new tokens) and an optional
- * {@code previous} key (still accepted on inbound validation for one
- * rotation cycle). Both come from {@code app.jwt.keys.<kid>}; today the
- * deployment populates {@code v1} with the {@code JWT_SECRET} env var and
- * pins {@code app.jwt.kid-current=v1}. When rotating: introduce {@code v2}
- * as {@code kid-current}, leave {@code v1} as {@code kid-previous} for one
- * release, then drop {@code v1} on the next.
+ * <p>The set of acceptable signing / verification keys is owned by
+ * {@link JwtKeyStore}: this class is the thin "what claims do we put on the
+ * token, and what do we extract back" layer. The store can hot-reload from a
+ * Secret-Manager-backed sidecar file — see
+ * {@code docs/design-docs/key-rotation.md}.
  *
- * <p>TODO: move the actual key bytes to Google Secret Manager and inject
- * via the Spring Cloud GCP secret-manager property source. For now the
- * keys live in env vars / application.yml — keys never appear in the image.
+ * <p>Versioned-kid model. Every minted token carries a {@code kid} header that
+ * names the key it was signed with. On validation we look up the verification
+ * key by the inbound {@code kid}; tokens minted under an older (still-accepted)
+ * key continue to verify until the operator removes that kid from the store.
+ * That overlap is the whole point of rotation — minted-old tokens keep working
+ * for the duration of the configured window (default 7 days; access-token TTL
+ * is 15 min so this is fingers-and-toes more headroom than required).
+ *
+ * <p>Back-compat. The legacy 3-arg constructor {@code (secret, ttlHours,
+ * issuer)} is still here — exercised by {@code JwtTokenProviderTest} and a few
+ * pre-V5 test seams. It synthesises a single-key store under {@code kid=v1}
+ * and produces tokens identical on the wire to a Spring-wired provider with
+ * {@code app.jwt.kid-current=v1}.
  *
  * <p>Claims:
  * <ul>
@@ -44,13 +48,9 @@ import java.util.Map;
  *   <li>{@code iat} — issued-at.</li>
  *   <li>{@code exp} — expiration (issued-at + {@code app.jwt.access-ttl-seconds}).</li>
  *   <li>{@code iss} — issuer (configurable, defaults to {@code online-judge}).</li>
+ *   <li>{@code region} — optional, see {@link #issueAccessToken(String, String)}.</li>
  *   <li>{@code kid} (header) — key id used to sign.</li>
  * </ul>
- *
- * <p>The token is validated on every request by {@link JwtAuthenticationFilter};
- * the {@code sub} becomes the {@link org.springframework.security.core.Authentication}'s
- * principal, which downstream controllers use instead of any user-supplied
- * {@code userId} in the request body.
  */
 @Component
 public class JwtTokenProvider {
@@ -58,59 +58,34 @@ public class JwtTokenProvider {
     public static final String TYPE_ACCESS = "access";
     public static final String TYPE_REFRESH = "refresh";
 
-    private final Map<String, SecretKey> keysByKid = new HashMap<>();
-    private final String currentKid;
+    private final JwtKeyStore keyStore;
     private final Duration accessTtl;
     private final String issuer;
 
-    // @Autowired marks this as THE constructor Spring should use. Without it,
-    // Spring sees two constructors (this + the legacy 3-arg test-only one
-    // below), can't pick, and falls back to looking for a no-arg default —
-    // which doesn't exist → "No default constructor found" at boot. Same
-    // pattern we hit on TestCaseFetcher and AgentClient.
     @org.springframework.beans.factory.annotation.Autowired
     public JwtTokenProvider(
-            @Value("${app.jwt.kid-current:v1}") String currentKid,
-            @Value("${app.jwt.kid-previous:}") String previousKid,
-            @Value("${app.jwt.keys.v1:${app.jwt.secret:dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256}}")
-            String keyV1,
-            @Value("${app.jwt.keys.v2:}") String keyV2,
+            JwtKeyStore keyStore,
             @Value("${app.jwt.access-ttl-seconds:900}") long accessTtlSeconds,
             @Value("${app.jwt.issuer:online-judge}") String issuer) {
-        registerKey("v1", keyV1);
-        registerKey("v2", keyV2);
-        if (!keysByKid.containsKey(currentKid)) {
-            throw new IllegalArgumentException(
-                    "app.jwt.kid-current=" + currentKid + " has no key configured under app.jwt.keys");
-        }
-        if (previousKid != null && !previousKid.isBlank() && !keysByKid.containsKey(previousKid)) {
-            throw new IllegalArgumentException(
-                    "app.jwt.kid-previous=" + previousKid + " has no key configured under app.jwt.keys");
-        }
-        this.currentKid = currentKid;
+        this.keyStore = keyStore;
         this.accessTtl = Duration.ofSeconds(accessTtlSeconds);
         this.issuer = issuer;
     }
 
     /**
-     * Legacy 3-arg constructor used by {@code JwtTokenProviderTest}. ttlHours
-     * is converted to seconds; passing 0 yields a zero-duration access TTL, matching
-     * the pre-V5 behaviour the test for "expired token" relies on.
+     * Legacy 3-arg constructor used by {@code JwtTokenProviderTest} and other
+     * pre-V5 test seams. Synthesises a single-key store under {@code v1}.
+     * ttlHours is converted to seconds; passing 0 yields a zero-duration access
+     * TTL, matching the pre-V5 behaviour the test for "expired token" relies on.
      */
     public JwtTokenProvider(String secret, long ttlHours, String issuer) {
-        this("v1", "", secret, "", ttlHours * 3600L, issuer);
+        this(new JwtKeyStore("v1", singleKeyMap(secret)), ttlHours * 3600L, issuer);
     }
 
-    private void registerKey(String kid, String secret) {
-        if (secret == null || secret.isBlank()) {
-            return;
-        }
-        byte[] raw = secret.getBytes(StandardCharsets.UTF_8);
-        if (raw.length < 32) {
-            throw new IllegalArgumentException(
-                    "app.jwt.keys." + kid + " must be at least 32 bytes for HS256 (got " + raw.length + ")");
-        }
-        keysByKid.put(kid, Keys.hmacShaKeyFor(raw));
+    private static Map<String, String> singleKeyMap(String secret) {
+        Map<String, String> m = new HashMap<>();
+        m.put("v1", secret);
+        return m;
     }
 
     public Duration getAccessTtl() {
@@ -142,9 +117,10 @@ public class JwtTokenProvider {
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("userId must not be blank");
         }
+        JwtKeyStore.Snapshot snap = keyStore.current();
         Instant now = Instant.now();
         io.jsonwebtoken.JwtBuilder builder = Jwts.builder()
-                .header().keyId(currentKid).and()
+                .header().keyId(snap.currentKid()).and()
                 .issuer(issuer)
                 .subject(userId)
                 .claim("typ", TYPE_ACCESS)
@@ -153,7 +129,7 @@ public class JwtTokenProvider {
         if (region != null && !region.isBlank()) {
             builder.claim("region", region);
         }
-        return builder.signWith(keysByKid.get(currentKid)).compact();
+        return builder.signWith(snap.currentKey()).compact();
     }
 
     /**
@@ -190,15 +166,28 @@ public class JwtTokenProvider {
     }
 
     private Jws<Claims> parse(String token) {
-        // Resolve the signing key by the token's kid header — falls back to
-        // current/previous if no header is present (legacy compat).
+        // Take ONE snapshot so the keyLocator and the parser see a consistent
+        // view; concurrent rotation can't flip the map mid-parse.
+        JwtKeyStore.Snapshot snap = keyStore.current();
         return Jwts.parser()
                 .keyLocator(header -> {
                     String kid = (String) header.get("kid");
-                    if (kid != null && keysByKid.containsKey(kid)) {
-                        return keysByKid.get(kid);
+                    if (kid != null) {
+                        SecretKey k = snap.keyFor(kid);
+                        if (k != null) {
+                            return k;
+                        }
+                        // Token names a kid we don't have. Falling back to
+                        // currentKey() would produce a misleading bad-signature
+                        // error and confuse rotation triage. Throw a clear
+                        // JwtException so the log line names the offending kid.
+                        throw new JwtException("Token signed with unknown kid='" + kid + "'");
                     }
-                    return keysByKid.get(currentKid);
+                    // No kid header — must be a legacy / pre-rotation token.
+                    // Validate against the current key (best-effort) — the
+                    // store's bootstrap seeds v1 from JWT_SECRET so this
+                    // matches the wire of every pre-rotation issuer.
+                    return snap.currentKey();
                 })
                 .requireIssuer(issuer)
                 .build()

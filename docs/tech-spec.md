@@ -444,7 +444,7 @@ Real auth was wired in roadmap §2.1 (commit `1b82186`). Today's surface:
 
 **Key rotation.** `JwtTokenProvider` keeps a `Map<kid, SecretKey>`. The current signing kid lives in `app.jwt.kid-current`; a one-version rollback window exists via `app.jwt.kid-previous`. To rotate: deploy with `kid-current=v2, kid-previous=v1`; wait for all access tokens minted under v1 to expire (15 min); drop v1 from the map on the next deploy.
 
-**Today's secret stash.** The actual key bytes are in `app.jwt.keys.v1` / `.v2`. The `random_password.jwt_secret` terraform resource generates `v1` and stores it in tfstate; on container start it's injected via `JWT_SECRET` env. Moving the secret to Secret Manager (with versioning) is roadmap §3.3.
+**Secret Manager + sidecar reload.** In production the gateway reads `oj-jwt-keys` from Secret Manager via a 60-s systemd-timer mirror to `/var/secrets/jwt-keys.json`; `JwtKeyStore` polls the file at the same cadence and swaps the in-memory key map atomically (no restart). A monthly Cloud Scheduler → Cloud Function (`oj-rotate-jwt-key`) writes a new version with `current=vN+1` and `previous=[vN]`; the gateway picks it up in ≤ 2 minutes end-to-end. Full design: [`design-docs/key-rotation.md`](./design-docs/key-rotation.md). The initial v1 is still seeded from `random_password.jwt_secret` in tfstate (a one-time bootstrap); after two rotations the operator can drop that resource (deferred Phase D in the design doc).
 
 ### 7.2 Source-code size cap
 
@@ -452,7 +452,7 @@ Real auth was wired in roadmap §2.1 (commit `1b82186`). Today's surface:
 
 ### 7.3 V4-signed GCS URLs
 
-Test-case bytes never reach the worker except through a signed URL. The signer SA (`oj-problem-signer@…`) has only `roles/storage.objectViewer` on the bucket — the URLs it signs can read, never write. TTL 5 minutes. The signer's private key lives on disk inside the problem-service container, fetched from Secret Manager at VM boot.
+Test-case bytes never reach the worker except through a signed URL. The signer SA (`oj-problem-signer@…`) has only `roles/storage.objectViewer` on the bucket — the URLs it signs can read, never write. TTL 5 minutes. The signer's private key lives on disk inside the problem-service container, fetched from Secret Manager at VM boot AND mirrored every 60 s by `oj-refresh-secrets.timer`; the monthly Cloud Function `oj-rotate-signer-key` mints a fresh SA key and writes a new Secret Manager version. On a bytes-changed mirror cycle the timer bounces the problem-service container — V4 URLs already carry a 5-minute TTL so the URL "overlap window" is free. Full design: [`design-docs/key-rotation.md`](./design-docs/key-rotation.md).
 
 This makes a leaked URL a 5-minute window of exposure rather than a permanent credential. It also means the worker container doesn't need any GCS-side IAM — it just curls the signed URL.
 
@@ -871,7 +871,7 @@ Short list — each item points at deeper material.
 |---|---|---|
 | Single-broker Kafka, single-node CRDB | [`design-docs/kafka-cluster-and-crdb-cluster.md`](./design-docs/kafka-cluster-and-crdb-cluster.md) | High — SPOF for the data plane |
 | OTel collector deployed and configured; dashboards/alerts shipped as code; awaits the `/opt/oj/.env` flip per `infra/observability/activation-runbook.md` | §9 + `design-docs/otel-collector-activation-plan.md` | Low — single-line operator flip; dashboards/alerts apply via `gcloud` |
-| JWT secret + signer SA key both in tfstate, no rotation cron | Roadmap §3.3, §3.4 | Medium — key rotation discipline missing |
+| JWT secret + signer SA key both in tfstate, no rotation cron — initial v1 still seeded from tfstate; subsequent rotations via Cloud Scheduler → Cloud Function → Secret Manager → on-disk sidecar + in-process hot-reload | [`design-docs/key-rotation.md`](./design-docs/key-rotation.md); roadmap §3.3, §3.4 | Low — rotation cron in place; only the initial v1 seed remains in tfstate (deferred Phase D cleanup) |
 | Auth endpoints share the per-IP rate limit bucket with submission posts | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | Medium — brute-force login eats submission budget |
 | scoring-pipeline not deployed (Flink cluster) | §4.7 + Agent I's audit | Medium — leaderboard-service does a stand-in calculation |
 | React SPA not built | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | High for v1 launch — no UI |

@@ -233,6 +233,93 @@ else
   rm -f /opt/oj/gcs-signer.json.new
 fi
 
+# ---------- Fetch JWT key set from Secret Manager ---------------------------
+# The Cloud Function oj-rotate-jwt-key writes a new version monthly; the
+# api-gateway hot-reloads from /var/secrets/jwt-keys.json via the on-disk
+# poller in JwtKeyStore. On a fresh project, the secret may not exist yet
+# (the Function hasn't run) — in that case we leave an empty file so the
+# compose mount succeeds; the gateway falls back to the inline JWT_SECRET.
+# See docs/design-docs/key-rotation.md for the rotation flow.
+echo "[oj-startup] fetching JWT key set from Secret Manager"
+if gcloud secrets versions access latest --secret="oj-jwt-keys" \
+     > /opt/oj/jwt-keys.json.new 2>/dev/null; then
+  chmod 0400 /opt/oj/jwt-keys.json.new
+  mv /opt/oj/jwt-keys.json.new /opt/oj/jwt-keys.json
+  echo "[oj-startup] jwt-keys.json ready"
+else
+  echo "[oj-startup] WARN: oj-jwt-keys secret not yet provisioned — gateway will use inline JWT_SECRET"
+  rm -f /opt/oj/jwt-keys.json.new
+  # Touch an empty file so the compose volume mount succeeds. JwtKeyStore
+  # tolerates an empty / unparseable sidecar — it logs a warn and keeps the
+  # inline seed map.
+  : > /opt/oj/jwt-keys.json
+  chmod 0400 /opt/oj/jwt-keys.json
+fi
+
+# ---------- Install systemd timer to refresh secrets every 60 s -------------
+# Mirrors Secret Manager onto disk so rotation events are picked up without
+# rebooting the VM. The api-gateway's JwtKeyStore polls /var/secrets/jwt-keys.json
+# at the same cadence; the problem-service notices a file-mtime change in its
+# Docker volume but does NOT hot-reload (signer credentials are immutable in
+# the SDK) — instead the timer post-fetch hook bounces the container.
+cat > /usr/local/bin/oj-refresh-secrets.sh <<'REFRESH'
+#!/usr/bin/env bash
+set -euo pipefail
+JWT_TMP=/opt/oj/jwt-keys.json.new
+SIGNER_TMP=/opt/oj/gcs-signer.json.new
+JWT_DST=/opt/oj/jwt-keys.json
+SIGNER_DST=/opt/oj/gcs-signer.json
+
+if gcloud secrets versions access latest --secret="oj-jwt-keys" > "$JWT_TMP" 2>/dev/null; then
+  if ! cmp -s "$JWT_TMP" "$JWT_DST"; then
+    chmod 0400 "$JWT_TMP" && mv "$JWT_TMP" "$JWT_DST"
+    echo "[oj-refresh-secrets] jwt-keys.json updated"
+  else
+    rm -f "$JWT_TMP"
+  fi
+fi
+
+if gcloud secrets versions access latest --secret="oj-problem-signer-key" > "$SIGNER_TMP" 2>/dev/null; then
+  if ! cmp -s "$SIGNER_TMP" "$SIGNER_DST"; then
+    chmod 0400 "$SIGNER_TMP" && mv "$SIGNER_TMP" "$SIGNER_DST"
+    echo "[oj-refresh-secrets] gcs-signer.json updated; bouncing problem-service"
+    docker restart oj-problem-service >/dev/null 2>&1 || true
+  else
+    rm -f "$SIGNER_TMP"
+  fi
+fi
+REFRESH
+chmod 0755 /usr/local/bin/oj-refresh-secrets.sh
+
+cat > /etc/systemd/system/oj-refresh-secrets.service <<'UNIT'
+[Unit]
+Description=Online Judge — mirror Secret Manager secrets (JWT + signer) to disk
+After=oj-region.service
+UNIT
+
+cat >> /etc/systemd/system/oj-refresh-secrets.service <<'UNIT'
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oj-refresh-secrets.sh
+UNIT
+
+cat > /etc/systemd/system/oj-refresh-secrets.timer <<'UNIT'
+[Unit]
+Description=Run oj-refresh-secrets every 60 s
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now oj-refresh-secrets.timer || \
+  echo "[oj-startup] WARN: oj-refresh-secrets.timer enable failed; rotation will require a manual fetch"
+
 # ---------- Pre-pull AR images (avoid first-boot stall) ---------------------
 for IMG in api-gateway problem-service contest-service leaderboard-service sandbox-manager execution-worker; do
   echo "[oj-startup] pre-pulling $IMG"

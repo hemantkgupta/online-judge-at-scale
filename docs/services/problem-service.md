@@ -142,7 +142,9 @@ public Storage storage(@Value("${gcs.signer-credentials-path:}") String keyPath,
 }
 ```
 
-The key file is loaded ONCE at startup. The credentials object lives in JVM memory for the process lifetime. The on-disk file is mounted read-only from `/var/secrets/gcs-signer.json` (compose volume from `/opt/oj/gcs-signer.json` on the host). The host's signer key is fetched from Secret Manager by `control-plane.sh.tpl` on every VM boot.
+The key file is loaded ONCE at startup. The credentials object lives in JVM memory for the process lifetime. The on-disk file is mounted read-only from `/var/secrets/gcs-signer.json` (compose volume from `/opt/oj/gcs-signer.json` on the host). The host's signer key is fetched from Secret Manager by `region.sh.tpl` on every VM boot.
+
+**Rotation.** Monthly via Cloud Scheduler → Cloud Function `oj-rotate-signer-key`, which mints a fresh SA key and writes it to Secret Manager. On each VM the `oj-refresh-secrets.timer` systemd timer mirrors the secret to `/opt/oj/gcs-signer.json` every 60 s and runs `docker restart oj-problem-service` when the bytes change. The bounce is sub-second; the worker's `ack.nack(5s)` retry on test-case GETs absorbs the gap. Why a bounce rather than hot-reload: Google's `ServiceAccountCredentials` is intentionally immutable, and V4-signed URLs already carry a 5-minute TTL so the "overlap window" we need for outstanding URLs is free. See [`../design-docs/key-rotation.md`](../design-docs/key-rotation.md) for the full design.
 
 ### 3.4 Health check + readiness
 
@@ -158,7 +160,7 @@ The startup-time check is implicit: if `GCS_SIGNER_KEY_PATH` is set but the file
 
 | Resource | Lifetime | Where |
 |---|---|---|
-| Signer SA private key | per-VM-boot (re-fetched from Secret Manager) | `/opt/oj/gcs-signer.json` on host; mounted into container at `/var/secrets/gcs-signer.json` (ro, mode 0400) |
+| Signer SA private key | per-VM-boot AND per-rotation (`oj-refresh-secrets.timer` re-fetches every 60 s; bounces the container when bytes change) | `/opt/oj/gcs-signer.json` on host; mounted into container at `/var/secrets/gcs-signer.json` (ro, mode 0400). Rotation orchestration in [`../design-docs/key-rotation.md`](../design-docs/key-rotation.md) |
 | Storage client + parsed credentials | process lifetime | JVM heap |
 | `problems` rows | (read-only here; api-gateway Flyway owns the schema, operator SQL writes today) | `onlinejudge.problems` |
 | `test_cases` rows | (read-only here) | `onlinejudge.test_cases` |
@@ -304,7 +306,34 @@ curl -s "$URL" | python3 -c "import sys,hashlib;b=sys.stdin.buffer.read();print(
 
 Compare against the hash the worker would compute. Mismatch → re-upload the GCS object with correct bytes (UTF-8, no BOM, content matches reference solution output).
 
-### 8.5 "problem-service heap pressure / OOM"
+### 8.5 "signer key rotated; problem-service didn't pick it up"
+
+**Symptom.** A new Secret Manager version of `oj-problem-signer-key` was written (manually or by the Cloud Function) more than 90 s ago, but `/opt/oj/gcs-signer.json` on the VM still has the old bytes — or the file changed but the container is still serving signed URLs verified with the old key.
+
+**Diagnose.**
+```sh
+gcloud compute ssh oj-region-a --zone=asia-south1-a --tunnel-through-iap --command='
+  # Did the systemd timer run?
+  systemctl status oj-refresh-secrets.timer
+  journalctl -u oj-refresh-secrets.service --since "10 min ago" --no-pager | tail -40
+
+  # When was the file last updated?
+  stat /opt/oj/gcs-signer.json | grep Modify
+
+  # Is the container still up?
+  sudo docker ps --filter name=oj-problem-service --format "table {{.Status}}"
+'
+```
+
+**Likely cause & fix.**
+- *Timer disabled.* `systemctl enable --now oj-refresh-secrets.timer`. The startup script installs and enables it; a manual `systemctl disable` is the only way it gets turned off.
+- *gcloud auth lapsed on the VM.* The region SA should have `roles/secretmanager.secretAccessor`. Verify the binding in `infra/gcp/terraform/key-rotation.tf`.
+- *Bounce didn't happen.* The refresh script `docker restart`s the container only when the file bytes change. If the file was overwritten with identical content, no bounce. Force one: `sudo docker restart oj-problem-service`.
+- *Bounce happened but the bean cached the OLD credentials.* The bean lifetime IS the container lifetime; a restart MUST give a fresh credentials object. If this is somehow not the case, that's a Spring DI bug — capture the JVM heap and open an incident.
+
+See [`../design-docs/key-rotation.md`](../design-docs/key-rotation.md#rotation-flow-gcs-v4-signer-sa-key) for the full flow.
+
+### 8.6 "problem-service heap pressure / OOM"
 
 **Symptom.** Container restart with `OutOfMemoryError` in logs. JVM heap pegged.
 

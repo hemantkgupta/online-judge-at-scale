@@ -86,6 +86,23 @@ variable "auto_shutdown_timezone" {
   default     = "Asia/Kolkata"
 }
 
+# ---------- Key rotation ----------------------------------------------------
+# Two monthly schedules, deliberately offset by ~14 days so we don't stack
+# the JWT and signer-SA rotations on the same night. See
+# `infra/gcp/terraform/key-rotation.tf` for the wiring.
+
+variable "key_rotation_jwt_cron" {
+  description = "Cron expression for the monthly JWT signing-key rotation. UTC."
+  type        = string
+  default     = "0 2 1 * *" # 02:00 UTC on the 1st of every month
+}
+
+variable "key_rotation_signer_cron" {
+  description = "Cron expression for the monthly GCS V4 signer-SA-key rotation. UTC."
+  type        = string
+  default     = "0 2 15 * *" # 02:00 UTC on the 15th of every month (offset from JWT by 14 days)
+}
+
 # ---------- Artifact Registry -----------------------------------------------
 
 variable "artifact_repo_name" {

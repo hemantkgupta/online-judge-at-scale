@@ -64,9 +64,15 @@ app:
   # cycle. Every key value MUST be at least 32 bytes for HS256 — startup fails
   # otherwise.
   #
-  # TODO(secret-manager): the actual key bytes should be sourced from Google
-  # Secret Manager (one secret per kid) rather than env. Tracked in a separate
-  # rotation pass — for now `JWT_SECRET` continues to feed keys.v1.
+  # Secret Manager → sidecar file → JwtKeyStore (in-process hot-reload).
+  # The startup-side fetch is owned by `oj-jwt-keys.timer` (systemd) which
+  # mirrors `oj-jwt-keys` from Secret Manager onto disk every 60 s. The
+  # in-process poller below detects content changes and swaps the key map
+  # atomically — no restart needed. See docs/design-docs/key-rotation.md.
+  #
+  # If `app.jwt.key-store.path` is unset (local dev / tests), the store falls
+  # back to the inline `app.jwt.keys.<kid>` map below — same wire as before
+  # the rotation refactor.
   jwt:
     secret: ${JWT_SECRET:dev-only-secret-please-rotate-in-prod-32+chars-needed-for-HS256}
     keys:
@@ -74,6 +80,14 @@ app:
       v2: ${JWT_KEY_V2:}
     kid-current: ${JWT_KID_CURRENT:v1}
     kid-previous: ${JWT_KID_PREVIOUS:}
+    key-store:
+      # Production path: /var/secrets/jwt-keys.json (mounted from
+      # /opt/oj/jwt-keys.json on the VM, written by the systemd timer).
+      # Blank → no sidecar; inline keys are authoritative.
+      path: ${JWT_KEY_STORE_PATH:}
+      # 60 s is the default Secret-Manager-mirror cadence; matching them
+      # bounds the worst-case staleness at ~2× the cadence.
+      poll-interval-ms: ${JWT_KEY_STORE_POLL_INTERVAL_MS:60000}
     # Access tokens are short-lived (15 min) and stateless. Refresh tokens
     # live 7 days, sit in the refresh_tokens table, and rotate on every use.
     access-ttl-seconds: ${JWT_ACCESS_TTL_SECONDS:900}
