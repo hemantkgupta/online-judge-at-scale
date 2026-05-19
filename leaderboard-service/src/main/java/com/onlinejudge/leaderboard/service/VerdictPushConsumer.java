@@ -3,9 +3,10 @@ package com.onlinejudge.leaderboard.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.onlinejudge.common.events.Events.VerdictEvent;
-import lombok.RequiredArgsConstructor;
+import com.onlinejudge.leaderboard.writer.LeaderboardWriter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -43,7 +44,6 @@ import java.time.Duration;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class VerdictPushConsumer {
 
     private static final String VERDICT_TOPIC_PREFIX = "/topic/verdicts/";
@@ -54,6 +54,27 @@ public class VerdictPushConsumer {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
     private final VerdictConnectionRegistry connectionRegistry;
+    /**
+     * Optional stand-in leaderboard writer. Absent when
+     * {@code app.leaderboard.writer.enabled=false} — at that point Flink
+     * (scoring-pipeline) owns the writes and we deliberately don't double-write.
+     * Injected as {@link ObjectProvider} so the {@code @KafkaListener} bean
+     * still wires (and verdict-cache + WebSocket push still run) when the
+     * writer is off.
+     */
+    private final ObjectProvider<LeaderboardWriter> writerProvider;
+
+    public VerdictPushConsumer(SimpMessagingTemplate messagingTemplate,
+                               StringRedisTemplate redisTemplate,
+                               ObjectMapper objectMapper,
+                               VerdictConnectionRegistry connectionRegistry,
+                               ObjectProvider<LeaderboardWriter> writerProvider) {
+        this.messagingTemplate = messagingTemplate;
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
+        this.connectionRegistry = connectionRegistry;
+        this.writerProvider = writerProvider;
+    }
 
     // Group is region-namespaced so two regions' leaderboard-services do NOT
     // share a consumer group. If they did, Kafka would partition-rebalance
@@ -102,6 +123,22 @@ public class VerdictPushConsumer {
                         VERDICT_STORE_KEY_PREFIX + submissionId,
                         payload,
                         VERDICT_TTL);
+            }
+
+            // Stand-in leaderboard write (M1 closure; flipped off when
+            // scoring-pipeline / Flink takes over via
+            // app.leaderboard.writer.enabled=false). Failures here must NOT
+            // break the WebSocket push: scored verdicts are eventually
+            // reconciled by Flink, but a missed WS push means a stale UI for
+            // the contestant.
+            LeaderboardWriter writer = writerProvider.getIfAvailable();
+            if (writer != null) {
+                try {
+                    writer.onVerdict(verdict);
+                } catch (Exception ex) {
+                    log.warn("[verdict-push] leaderboard writer failed (continuing with WS push). submissionId={} err={}",
+                            submissionId.isEmpty() ? "?" : submissionId, ex.toString());
+                }
             }
 
             if (!connectionRegistry.isConnectedLocally(userId)) {

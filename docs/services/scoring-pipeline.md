@@ -1,12 +1,12 @@
 # scoring-pipeline
 
-> **Owner page.** Last reconciled with the repo on **2026-05-18**.
+> **Owner page.** Last reconciled with the repo on **2026-05-19**.
 >
-> The single source of truth for the scoring-pipeline module. Cross-cutting concerns (proto schema, Kafka topic catalogue) live in [`../tech-spec.md`](../tech-spec.md). The simpler stand-in calculation that runs in production today is documented at [`./leaderboard-service.md`](./leaderboard-service.md).
+> The single source of truth for the scoring-pipeline module. Cross-cutting concerns (proto schema, Kafka topic catalogue) live in [`../tech-spec.md`](../tech-spec.md). The simpler stand-in calculation that runs in production today (until this Flink job is productionised) is documented at [`./leaderboard-service.md`](./leaderboard-service.md) §3.6.
 >
 > Read this page if you are: (a) about to stand up a Flink JobManager and submit this job for the first time, (b) changing scoring rules in `scoring-pipeline/`, (c) trying to understand why two services appear to write to the same Redis sorted-set keys.
 
-> **Status (2026-05-18): BLOCKED.** This module compiles and has unit tests (including `ScoringEndToEndTest` driving the scoring algorithm directly), but is NOT deployable as a Spring container. `build.gradle` declares Flink as `compileOnly` and `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()`, which expects an external Flink runtime. Deploying scoring-pipeline = standing up a Flink JobManager + TaskManager pair (in compose, or moving to managed Cloud Dataflow), uploading the fat JAR via `POST /jars/upload`, and submitting the job. Until then, [`./leaderboard-service.md`](./leaderboard-service.md) performs a simpler ZADD-by-points calculation as a stand-in.
+> **Status (2026-05-19): job code is ready; productionising (Flink JM/TM in compose, fat-JAR submission, smoke harness) tracked in PR #8.** This module compiles and has unit tests (including `ScoringEndToEndTest` driving the scoring algorithm directly), but is NOT deployable as a Spring container. `build.gradle` declares Flink as `compileOnly` and `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()`, which expects an external Flink runtime. Deploying scoring-pipeline = standing up a Flink JobManager + TaskManager pair (in compose, or moving to managed Cloud Dataflow), uploading the fat JAR via `POST /jars/upload`, and submitting the job. **Until PR #8 lands**, leaderboard-service's stand-in `LeaderboardWriter` (§3.6 of its owner page; landed 2026-05-19) is the live writer — a simpler ZADD-by-points implementation with penalty = 0. See [§11 Follow-up](#11-follow-up-leaderboard-service-writer-cutover) for the cutover plan.
 
 ---
 
@@ -14,7 +14,7 @@
 
 The Flink DataStream job that — once deployed — will be the official scorer for contest leaderboards. It consumes `evaluated_results`, applies stateful ICPC-style scoring (first-AC-wins on event-time, twenty-minute penalty per pre-AC wrong attempt, partial credit reserved for the future), and writes composite-score ZADDs to the score-range-sharded Redis sorted set that powers the read-side leaderboard.
 
-The job exists separately from leaderboard-service because real contest scoring is order-sensitive in event-time, requires per-(user, problem) state, and must self-correct when a late verdict arrives with an earlier event-time than the current accepted-at. That does not fit in a Spring `@KafkaListener`; Flink's keyed state, watermarks, and exactly-once checkpointing are the right primitives. Today the code captures the intent — `Scorer` is a pure-function port of the ICPC rules, exercised end-to-end by `ScoringEndToEndTest` — but no Flink cluster runs anywhere, so the rules are not in effect on the live Redis keys. The live math is whatever leaderboard-service's `KafkaListener` calculates.
+The job exists separately from leaderboard-service because real contest scoring is order-sensitive in event-time, requires per-(user, problem) state, and must self-correct when a late verdict arrives with an earlier event-time than the current accepted-at. That does not fit in a Spring `@KafkaListener`; Flink's keyed state, watermarks, and exactly-once checkpointing are the right primitives. Today the code captures the intent — `Scorer` is a pure-function port of the ICPC rules, exercised end-to-end by `ScoringEndToEndTest` — but until PR #8 productionises the Flink runtime, the live math is leaderboard-service's stand-in `LeaderboardWriter` (`totalPoints * 10_000_000`, penalty = 0) running off the same `@KafkaListener` that drives the WebSocket push. The stand-in and this Flink job share the same shard router, the same Lua key/arg shape, and the same composite-score encoding — only the penalty arithmetic differs.
 
 ---
 
@@ -24,7 +24,7 @@ scoring-pipeline is **not** a Spring Boot service. No REST, no `/actuator/health
 
 **Kafka input.** Topic `regional.evaluated_results` (configurable via `SCORING_INPUT_TOPIC` / `SCORING_KAFKA_TOPIC`); default targets the MM2-mirrored global topic, unmirrored regional name is `evaluated_results`. Consumer group `scoring-pipeline`. Starting offset `OffsetsInitializer.earliest()` on first run; thereafter Flink's checkpoint state owns the offsets, not `__consumer_offsets`. Wire format: binary protobuf `VerdictEvent` (see `common/src/main/proto/events.proto`), deserialised lazily inside the watermark assigner and `keyBy` extractor — the Flink record type is `byte[]`.
 
-**Redis output.** Keys `leaderboard:{contestId}:shard:{shardIndex}` ZSETs, plus a `score_updates:{contestId}` Pub/Sub channel. A single Lua script (`LUA_UPDATE_SCORE` in `RedisLeaderboardSink`) does `ZREM` from non-target shards + `ZADD` to the target + `ZREVRANK` + `PUBLISH`, atomically. Shard index comes from `ScoreRangeShardRouter.shardForScore(zsetScore)` in `:common`. Score encoding: `ScoreEncoder.encode(totalPoints, penaltyMinutes) = totalPoints * 10_000_000 - penaltyMinutes`. Both this service and leaderboard-service target the same ZSET key pattern; once scoring-pipeline is deployed, leaderboard-service's writer path must be disabled or the two will race. Today, only leaderboard-service writes; the overlap is latent.
+**Redis output.** Keys `leaderboard:{contestId}:shard:{shardIndex}` ZSETs, plus a `score_updates:{contestId}` Pub/Sub channel. A single Lua script (`LUA_UPDATE_SCORE` in `RedisLeaderboardSink`) does `ZREM` from non-target shards + `ZADD` to the target + `ZREVRANK` + `PUBLISH`, atomically. Shard index comes from `ScoreRangeShardRouter.shardForScore(zsetScore)` in `:common`. Score encoding: `ScoreEncoder.encode(totalPoints, penaltyMinutes) = totalPoints * 10_000_000 - penaltyMinutes`. Both this service and leaderboard-service's stand-in writer target the same ZSET key pattern with byte-identical Lua bodies; once scoring-pipeline is deployed and verified at rate-parity, the operator flips `app.leaderboard.writer.enabled=false` and the stand-in bean drops out (see [§11 Follow-up](#11-follow-up-leaderboard-service-writer-cutover)).
 
 **Submission surface (deployment-time).** The job has no listening port; the Flink cluster does. Submission:
 
@@ -66,10 +66,10 @@ Verdicts whose `phase` is not `system` or `final` are dropped before state mutat
 | Kafka offsets for `scoring-pipeline` | per-checkpoint | Flink checkpoint state (not `__consumer_offsets`) |
 | `ScoringState` per userId | running job | Flink keyed state (heap today; RocksDB in prod) |
 | Checkpoints | per-interval | `CHECKPOINT_DIR` — local FS in dev, object store in prod |
-| `leaderboard:{contestId}:shard:{i}` ZSETs | contest lifetime | Redis (overlaps with leaderboard-service today) |
+| `leaderboard:{contestId}:shard:{i}` ZSETs | contest lifetime | Redis (overlaps with leaderboard-service's stand-in writer until cutover) |
 | `score_updates:{contestId}` Pub/Sub | transient | Redis (consumed by leaderboard-service's WebSocket fan-out) |
 
-Not touched: CRDB. The ZSET overlap is the architecture shift the deployment requires — when the Flink job comes online, leaderboard-service's writer turns off; its reader + WebSocket fan-out stays.
+Not touched: CRDB. The ZSET overlap is the architecture shift the deployment requires — when the Flink job comes online and is observed at rate-parity, the operator flips `app.leaderboard.writer.enabled=false` on leaderboard-service and the stand-in writer drops out. Its reader + WebSocket fan-out stays.
 
 ---
 
@@ -77,7 +77,7 @@ Not touched: CRDB. The ZSET overlap is the architecture shift the deployment req
 
 | Failure | Detection | Behaviour |
 |---|---|---|
-| **No Flink runtime today** | Job never submitted; `scoring-pipeline` group has no consumers | leaderboard-service's ZADD-by-points is live; ICPC penalty math is not in effect |
+| **No Flink runtime in production** (PR #8 productionising) | Job never submitted; `scoring-pipeline` group has no consumers | leaderboard-service's stand-in `LeaderboardWriter` is live (ZADD-by-points, penalty = 0); ICPC penalty math is not in effect until Flink takes over |
 | JM / TM crash | Supervisor restarts job from last checkpoint | Kafka source rewinds to checkpointed offsets; replayed ZADDs are idempotent |
 | Redis sink unreachable | Jedis throws; Flink retries via job restart strategy | Job stalls at the failed barrier; Kafka-side lag visible |
 | Late VerdictEvent (event-time before watermark) | Bytes flow through; `Scorer.apply` consumes them | Order-independent: late WA before accepted raises penalty; earlier-event-time ACCEPTED lowers `acceptedAtMs`. Correct under cross-region Cluster-Linking lag |
@@ -131,7 +131,7 @@ Future-tense — without a Flink cluster, none of these fire today; they are pla
 
 **Redis sink lag — `ScoreUpdate`s emit but ZSET doesn't change.** Verify the Lua script is current and the shard router is `defaultIcpcRouter()` — writer/reader router mismatch is the silent-bug class. `redis-cli MONITOR` reveals ZADDs landing on the wrong key.
 
-**Score values diverging from leaderboard-service's fallback math.** Expected during cutover. Disable leaderboard-service's writer in the same change as the scoring-pipeline deploy — otherwise both writers contend on the same ZSETs and final state depends on which write landed last. Right cutover: deploy scoring-pipeline, observe parity on `oj.scoring.score_updates_total`, *then* flip leaderboard-service's writer off.
+**Score values diverging from leaderboard-service's stand-in math.** Expected. The stand-in encodes `totalPoints * 10_000_000` (penalty = 0); this Flink job encodes `totalPoints * 10_000_000 - penaltyMinutes`. Per-user values differ; only the relative rank within a points-tier and the rate of writes are comparable. The cutover criterion is **rate parity** (`oj.scoring.score_updates_total` vs `oj.leaderboard.writer.writes_total`), not value parity. Right cutover: deploy this job; observe rate parity for ≥5 contests; *then* flip `app.leaderboard.writer.enabled=false` on leaderboard-service. The two writers share the same Lua, same shard router, same score encoding — brief overlap during the flip is no-op in score-encoding space.
 
 **Submitting the fat JAR.** `./gradlew :scoring-pipeline:shadowJar` → `scoring-pipeline/build/libs/scoring-pipeline-all.jar`. Submission curl in §2. Verify at `<flink-jm>:18081/jobs/overview`.
 
@@ -183,7 +183,31 @@ Cross-reference: [`../design-docs/kafka-cluster-and-crdb-cluster.md`](../design-
 
 ---
 
-## 11. Code map
+## 11. Follow-up: leaderboard-service writer cutover
+
+The full M1 closure (tech-spec §14) is three pieces:
+
+1. **Stand-in writer in leaderboard-service.** Landed 2026-05-19. ZADD-by-points (penalty = 0) gated by `app.leaderboard.writer.enabled` (default `true`). See [`./leaderboard-service.md`](./leaderboard-service.md) §3.6.
+2. **Flink productionisation.** PR #8 (smoke harness + JM/TM compose + fat-JAR submission flow + MM2 cross-region wiring).
+3. **Cutover flip.** Operator action, AFTER (1) and (2) both land.
+
+**Why both pieces ship together (rather than gating either on the other).** The stand-in closes M1 with working code today: `LeaderboardWriter` writes the ZSETs, the read API returns non-empty pages, the WebSocket `/topic/leaderboard/{contestId}` channel actually fires. Flink (PR #8) then takes over with real ICPC penalty math, exactly-once semantics, and event-time correctness. Decoupling the two lets each PR review on its own merits without the M1 close being held hostage to the Flink runtime productionisation.
+
+**Cutover procedure** (operator action, no code change required):
+
+1. Submit a synthetic contest. Confirm `oj.leaderboard.writer.writes_total{contest_id=...}` and `oj.scoring.score_updates_total{contest_id=...}` both increment on each ACCEPTED system verdict.
+2. Watch the operator parity tile across ≥5 contests over ≥24 h. The two counter rates should match (not the absolute values — penalty math differs).
+3. Uncomment `APP_LEADERBOARD_WRITER_ENABLED: "false"` in [`infra/gcp/compose/region.yml`](../../infra/gcp/compose/region.yml) for the `oj-leaderboard-service` block and `docker compose up -d oj-leaderboard-service`. The stand-in `LeaderboardWriter` bean drops out of leaderboard-service's context at startup; the `@KafkaListener` keeps running.
+4. Verify `oj.leaderboard.writer.writes_total` flatlines while `oj.scoring.score_updates_total` continues. Verify the leaderboard reads still return non-empty pages (now backed by Flink's writes).
+5. Optional: `DEL processed:{contestId}` and `leaderboard:state:{contestId}` for active contests after the flip — these are stand-in scratch keys and have a 24 h TTL anyway.
+
+**If something goes wrong** (Flink stops emitting, the ZSETs go cold): comment the env var back out and bounce leaderboard-service. The stand-in resumes from the next ACCEPTED verdict. Both writers are idempotent at the ZSET level (same Lua, equal scores ZADD as no-op).
+
+**Cross-reference.** Audit that surfaced the premise mismatch (LB-service had never actually been the writer, despite docs assuming it was): handled by agent `af394dca` (2026-05-19).
+
+---
+
+## 12. Code map
 
 | Concern | File |
 |---|---|
