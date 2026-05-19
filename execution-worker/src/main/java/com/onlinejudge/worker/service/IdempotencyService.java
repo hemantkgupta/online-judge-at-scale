@@ -67,7 +67,21 @@ public class IdempotencyService {
         POISON
     }
 
-    public record ClaimDecision(ClaimStatus status, Instant leaseStartedAt) {
+    /**
+     * @param attempts the {@code attempts} value of the row at the moment
+     *                 of the decision. 1 for a freshly-INSERTed row;
+     *                 {@code n} after the n-th reclaim. 0 when the
+     *                 decision didn't correspond to a row (e.g. lost race
+     *                 path that returns IN_PROGRESS with no row read).
+     *                 Surfaced so the worker's
+     *                 {@code worker.idempotency.attempts_max} gauge can
+     *                 observe the high-water mark without a second SELECT
+     *                 (tech-spec §9.3).
+     */
+    public record ClaimDecision(ClaimStatus status, Instant leaseStartedAt, int attempts) {
+        public ClaimDecision(ClaimStatus status, Instant leaseStartedAt) {
+            this(status, leaseStartedAt, 0);
+        }
         public boolean claimed() {
             return status == ClaimStatus.CLAIMED;
         }
@@ -91,7 +105,7 @@ public class IdempotencyService {
             .executeUpdate();
 
             if (rows == 1) {
-                return new ClaimDecision(ClaimStatus.CLAIMED, claimedAt);
+                return new ClaimDecision(ClaimStatus.CLAIMED, claimedAt, 1);
             }
 
         } catch (DataIntegrityViolationException ex) {
@@ -186,7 +200,11 @@ public class IdempotencyService {
 
         if (reclaimed == 1) {
             log.info("[idempotency] Reclaimed stale claim submission={} phase={}", submissionId, phase);
-            return new ClaimDecision(ClaimStatus.CLAIMED, claimedAt);
+            // Re-read to surface the bumped attempts count so the worker
+            // can feed it to the worker.idempotency.attempts_max gauge.
+            Row reclaimedRow = currentRow(compositeKey);
+            int attempts = reclaimedRow == null ? 0 : reclaimedRow.attempts();
+            return new ClaimDecision(ClaimStatus.CLAIMED, claimedAt, attempts);
         }
 
         Row r = currentRow(compositeKey);
@@ -198,11 +216,11 @@ public class IdempotencyService {
         }
         if ("completed".equals(r.status())) {
             log.info("[idempotency] Skipping completed duplicate submission={} phase={}", submissionId, phase);
-            return new ClaimDecision(ClaimStatus.COMPLETED, null);
+            return new ClaimDecision(ClaimStatus.COMPLETED, null, r.attempts());
         }
         if ("poisoned".equals(r.status())) {
             log.warn("[idempotency] Poisoned duplicate submission={} phase={}", submissionId, phase);
-            return new ClaimDecision(ClaimStatus.POISON, null);
+            return new ClaimDecision(ClaimStatus.POISON, null, r.attempts());
         }
         // status=processing. If attempts >= cap AND the row is stale,
         // upgrade to POISON. (Non-stale processing means another worker
@@ -211,12 +229,12 @@ public class IdempotencyService {
                 && r.createdAt().isBefore(staleBefore)) {
             log.warn("[idempotency] Attempts cap reached submission={} phase={} attempts={}",
                     submissionId, phase, r.attempts());
-            return new ClaimDecision(ClaimStatus.POISON, null);
+            return new ClaimDecision(ClaimStatus.POISON, null, r.attempts());
         }
 
         log.info("[idempotency] Submission still processing submission={} phase={} status={} attempts={}",
                 submissionId, phase, r.status(), r.attempts());
-        return new ClaimDecision(ClaimStatus.IN_PROGRESS, null);
+        return new ClaimDecision(ClaimStatus.IN_PROGRESS, null, r.attempts());
     }
 
     private record Row(String status, int attempts, Instant createdAt) {}

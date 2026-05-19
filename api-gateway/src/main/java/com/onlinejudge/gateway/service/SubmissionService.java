@@ -5,6 +5,7 @@ import com.onlinejudge.gateway.dto.SubmissionRequest;
 import com.onlinejudge.gateway.dto.SubmissionResponse;
 import com.onlinejudge.gateway.model.OutboxEvent;
 import com.onlinejudge.gateway.model.Submission;
+import com.onlinejudge.gateway.observability.GatewayMetrics;
 import com.onlinejudge.gateway.repository.OutboxEventRepository;
 import com.onlinejudge.gateway.repository.SubmissionRepository;
 import lombok.RequiredArgsConstructor;
@@ -32,6 +33,15 @@ public class SubmissionService {
     private final SubmissionRepository submissionRepository;
     private final OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
+    /**
+     * Tech-spec §9.3: submission.accepted counter wire-in. Optional so
+     * older Mockito-driven tests can stay quiet without an explicit mock
+     * — when absent, the increment is a no-op. Production wiring is via
+     * Spring constructor injection (this is a constructor-injected
+     * {@code @Autowired(required=false)} field, not a setter).
+     */
+    @Autowired(required = false)
+    private GatewayMetrics gatewayMetrics;
 
     /**
      * Optional — only present once Workstream G has wired the GcsConfig bean.
@@ -99,6 +109,13 @@ public class SubmissionService {
 
         log.info("[gateway] Accepted submission={} user={} lang={} region={} ts={} mode={}",
                 submission.getId(), userId, request.getLanguage(), region, gatewayTsMs, sourceMode);
+
+        // Tech-spec §9.3 wire-in: count the accepted submission only
+        // after both rows are in the same transaction — never count an
+        // "almost-accepted" submission that died at the outbox INSERT.
+        if (gatewayMetrics != null) {
+            gatewayMetrics.incSubmissionAccepted(region);
+        }
 
         return new SubmissionResponse(
                 submission.getId().toString(),

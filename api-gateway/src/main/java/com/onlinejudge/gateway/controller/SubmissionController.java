@@ -2,6 +2,7 @@ package com.onlinejudge.gateway.controller;
 
 import com.onlinejudge.gateway.dto.SubmissionRequest;
 import com.onlinejudge.gateway.dto.SubmissionResponse;
+import com.onlinejudge.gateway.observability.GatewayMetrics;
 import com.onlinejudge.gateway.security.IdempotencyFilter;
 import com.onlinejudge.gateway.service.RateLimitService;
 import com.onlinejudge.gateway.service.RegionResolver;
@@ -53,6 +54,8 @@ public class SubmissionController {
     private final StringRedisTemplate redisTemplate;
     private final RegionResolver regionResolver;
     private final IdempotencyFilter idempotencyFilter;
+    /** Tech-spec §9.3: submission.rejected.size_too_large counter wire-in. */
+    private final GatewayMetrics gatewayMetrics;
 
     /**
      * POST /api/v1/submissions
@@ -81,6 +84,11 @@ public class SubmissionController {
         if (declaredLen > MAX_BODY_BYTES) {
             log.warn("[gateway] Rejecting oversized submission: Content-Length={} > {} (cap)",
                     declaredLen, MAX_BODY_BYTES);
+            // Tech-spec §9.3 wire-in. Region is resolved here too so the
+            // metric carries the same dimension as the accepted counter;
+            // a 413 returned before regionResolver runs would otherwise
+            // skew the per-region breakdown.
+            gatewayMetrics.incSubmissionRejectedSizeTooLarge(regionResolver.resolve(httpRequest));
             return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
                     "status", "PAYLOAD_TOO_LARGE",
                     "message", "Submission body exceeds " + MAX_BODY_BYTES + " bytes. " +
