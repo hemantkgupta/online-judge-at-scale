@@ -10,12 +10,12 @@ import com.onlinejudge.common.events.Events.VerdictEvent;
 import com.onlinejudge.worker.observability.WorkerMetrics;
 import com.onlinejudge.worker.service.AgentClient.PerTestResult;
 import com.onlinejudge.worker.service.ExecutionBackend;
-import com.onlinejudge.worker.service.GcsClient;
 import com.onlinejudge.worker.service.IdempotencyService;
 import com.onlinejudge.worker.service.PoolExhaustedException;
 import com.onlinejudge.worker.service.TestCaseFetcher;
 import com.onlinejudge.worker.service.TestCaseFetcher.ProblemSpec;
 import com.onlinejudge.worker.service.TestCaseFetcher.TestCaseSpec;
+import com.onlinejudge.worker.service.source.SourceCodeResolver;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -25,12 +25,10 @@ import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
-import java.io.ByteArrayOutputStream;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -75,8 +73,12 @@ public class SubmissionConsumer {
     private final ObjectMapper objectMapper;
     /** Workstream H: worker.verdicts.published_total + adjacent metrics. */
     private final WorkerMetrics metrics;
-    /** Workstream B: pulls source code from GCS by gs:// URI. Nullable in tests. */
-    private final GcsClient gcsClient;
+    /**
+     * Tech-spec L5 (§5.1): resolves {@code SubmissionEvent.s3_code_url} across
+     * all supported schemes (data:, gs://, s3://, r2://, http(s)://) with a
+     * shared §7.2 size-cap enforcement. Nullable in tests.
+     */
+    private final SourceCodeResolver sourceCodeResolver;
     /** Workstream B: resolves test-case URLs and SHA-256s expected outputs. Nullable in tests. */
     private final TestCaseFetcher testCaseFetcher;
 
@@ -412,83 +414,19 @@ public class SubmissionConsumer {
         };
     }
 
+    /**
+     * Tech-spec L5 (§5.1): all scheme dispatch — data:, gs://, s3://, r2://,
+     * http(s):// — lives in {@link SourceCodeResolver}. This method is
+     * retained as a small forwarder so unit tests can keep instantiating
+     * {@code SubmissionConsumer} directly without dragging in the full
+     * Spring context.
+     */
     String resolveSourceCode(String s3CodeUrl) {
-        if (s3CodeUrl == null || s3CodeUrl.isBlank()) {
-            throw new IllegalArgumentException("SubmissionEvent.s3CodeUrl is required");
+        if (sourceCodeResolver == null) {
+            throw new IllegalStateException(
+                    "SourceCodeResolver not wired — tests must inject one to call resolveSourceCode");
         }
-
-        if (s3CodeUrl.startsWith("data:")) {
-            return decodeDataUrl(s3CodeUrl);
-        }
-
-        String lower = s3CodeUrl.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("gs://")) {
-            // Workstream B: the API gateway (Workstream G) writes contestant
-            // source to GCS and stamps a gs://<bucket>/<key> URI on the event.
-            if (gcsClient == null) {
-                throw new UnsupportedOperationException(
-                        "gs:// code URL but GcsClient not wired (running without GcsConfig?)");
-            }
-            try {
-                return new String(gcsClient.fetch(s3CodeUrl), StandardCharsets.UTF_8);
-            } catch (java.io.IOException ex) {
-                throw new RuntimeException("GCS source fetch failed: " + s3CodeUrl, ex);
-            }
-        }
-
-        if (lower.startsWith("s3://") || lower.startsWith("r2://") ||
-                lower.startsWith("http://") || lower.startsWith("https://")) {
-            throw new UnsupportedOperationException(
-                    "TODO: object-store code fetch is not wired in execution-worker yet");
-        }
-
-        if (lower.startsWith("local://")) {
-            throw new UnsupportedOperationException(
-                    "local:// code URLs do not embed source; local mode must emit data: URLs");
-        }
-
-        throw new UnsupportedOperationException("Unsupported code URL scheme");
-    }
-
-    private static String decodeDataUrl(String dataUrl) {
-        int comma = dataUrl.indexOf(',');
-        if (comma < 0) {
-            throw new IllegalArgumentException("Malformed data URL: missing comma separator");
-        }
-
-        String metadata = dataUrl.substring(5, comma).toLowerCase(Locale.ROOT);
-        String payload = dataUrl.substring(comma + 1);
-        if (metadata.contains(";base64")) {
-            try {
-                return new String(Base64.getDecoder().decode(payload), StandardCharsets.UTF_8);
-            } catch (IllegalArgumentException ex) {
-                throw new IllegalArgumentException("Malformed data URL: invalid base64 payload", ex);
-            }
-        }
-
-        return percentDecode(payload);
-    }
-
-    private static String percentDecode(String payload) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(payload.length());
-        for (int i = 0; i < payload.length(); i++) {
-            char c = payload.charAt(i);
-            if (c == '%') {
-                if (i + 2 >= payload.length()) {
-                    throw new IllegalArgumentException("Malformed data URL: incomplete percent escape");
-                }
-                int hi = Character.digit(payload.charAt(i + 1), 16);
-                int lo = Character.digit(payload.charAt(i + 2), 16);
-                if (hi < 0 || lo < 0) {
-                    throw new IllegalArgumentException("Malformed data URL: invalid percent escape");
-                }
-                out.write((hi << 4) + lo);
-                i += 2;
-            } else {
-                out.writeBytes(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
-            }
-        }
-        return out.toString(StandardCharsets.UTF_8);
+        return sourceCodeResolver.resolve(s3CodeUrl);
     }
 
     private void sendAndWait(String topic, String key, byte[] payload) throws Exception {

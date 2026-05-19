@@ -100,7 +100,8 @@ class SubmissionConsumerRegionTest {
                 idempotency, backend, kafkaTemplate,
                 new com.fasterxml.jackson.databind.ObjectMapper(),
                 metrics,
-                /* gcsClient */ null,
+                /* sourceCodeResolver */ new com.onlinejudge.worker.service.source.SourceCodeResolver(
+                        null, null, null, null),
                 /* testCaseFetcher */ null);
 
         // Inject @Value-bound fields by reflection — simulates Spring's
@@ -178,7 +179,8 @@ class SubmissionConsumerRegionTest {
                 idempotency, backend, kafkaTemplate,
                 new com.fasterxml.jackson.databind.ObjectMapper(),
                 mock(WorkerMetrics.class),
-                null, null);
+                new com.onlinejudge.worker.service.source.SourceCodeResolver(null, null, null, null),
+                null);
 
         org.springframework.test.util.ReflectionTestUtils.setField(
                 consumer, "evaluatedResultsTopic", "evaluated_results.eu-west1");
