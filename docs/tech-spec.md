@@ -191,7 +191,7 @@ Consumes `evaluated_results`, caches each verdict in Redis (`verdict:{submission
 
 ### 4.7 scoring-pipeline
 
-Flink DataStream job that would consume `evaluated_results`, apply per-contest scoring rules (first-AC-wins / time-penalty / partial-credit), and write the resulting score deltas to the Redis sorted-set leaderboard. Treats the verdict stream as source of truth and the Redis state as a materialised view. **Status: BLOCKED.** `build.gradle` declares Flink as `compileOnly`; `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()` expecting an external Flink JobManager + TaskManager. No `Dockerfile`, no compose entry, no Flink runtime provisioned. Deploying scoring-pipeline = standing up Flink in compose (or moving to managed Cloud Dataflow), submitting the fat JAR. Until then, [`services/leaderboard-service.md`](./services/leaderboard-service.md) does NOT compute scores (the read path is empty); a future stand-in could be a simple ZADD-by-points in leaderboard-service, but that's not implemented either.
+Flink DataStream job that would consume `evaluated_results`, apply per-contest scoring rules (first-AC-wins / time-penalty / partial-credit), and write the resulting score deltas to the Redis sorted-set leaderboard. Treats the verdict stream as source of truth and the Redis state as a materialised view. **Status: BLOCKED on production deploy.** `build.gradle` declares Flink as `compileOnly`; `main()` calls `StreamExecutionEnvironment.getExecutionEnvironment()` expecting an external Flink JobManager + TaskManager. No `Dockerfile`, no compose entry, no Flink runtime provisioned in `region.yml`. Local end-to-end smoke proves the topology against a real Flink mini-cluster + MM2 + Redis (`scripts/scoring-smoke.sh` driving `scoring-pipeline/src/test/java/com/onlinejudge/scoring/smoke/SmokeProducer.java`); productionising the JM/TM in `region.yml` (or moving to managed Cloud Dataflow) and submitting the fat JAR is the remaining step. Until then, [`services/leaderboard-service.md`](./services/leaderboard-service.md) does NOT compute scores (the read path is empty); a future stand-in could be a simple ZADD-by-points in leaderboard-service, but that's not implemented either.
 
 → **Full owner page: [`services/scoring-pipeline.md`](./services/scoring-pipeline.md)** — Flink topology, scoring rules, deployment path forward, code map.
 
@@ -285,7 +285,7 @@ The canonical wire on Kafka. Schema in `common/src/main/proto/events.proto`. pro
 | 4 | `memory_kb` | int64 | Per-test peak RSS. |
 | 5 | `stdout_hash` | string | SHA-256 hex of canonical stdout. **Never the raw bytes** — preserves test-case secrecy. |
 
-**Code/intent gap (per the chosen scope rule).** `per_test` is populated by the worker, but no downstream consumer parses it yet. The leaderboard-service ignores it; scoring-pipeline ignores it; a future React SPA submission-detail page would render it. The field is reserved-for-future on the consumer side and live-on-write on the producer side.
+**Code/intent gap (per the chosen scope rule).** `per_test` is populated by the worker. leaderboard-service and scoring-pipeline still ignore it, but the React SPA's SubmissionDetail page now parses and renders the per-test breakdown live over STOMP (see `frontend/src/pages/SubmissionDetail.tsx:56–67, 157–163` — merges incoming `per_test` rows into local state and renders them in a table). The field is no longer reserved-for-future on the consumer side; it's live-on-write on the producer side and live-on-read on the SPA, with the score-path consumers as the remaining gap.
 
 **AnalyticsEvent** (tags 1–11). Produced by execution-worker. Consumed by analytics-pipeline (not deployed). Shape mirrors VerdictEvent's flat fields plus `language` and `event_ts_ms`. Used for offline reports.
 
@@ -874,7 +874,7 @@ Short list — each item points at deeper material.
 | JWT secret + signer SA key both in tfstate, no rotation cron | Roadmap §3.3, §3.4 | Medium — key rotation discipline missing |
 | Auth endpoints share the per-IP rate limit bucket with submission posts | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | Medium — brute-force login eats submission budget |
 | scoring-pipeline not deployed (Flink cluster) | §4.7 + Agent I's audit | Medium — leaderboard-service does a stand-in calculation |
-| React SPA not built | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | High for v1 launch — no UI |
+| React SPA — Live — `frontend/` MVP shipped (Login/Signup/Problems/ProblemDetail/SubmissionDetail pages + Layout/ProtectedRoute components, auth context, STOMP WS live verdict updates, per-test rendering) | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | Low — MVP usable; polish + remaining screens are follow-ups |
 | `analytics-pipeline` Spring module deprecated; replaced by ClickHouse Kafka Engine (see `design-docs/clickhouse-kafka-engine-rollout.md`) | §4.8 | n/a — DDL + compose entry shipped; the JVM module is retained for git history only |
 | `RUNTIME_ERROR` vs INTERNAL_ERROR conflation | §4.2 failure modes | Low — minor UX paper-cut |
 | No DLQ dashboard for the poison topic | Roadmap §3.10 | Medium — operators don't see dead-lettered submissions |
