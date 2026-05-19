@@ -43,6 +43,7 @@ class RateLimitServiceTest {
     void setUp() {
         ReflectionTestUtils.setField(rateLimitService, "submissionsPerUserPerMinute", 10);
         ReflectionTestUtils.setField(rateLimitService, "submissionsPerIpPerMinute", 60);
+        ReflectionTestUtils.setField(rateLimitService, "authAttemptsPerIpPerMinute", 5);
     }
 
     @Test
@@ -108,6 +109,78 @@ class RateLimitServiceTest {
         verify(redisTemplate).execute(any(RedisScript.class), captor.capture(),
                 any(), any(), any());
         assertThat(captor.getValue().get(1)).contains("unknown");
+    }
+
+    // ---- Auth bucket (tech-spec §14 M3) ------------------------------------
+    //
+    // The auth limiter calls execute(...) with a DIFFERENT varargs arity (2 ARGV
+    // instead of 3) and a single-key KEYS list, so the stubs below match
+    // any(),any() rather than any(),any(),any(). That arity difference is also
+    // what proves the buckets don't share state at the Redis call site —
+    // see {@code authBucket_usesDistinctKeyPrefix} below.
+
+    @Test
+    void isAuthAllowed_returnsTrue_whenUnderLimit() {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any()))
+                .thenReturn("OK");
+
+        assertThat(rateLimitService.isAuthAllowed("203.0.113.7")).isTrue();
+    }
+
+    @Test
+    void isAuthAllowed_returnsFalse_whenIpLimitTripped() {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any()))
+                .thenReturn("IP_LIMIT");
+
+        assertThat(rateLimitService.isAuthAllowed("203.0.113.7")).isFalse();
+    }
+
+    @Test
+    void isAuthAllowed_usesDistinctKeyPrefix_separateFromSubmissionBucket() {
+        // Two facts in one test:
+        //   (a) the auth call's KEYS list has exactly one entry — the auth-ip
+        //       prefix — which is what guarantees the brute-force burst can
+        //       never decrement the rate_limit:ip:... submission bucket.
+        //   (b) the prefix is `rate_limit:auth-ip:` (not `rate_limit:ip:`),
+        //       so even though both buckets are IP-scoped they live in
+        //       independent Redis keys.
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any()))
+                .thenReturn("OK");
+
+        rateLimitService.isAuthAllowed("198.51.100.9");
+
+        ArgumentCaptor<List<String>> captor = ArgumentCaptor.forClass(List.class);
+        verify(redisTemplate).execute(any(RedisScript.class), captor.capture(), any(), any());
+
+        List<String> keys = captor.getValue();
+        assertThat(keys).hasSize(1);
+        assertThat(keys.get(0))
+                .startsWith("rate_limit:auth-ip:198.51.100.9:")
+                .doesNotStartWith("rate_limit:ip:");
+    }
+
+    @Test
+    void isAuthAllowed_argsCarryConfiguredLimitAndTtl() {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any()))
+                .thenReturn("OK");
+
+        rateLimitService.isAuthAllowed("1.2.3.4");
+
+        // authAttemptsPerIpPerMinute=5 (set in @BeforeEach), TTL constant = 70.
+        verify(redisTemplate).execute(any(RedisScript.class), anyList(),
+                eqStr("5"), eqStr("70"));
+    }
+
+    @Test
+    void isAuthAllowed_nullSourceIp_substitutesPlaceholder() {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any()))
+                .thenReturn("OK");
+
+        rateLimitService.isAuthAllowed(null);
+
+        ArgumentCaptor<List<String>> captor = ArgumentCaptor.forClass(List.class);
+        verify(redisTemplate).execute(any(RedisScript.class), captor.capture(), any(), any());
+        assertThat(captor.getValue().get(0)).contains("unknown");
     }
 
     private static String eqStr(String s) {

@@ -464,7 +464,7 @@ Covered in §6.3. Belt-and-suspenders: netns isolation + iptables DROP rules per
 
 `RateLimitService` in api-gateway uses a Lua-script leaky bucket against Redis. Two limiters today: per-IP and per-user. Configured via `app.rate-limit.{per-ip,per-user}.{capacity,refill-per-second}`; defaults are dev-grade. Tuning to real production thresholds is roadmap §3.2; the alert on 429 rate that should accompany it is also pending.
 
-The auth endpoints are NOT rate-limited separately today — they share the per-IP bucket with submission posts. A brute-force login attempt eats the contestant's submission budget. Splitting them out is tracked in [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md).
+The auth endpoints have their own per-IP bucket keyed under `rate_limit:auth-ip:{ip}:{minuteBucket}`, sized by `app.rate-limit.auth-attempts-per-ip-per-minute` (default 10/min). A brute-force login burst trips that bucket — not the submission bucket — so the contestant's submission budget stays intact. See [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) for the broader auth threat model.
 
 ### 7.6 IAM posture on GCP
 
@@ -872,7 +872,7 @@ Short list — each item points at deeper material.
 | Single-broker Kafka, single-node CRDB | [`design-docs/kafka-cluster-and-crdb-cluster.md`](./design-docs/kafka-cluster-and-crdb-cluster.md) | High — SPOF for the data plane |
 | OTel collector deployed and configured; dashboards/alerts shipped as code; awaits the `/opt/oj/.env` flip per `infra/observability/activation-runbook.md` | §9 + `design-docs/otel-collector-activation-plan.md` | Low — single-line operator flip; dashboards/alerts apply via `gcloud` |
 | JWT secret + signer SA key both in tfstate, no rotation cron | Roadmap §3.3, §3.4 | Medium — key rotation discipline missing |
-| Auth endpoints share the per-IP rate limit bucket with submission posts | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | Medium — brute-force login eats submission budget |
+| ~~Auth endpoints share the per-IP rate limit bucket with submission posts~~ Resolved — auth has its own `rate_limit:auth-ip:*` bucket (`app.rate-limit.auth-attempts-per-ip-per-minute`, default 10/min) | §7.5 + [`design-docs/auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | ~~Medium~~ Closed |
 | scoring-pipeline not deployed (Flink cluster) | §4.7 + Agent I's audit | Medium — leaderboard-service does a stand-in calculation |
 | React SPA not built | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | High for v1 launch — no UI |
 | `analytics-pipeline` Spring module deprecated; replaced by ClickHouse Kafka Engine (see `design-docs/clickhouse-kafka-engine-rollout.md`) | §4.8 | n/a — DDL + compose entry shipped; the JVM module is retained for git history only |
@@ -1018,7 +1018,7 @@ Eight per-feature design docs live in [`docs/design-docs/`](./design-docs/). Eac
 
 | Doc | Roadmap | Status today | What it covers |
 |---|---|---|---|
-| [`auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | §2.1 | Implemented | Signup / login / refresh / logout endpoints; Argon2id + JWT `kid` rotation; refresh-token storage as SHA-256 hash; rate-limit split between auth and submission buckets (the split itself is still TODO). |
+| [`auth-end-to-end.md`](./design-docs/auth-end-to-end.md) | §2.1 | Implemented | Signup / login / refresh / logout endpoints; Argon2id + JWT `kid` rotation; refresh-token storage as SHA-256 hash; rate-limit split between auth and submission buckets (`rate_limit:auth-ip:*` vs `rate_limit:ip:*`, sized independently). |
 | [`otel-collector-deployment.md`](./design-docs/otel-collector-deployment.md) + [`otel-collector-activation-plan.md`](./design-docs/otel-collector-activation-plan.md) | §2.6 | Shipped end-to-end; awaits the `OTEL_JAVAAGENT_ENABLED=true` flip | OTLP collector pipeline; GCP exporter wiring; the three dashboards + five alerts under `infra/observability/`; the `x-otel-defaults` YAML anchor every JVM service inherits; the operator runbook in `infra/observability/activation-runbook.md`. |
 | [`kafka-cluster-and-crdb-cluster.md`](./design-docs/kafka-cluster-and-crdb-cluster.md) | §2.7 | Stepping-stone shipped; full 3-broker/3-node not implemented | KRaft single-broker hardening (already in place) + the full 3-broker + 3-node multi-AZ migration; cert handling for inter-node TLS; disk co-tenancy risk (the highest-impact production-incident class). |
 | [`microvm-egress-lockdown.md`](./design-docs/microvm-egress-lockdown.md) | §3.1 | Implemented | Per-microVM netns; iptables belt-and-suspenders; Firecracker machine config sans `network-interfaces`; the Go integration test that validates the lockdown. |
