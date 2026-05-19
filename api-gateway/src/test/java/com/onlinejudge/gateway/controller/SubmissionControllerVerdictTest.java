@@ -1,5 +1,6 @@
 package com.onlinejudge.gateway.controller;
 
+import com.onlinejudge.gateway.observability.GatewayMetrics;
 import com.onlinejudge.gateway.security.IdempotencyFilter;
 import com.onlinejudge.gateway.service.RateLimitService;
 import com.onlinejudge.gateway.service.RegionResolver;
@@ -47,7 +48,8 @@ class SubmissionControllerVerdictTest {
     void setUp() {
         controller = new SubmissionController(
                 submissionService, rateLimitService, redisTemplate,
-                new RegionResolver("us-east-1"), idempotencyFilter);
+                new RegionResolver("us-east-1"), idempotencyFilter,
+                new GatewayMetrics());
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
     }
 

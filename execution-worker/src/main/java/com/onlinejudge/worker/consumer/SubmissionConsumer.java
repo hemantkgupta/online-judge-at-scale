@@ -208,6 +208,11 @@ public class SubmissionConsumer {
             // correctness bug.
             IdempotencyService.ClaimDecision claim =
                     idempotencyService.claimSubmission(submissionId, phase);
+            // Tech-spec §9.3: feed every claim outcome to the
+            // worker.idempotency.attempts_max high-water-mark gauge. The
+            // attempts field is 0 on the IN_PROGRESS lost-race path and
+            // is otherwise the row's bumped attempts counter.
+            metrics.observeIdempotencyAttempts(claim.attempts());
             if (claim.status() == IdempotencyService.ClaimStatus.COMPLETED) {
                 ack.acknowledge();
                 return;

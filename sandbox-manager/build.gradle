@@ -17,6 +17,10 @@ dependencies {
     implementation 'io.opentelemetry:opentelemetry-api:1.43.0'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
+
+    // OTel SDK + InMemoryMetricReader for SandboxMetricsTest.
+    testImplementation 'io.opentelemetry:opentelemetry-sdk:1.43.0'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk-testing:1.43.0'
 }
 
 springBoot {

@@ -32,10 +32,25 @@ dependencies {
     // hashing works at runtime without surprise.
     implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
 
+    // OpenTelemetry API for GatewayMetrics (tech-spec §9.3). Same version
+    // and rationale as execution-worker / sandbox-manager: the -javaagent
+    // jar does NOT expose its API to the application classloader, so we
+    // need the API artifact on the runtime classpath to avoid a
+    // NoClassDefFoundError at boot. The agent still drives the actual SDK
+    // behind GlobalOpenTelemetry.
+    implementation 'io.opentelemetry:opentelemetry-api:1.43.0'
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.testcontainers:junit-jupiter'
     testImplementation 'org.testcontainers:postgresql'
     testImplementation 'org.testcontainers:kafka'
+
+    // OTel SDK + InMemoryMetricReader for GatewayMetricsTest. Brings
+    // io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader plus the
+    // OpenTelemetrySdk builder used to install a non-no-op provider into
+    // GlobalOpenTelemetry for the duration of a test.
+    testImplementation 'io.opentelemetry:opentelemetry-sdk:1.43.0'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk-testing:1.43.0'
 
     dependencyManagement {
         imports {

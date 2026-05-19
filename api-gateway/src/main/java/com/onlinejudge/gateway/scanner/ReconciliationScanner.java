@@ -2,7 +2,9 @@ package com.onlinejudge.gateway.scanner;
 
 import com.onlinejudge.common.events.Events.SubmissionEvent;
 import com.onlinejudge.gateway.model.Submission;
+import com.onlinejudge.gateway.observability.GatewayMetrics;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -56,6 +58,13 @@ public class ReconciliationScanner {
 
     private final StuckSubmissionRepository repo;
     private final KafkaTemplate<String, byte[]> kafkaTemplate;
+    /**
+     * Tech-spec §9.3: gateway.reconciliation.{swept,republished,dlq}_total
+     * counters. Optional so existing Mockito tests without an explicit
+     * mock keep working — the wire-in below null-guards every call.
+     */
+    @Autowired(required = false)
+    private GatewayMetrics gatewayMetrics;
 
     @Value("${app.kafka.topic.pretest}")
     private String pretestTopic;
@@ -135,6 +144,14 @@ public class ReconciliationScanner {
 
         log.info("[reconcile] sweep complete swept={} republished={} dlq={} staleBefore={}",
                 stuck.size(), republished, dlq, staleBefore);
+        // Tech-spec §9.3 wire-in: three independent counters (separate
+        // alerts in infra/observability/). Bulk-increment per sweep
+        // matches the ScanResult shape that callers/tests already use.
+        if (gatewayMetrics != null) {
+            gatewayMetrics.addReconciliationSwept(stuck.size());
+            gatewayMetrics.addReconciliationRepublished(republished);
+            gatewayMetrics.addReconciliationDlq(dlq);
+        }
         return new ScanResult(stuck.size(), republished, dlq);
     }
 

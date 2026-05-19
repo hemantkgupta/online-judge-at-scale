@@ -8,6 +8,8 @@ import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Execution-worker custom metrics (Workstream H).
  *
@@ -33,10 +35,19 @@ import org.springframework.stereotype.Component;
  *
  * <h2>Metric inventory</h2>
  * <pre>
- *   worker.gcs.fetch.latency_ms   (histogram)   attrs: bucket
- *   worker.agent.exec.latency_ms  (histogram)   attrs: language
- *   worker.verdicts.published_total (counter)   attrs: verdict, language, phase
+ *   worker.gcs.fetch.latency_ms        (histogram)   attrs: bucket
+ *   worker.agent.exec.latency_ms       (histogram)   attrs: language
+ *   worker.verdicts.published_total    (counter)     attrs: verdict, language, phase
+ *   worker.idempotency.attempts_max    (async gauge) attrs: (none) — high-water mark
  * </pre>
+ *
+ * <p><b>idempotency.attempts_max</b> mirrors tech-spec §9.3. The
+ * idempotency row's {@code attempts} column is bumped each time a stale
+ * claim is reclaimed; this gauge tracks the highest value observed across
+ * the worker's lifetime, surfacing the worst-case reclaim depth without
+ * having to scan the whole table. Reset on JVM restart by design — the
+ * dashboard alert is "max ever observed since boot is approaching the
+ * cap configured in app.idempotency.max-attempts".
  */
 @Component
 public class WorkerMetrics {
@@ -51,6 +62,14 @@ public class WorkerMetrics {
     private final DoubleHistogram gcsFetchLatencyMs;
     private final DoubleHistogram agentExecLatencyMs;
     private final LongCounter verdictsPublished;
+    /**
+     * Tech-spec §9.3: high-water mark of the idempotency {@code attempts}
+     * counter observed at the worker. Backed by an {@link AtomicLong} so
+     * the async-gauge callback reads a consistent snapshot from any
+     * thread. Kept as a field (not a closure-captured local) so the
+     * unit-test fixture can reach it via reflection-free getters.
+     */
+    private final AtomicLong idempotencyAttemptsMax = new AtomicLong(0);
 
     public WorkerMetrics() {
         Meter meter = GlobalOpenTelemetry.getMeter(SCOPE);
@@ -72,6 +91,17 @@ public class WorkerMetrics {
                 .setDescription("Verdicts written to the evaluated_results Kafka topic.")
                 .setUnit("{verdict}")
                 .build();
+
+        // Async gauge: the OTel SDK invokes the callback at every collection
+        // tick (default 60s with the agent SDK). Using an async gauge instead
+        // of an up-down counter so the value is monotonically non-decreasing
+        // — we want a high-water mark, not a delta-applied running total.
+        meter.gaugeBuilder("worker.idempotency.attempts_max")
+                .ofLongs()
+                .setDescription("Highest idempotency attempts counter observed since worker boot.")
+                .setUnit("{attempt}")
+                .buildWithCallback(measurement ->
+                        measurement.record(idempotencyAttemptsMax.get()));
     }
 
     /** Workstream B wire-in. Bucket is "source" or "tests". */
@@ -96,5 +126,30 @@ public class WorkerMetrics {
                 VERDICT,  verdict  == null ? "UNKNOWN" : verdict,
                 LANGUAGE, language == null ? "unknown" : language,
                 PHASE,    phase    == null ? "unknown" : phase));
+    }
+
+    /**
+     * Tech-spec §9.3 wire-in: every successful idempotency claim reports
+     * the {@code attempts} value of the row that won the race (1 on the
+     * first try, n on the n-th reclaim of a stale row). The gauge keeps
+     * the max via lock-free CAS. Non-positive inputs are silently dropped
+     * — they're a no-op for a max.
+     */
+    public void observeIdempotencyAttempts(long attempts) {
+        if (attempts <= 0) {
+            return;
+        }
+        long current;
+        do {
+            current = idempotencyAttemptsMax.get();
+            if (attempts <= current) {
+                return;
+            }
+        } while (!idempotencyAttemptsMax.compareAndSet(current, attempts));
+    }
+
+    /** Test-only accessor. Returns the current high-water mark. */
+    public long currentIdempotencyAttemptsMax() {
+        return idempotencyAttemptsMax.get();
     }
 }

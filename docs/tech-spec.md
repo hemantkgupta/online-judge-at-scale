@@ -570,20 +570,31 @@ The compute VM's services (`oj-execution-worker`, `oj-sandbox-manager`) point at
 
 Every JVM service already bakes the OpenTelemetry Java agent. The compose env carries `OTEL_JAVAAGENT_ENABLED=${OTEL_JAVAAGENT_ENABLED:-false}` — disabled by default. After verifying the collector is healthy, the operator flips the `.env` to `OTEL_JAVAAGENT_ENABLED=true` + `OTEL_ENDPOINT=http://oj-otel-collector:4317` and bounces each service. The two-step rollout is deliberate: flipping the agent on with no reachable collector crashes the JVM during autoconfigure (the autoconfigure validator's known footgun).
 
-### 9.3 Metrics catalogue (planned)
+### 9.3 Metrics catalogue
 
-Counter + gauge + histogram names below are aspirational — the OTel agent gives us automatic JVM + HTTP + Kafka metrics for free, but the application-specific ones need explicit `WorkerMetrics` / `SandboxMetrics` / `GatewayMetrics` registration. Today's `WorkerMetrics` ships several of these; the rest are TODO.
+The OTel agent gives us automatic JVM + HTTP + Kafka metrics for free. The application-specific rows below are registered in three sibling classes — `WorkerMetrics`, `SandboxMetrics`, `GatewayMetrics` — each colocated with the service it instruments. Every row in the table is shipped; the file/line column is the registration site (not the wire-in callsite).
 
-| Metric | Type | Labels | Owner |
-|---|---|---|---|
-| `submission.accepted` | counter | `region` | api-gateway |
-| `submission.rejected.size_too_large` | counter | `region` | api-gateway |
-| `verdict.published_total` | counter | `verdict`, `language`, `phase` | execution-worker |
-| `sandbox.lease.latency_seconds` | histogram | `language` | sandbox-manager |
-| `sandbox.pool.ready` | gauge | `language` | sandbox-manager |
-| `sandbox.leases.active` | gauge | `language` | sandbox-manager |
-| `worker.idempotency.attempts_max` | gauge | (none) | execution-worker |
-| `gateway.reconciliation.{swept,republished,dlq}_total` | counter | (none) | api-gateway |
+The histogram unit suffix on the sandbox row was sharpened from `_seconds` (aspirational) to `_ms` (what the API records — OTel doesn't auto-convert and the `.setUnit("ms")` annotation is the contract the dashboard reads). The `_seconds` form appeared in the earlier draft for symmetry with Prometheus convention but never made it past review.
+
+| Metric | Type | Labels | Owner | Registered at |
+|---|---|---|---|---|
+| `submission.accepted` | counter | `region` | api-gateway | `api-gateway/src/main/java/com/onlinejudge/gateway/observability/GatewayMetrics.java:68` |
+| `submission.rejected.size_too_large` | counter | `region` | api-gateway | `GatewayMetrics.java:74` |
+| `gateway.reconciliation.swept_total` | counter | (none) | api-gateway | `GatewayMetrics.java:84` |
+| `gateway.reconciliation.republished_total` | counter | (none) | api-gateway | `GatewayMetrics.java:90` |
+| `gateway.reconciliation.dlq_total` | counter | (none) | api-gateway | `GatewayMetrics.java:96` |
+| `worker.verdicts.published_total` | counter | `verdict`, `language`, `phase` | execution-worker | `execution-worker/src/main/java/com/onlinejudge/worker/observability/WorkerMetrics.java:90` |
+| `worker.idempotency.attempts_max` | async gauge | (none) | execution-worker | `WorkerMetrics.java:99` |
+| `worker.gcs.fetch.latency_ms` | histogram | `bucket` | execution-worker | `WorkerMetrics.java:78` |
+| `worker.agent.exec.latency_ms` | histogram | `language` | execution-worker | `WorkerMetrics.java:84` |
+| `sandbox.lease.latency_ms` | histogram | `language` | sandbox-manager | `sandbox-manager/src/main/java/com/onlinejudge/sandbox/observability/SandboxMetrics.java:74` |
+| `sandbox.leases.active` | up-down counter | `language` | sandbox-manager | `SandboxMetrics.java:80` |
+| `sandbox.pool.ready` | up-down counter | `language` | sandbox-manager | `SandboxMetrics.java:92` |
+| `sandbox.watchdog.fires_total` | counter | `language` | sandbox-manager | `SandboxMetrics.java:86` |
+
+Why up-down counters instead of async gauges for `sandbox.leases.active` and `sandbox.pool.ready`: see the comment block in `SandboxMetrics.observePoolDepth(...)` — the async-gauge form would require enumerating every language up-front, which doesn't compose with `application.yml`-driven language lists. Up-down counters with delta semantics stay allocation-free and let the dashboard render the same shape.
+
+The `worker.idempotency.attempts_max` row is an async gauge backed by an `AtomicLong` high-water mark — every claim outcome from `IdempotencyService` feeds `WorkerMetrics.observeIdempotencyAttempts(claim.attempts())` in `SubmissionConsumer.processSubmission(...)`. The metric resets on JVM restart by design — the dashboard alert is "max ever observed since boot is approaching `app.idempotency.max-attempts`".
 
 ### 9.4 Dashboards and alerts
 
