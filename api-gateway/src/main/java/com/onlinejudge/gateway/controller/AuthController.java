@@ -7,6 +7,7 @@ import com.onlinejudge.gateway.dto.SignupRequest;
 import com.onlinejudge.gateway.dto.SignupResponse;
 import com.onlinejudge.gateway.dto.TokenPairResponse;
 import com.onlinejudge.gateway.service.AuthService;
+import com.onlinejudge.gateway.service.RateLimitService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -41,11 +42,16 @@ import java.util.UUID;
 public class AuthController {
 
     private final AuthService authService;
+    private final RateLimitService rateLimitService;
 
     @PostMapping("/signup")
     public ResponseEntity<?> signup(@Valid @RequestBody SignupRequest req, HttpServletRequest httpReq) {
+        String sourceIp = clientIp(httpReq);
+        if (!rateLimitService.isAuthAllowed(sourceIp)) {
+            return rateLimited(sourceIp);
+        }
         try {
-            UUID userId = authService.signup(req, clientIp(httpReq), userAgent(httpReq));
+            UUID userId = authService.signup(req, sourceIp, userAgent(httpReq));
             return ResponseEntity.status(HttpStatus.CREATED).body(new SignupResponse(userId));
         } catch (AuthService.AuthException ex) {
             return errorResponse(ex);
@@ -54,8 +60,12 @@ public class AuthController {
 
     @PostMapping("/login")
     public ResponseEntity<?> login(@Valid @RequestBody LoginRequest req, HttpServletRequest httpReq) {
+        String sourceIp = clientIp(httpReq);
+        if (!rateLimitService.isAuthAllowed(sourceIp)) {
+            return rateLimited(sourceIp);
+        }
         try {
-            TokenPairResponse pair = authService.login(req, clientIp(httpReq), userAgent(httpReq));
+            TokenPairResponse pair = authService.login(req, sourceIp, userAgent(httpReq));
             return ResponseEntity.ok(pair);
         } catch (AuthService.AuthException ex) {
             return errorResponse(ex);
@@ -64,8 +74,12 @@ public class AuthController {
 
     @PostMapping("/refresh")
     public ResponseEntity<?> refresh(@Valid @RequestBody RefreshRequest req, HttpServletRequest httpReq) {
+        String sourceIp = clientIp(httpReq);
+        if (!rateLimitService.isAuthAllowed(sourceIp)) {
+            return rateLimited(sourceIp);
+        }
         try {
-            TokenPairResponse pair = authService.refresh(req.getRefreshToken(), clientIp(httpReq), userAgent(httpReq));
+            TokenPairResponse pair = authService.refresh(req.getRefreshToken(), sourceIp, userAgent(httpReq));
             return ResponseEntity.ok(pair);
         } catch (AuthService.AuthException ex) {
             return errorResponse(ex);
@@ -90,6 +104,15 @@ public class AuthController {
 
     private static ResponseEntity<Map<String, String>> errorResponse(AuthService.AuthException ex) {
         return ResponseEntity.status(ex.status()).body(Map.of("error", ex.getMessage()));
+    }
+
+    /**
+     * 429 response for the auth-only per-IP bucket (tech-spec §14 M3). Shape kept
+     * consistent with the submission limiter's 429 in {@code SubmissionController}.
+     */
+    private static ResponseEntity<String> rateLimited(String sourceIp) {
+        log.warn("[gateway] Auth rate limit exceeded for ip={}", sourceIp);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("Rate limit exceeded");
     }
 
     private static String clientIp(HttpServletRequest req) {

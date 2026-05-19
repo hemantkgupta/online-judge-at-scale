@@ -116,6 +116,10 @@ app:
   rate-limit:
     submissions-per-minute: 10
     submissions-per-ip-per-minute: 60
+    # Tech-spec §14 M3 — auth endpoints (signup/login/refresh) have a
+    # dedicated per-IP bucket so a brute-force login burst can't drain the
+    # caller's submission quota. Keyed under rate_limit:auth-ip:{ip}:{min}.
+    auth-attempts-per-ip-per-minute: 10
   outbox:
     # The polling outbox publisher is the default substitute for production CDC.
     # Set this to false (or env APP_OUTBOX_PUBLISHER_ENABLED=false) to use a

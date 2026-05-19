@@ -31,6 +31,13 @@ import java.util.List;
  *
  * <p>The decision is returned as a short status string so callers can log
  * <em>which</em> bucket tripped: {@code OK}, {@code USER_LIMIT}, or {@code IP_LIMIT}.
+ *
+ * <p><b>Auth bucket (tech-spec §14 M3).</b> Auth endpoints (login/signup/refresh)
+ * used to share the per-IP submission bucket — a brute-force login burst would
+ * eat the contestant's submission budget. {@link #isAuthAllowed(String)} uses
+ * a distinct key prefix ({@code rate_limit:auth-ip:{ip}:{minuteBucket}}) and
+ * its own quota ({@code app.rate-limit.auth-attempts-per-ip-per-minute}, default
+ * 10/min) so the two failure domains don't bleed into each other.
  */
 @Slf4j
 @Service
@@ -62,6 +69,27 @@ public class RateLimitService {
     private static final RedisScript<String> SCRIPT =
             new DefaultRedisScript<>(LUA_RATE_LIMIT, String.class);
 
+    /**
+     * Single-bucket variant used for the auth-only IP limiter. Same INCR + first-write
+     * EXPIRE pattern, just one key. Returns {@code "OK"} or {@code "IP_LIMIT"}.
+     */
+    private static final String LUA_RATE_LIMIT_SINGLE = """
+            local key = KEYS[1]
+            local max = tonumber(ARGV[1])
+            local ttl = tonumber(ARGV[2])
+
+            local count = redis.call('INCR', key)
+            if count == 1 then
+                redis.call('EXPIRE', key, ttl)
+            end
+
+            if count > max then return 'IP_LIMIT' end
+            return 'OK'
+            """;
+
+    private static final RedisScript<String> SCRIPT_SINGLE =
+            new DefaultRedisScript<>(LUA_RATE_LIMIT_SINGLE, String.class);
+
     /** Per-bucket TTL — slightly longer than the bucket width so rounding never races the expiry. */
     private static final int BUCKET_TTL_SECONDS = 70;
 
@@ -72,6 +100,9 @@ public class RateLimitService {
 
     @Value("${app.rate-limit.submissions-per-ip-per-minute:60}")
     private int submissionsPerIpPerMinute;
+
+    @Value("${app.rate-limit.auth-attempts-per-ip-per-minute:10}")
+    private int authAttemptsPerIpPerMinute;
 
     /**
      * Checks the user and IP buckets atomically. Returns {@code true} if both buckets
@@ -95,6 +126,35 @@ public class RateLimitService {
         }
         if ("IP_LIMIT".equals(result)) {
             log.warn("[rate-limit] IP bucket tripped: ip={} bucket={}", sourceIp, minuteBucket);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Per-IP rate limit for auth endpoints (login / signup / refresh).
+     *
+     * <p>Distinct from {@link #isAllowed(String, String)} so a brute-force login
+     * burst can't drain the contestant's submission quota — see tech-spec §14 M3
+     * and the class-level javadoc. Quota is configured by
+     * {@code app.rate-limit.auth-attempts-per-ip-per-minute} (default 10).
+     *
+     * <p>Returns {@code true} if the request is within the limit, {@code false}
+     * if the auth bucket has been exhausted for the current minute.
+     */
+    public boolean isAuthAllowed(String sourceIp) {
+        long minuteBucket = Instant.now().getEpochSecond() / 60;
+        String authIpKey = "rate_limit:auth-ip:" + (sourceIp == null ? "unknown" : sourceIp)
+                + ":" + minuteBucket;
+
+        String result = redisTemplate.execute(
+                SCRIPT_SINGLE,
+                List.of(authIpKey),
+                String.valueOf(authAttemptsPerIpPerMinute),
+                String.valueOf(BUCKET_TTL_SECONDS));
+
+        if ("IP_LIMIT".equals(result)) {
+            log.warn("[rate-limit] Auth IP bucket tripped: ip={} bucket={}", sourceIp, minuteBucket);
             return false;
         }
         return true;
