@@ -619,11 +619,25 @@ Both VMs have **static internal IPs** allocated via `google_compute_address` (`o
 Network:
 - One global VPC `oj-vpc` with `routing_mode = GLOBAL` (so cross-region private-IP traffic doesn't hairpin via the public internet).
 - Two regional subnets: `oj-subnet-primary` (`10.10.0.0/24`) and `oj-subnet-secondary` (`10.20.0.0/24`).
-- Firewall: `oj-allow-iap-ssh` (IAP SSH source range) + `oj-allow-cross-region` (all TCP/UDP/ICMP between the two subnets). Both VMs tagged `oj-vm`.
+- Firewall: `oj-allow-iap-ssh` (IAP SSH source range) + `oj-allow-cross-region` (a narrow per-port TCP allow-list between the two subnets, plus ICMP — see §10.1.1). Both VMs tagged `oj-vm`.
 
 Both VMs have ephemeral external IPs for outbound only (apt / docker pulls / AR cross-region pulls). Inbound is IAP-only.
 
 Two Cloud Scheduler jobs (`oj-auto-shutdown-region-a/-b`) stop both VMs nightly at 23:00 IST.
+
+#### 10.1.1 Inter-VM port matrix (`oj-allow-cross-region`)
+
+Source for every row is the *other* regional subnet CIDR (`10.10.0.0/24` ⇄ `10.20.0.0/24`); target is the `oj-vm` tag on both VMs. Everything not in this table is intra-VM only (lives on the per-host docker bridge) and never crosses the firewall.
+
+| Port | Proto | Source | Destination | Purpose |
+|---|---|---|---|---|
+| `26257` | tcp | peer subnet | `oj-vm` | CRDB SQL + Raft. `--join` peer at boot; range placement honours `locality=region=…` so cross-region replicas exchange Raft heartbeats and SQL fan-out on this port. |
+| `9092` | tcp | peer subnet | `oj-vm` | Kafka `PLAINTEXT_HOST` listener (advertised on the VM's internal IP). Reserved for cross-region MirrorMaker 2 / parity — in-region clients talk to `oj-kafka:29092` over the docker network and do not traverse this rule. |
+| `8088` | tcp | peer subnet | `oj-vm` | api-gateway peer redirect target (`APP_PEER_GATEWAY_URL`). When `RegionMismatchFilter` returns a 307, the browser follows it to this port on the peer VM. |
+| `8082` | tcp | peer subnet | `oj-vm` | leaderboard-service peer fan-out (`APP_PEER_LEADERBOARD_URL`). Powers the global leaderboard view (§12.3). |
+| (all) | icmp | peer subnet | `oj-vm` | Diagnostics — `ping`/`traceroute` between the two VMs for triage. No application dependency. |
+
+UDP is intentionally not permitted (no cross-region UDP traffic in the stack today). SSH (`:22`) is handled by the separate `oj-allow-iap-ssh` rule (source `35.235.240.0/20` only). Public ingress remains zero — neither rule sources from `0.0.0.0/0`.
 
 ### 10.2 Terraform inventory
 
@@ -879,7 +893,7 @@ Short list — each item points at deeper material.
 | `RUNTIME_ERROR` vs INTERNAL_ERROR conflation | §4.2 failure modes | Low — minor UX paper-cut |
 | No DLQ dashboard for the poison topic | Roadmap §3.10 | Medium — operators don't see dead-lettered submissions |
 | No SPOT preemption shutdown script | §11.2 + roadmap §3.8 | Medium for `oj-compute` cost-optimised path |
-| `network-policy` rules on `oj-allow-internal` too permissive (`0-65535/tcp`) | Roadmap §3.5 | Low — intra-VPC, no public ingress |
+| ~~`network-policy` rules on `oj-allow-internal` too permissive (`0-65535/tcp`)~~ Closed: `oj-allow-cross-region` is now a per-port TCP allow-list (CRDB :26257, Kafka :9092, api-gateway :8088, leaderboard :8082) plus ICMP. See §10.1.1. | §10.1.1 | Closed |
 | `pre-test ≤ ordinal 10` is a magic number | Constants in `TestCase` entity + worker | Low — refactor to config |
 | `idempotency_keys.processing-lease-seconds` is 300 s; not tunable per-problem | §8.3 | Low |
 

@@ -109,11 +109,30 @@ resource "google_compute_firewall" "allow_iap_ssh" {
   target_tags   = ["oj-vm"]
 }
 
-# Allow all traffic between the two regional subnets so each VM can reach the
-# other's CRDB (:26257 Raft + SQL), Kafka (:29092 advertised on the internal
-# IP), HTTP services (8082/8084/8088/8089), and OTLP gRPC (:4317). Tight
-# enough — only the two named CIDRs are trusted — and pragmatic enough that
-# we don't have to enumerate every port the stack opens.
+# Cross-region intra-stack ingress. Source is restricted to the two regional
+# subnet CIDRs (10.10.0.0/24 + 10.20.0.0/24) and target is the `oj-vm` tag, so
+# nothing public can hit these ports. The earlier rev opened `0-65535/tcp+udp`
+# between the subnets which was easy to reason about but flagged as L2 debt in
+# tech-spec §14 — replaced here with an explicit allow-list of the four TCP
+# ports that legitimately cross subnets, plus ICMP for diagnostics.
+#
+# Per-port matrix (see tech-spec §10.1.1 for prose):
+#   tcp/26257 — CRDB SQL + Raft (--join peer, cross-region range placement)
+#   tcp/9092  — Kafka PLAINTEXT_HOST listener (advertised on the internal IP
+#               for cross-region MirrorMaker 2 / parity; in-region clients go
+#               through the docker network on :29092, which never traverses
+#               this firewall)
+#   tcp/8088  — api-gateway peer redirect (APP_PEER_GATEWAY_URL)
+#   tcp/8082  — leaderboard-service peer fan-out (APP_PEER_LEADERBOARD_URL)
+#
+# Everything else (Redis :6379, OTLP :4317, ClickHouse :8123/:9000, sandbox-
+# manager :9100, execution-worker actuator :8081, problem-service :8089,
+# contest-service :8084, CRDB admin :8080, OTel self-metrics :8888/:13133)
+# is intra-VM only — it lives on the docker bridge network on each host and
+# does not cross the subnet boundary, so no firewall rule is needed.
+#
+# UDP is no longer allowed: the stack has no cross-region UDP traffic. ICMP
+# stays open so `ping` from one VM to the other works for triage.
 resource "google_compute_firewall" "allow_cross_region" {
   name      = "oj-allow-cross-region"
   network   = google_compute_network.oj_vpc.id
@@ -121,11 +140,12 @@ resource "google_compute_firewall" "allow_cross_region" {
 
   allow {
     protocol = "tcp"
-    ports    = ["0-65535"]
-  }
-  allow {
-    protocol = "udp"
-    ports    = ["0-65535"]
+    ports = [
+      "26257", # CRDB SQL + Raft
+      "9092",  # Kafka PLAINTEXT_HOST listener
+      "8088",  # api-gateway peer redirect
+      "8082",  # leaderboard-service peer fan-out
+    ]
   }
   allow {
     protocol = "icmp"
