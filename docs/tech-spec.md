@@ -594,8 +594,9 @@ Shipped as code under `infra/observability/`:
 | `dashboards/submission-funnel.json` | accept→outbox / outbox→lease / lease→exec-done / exec→verdict — p50 + p99 each, plus end-to-end verdict throughput |
 | `dashboards/sandbox-pool-depth.json` | gauges (python/cpp/java) + per-language pool depth and active leases over time |
 | `dashboards/kafka-consumer-lag.json` | per-group lag panels (`execution-worker.{pretest,system}`, `leaderboard-service.evaluated`, `analytics-clickhouse`) + cross-group sum as the alert source |
+| `dashboards/dlq-poison.json` | `submissions.dlq` topic depth + arrival rate, age of oldest unreplayed message (lag-style), per-partition spread (envelope is JSON in the message body, so per-error breakdown lives in the `last_error` field — peek via `kcat -C -t submissions.dlq -o -10 -e`) |
 
-Five alert policies under `alerts/`: collector pod restart, collector OOM-kill, accept→verdict p99 > 30 s for 5 min, sandbox pool at 0 for any language for 60 s, consumer-group lag > 10 000 for 5 min.
+Six alert policies under `alerts/`: collector pod restart, collector OOM-kill, accept→verdict p99 > 30 s for 5 min, sandbox pool at 0 for any language for 60 s, consumer-group lag > 10 000 for 5 min, and DLQ arrivals on `submissions.dlq` sustained > 0 for 5 min.
 
 `scripts/validate.sh` is the offline pre-merge gate — parses every JSON, runs `otelcol-contrib validate` on the collector config when the binary is on `$PATH`, and confirms every JVM service in `region.yml` inherits the shared `x-otel-defaults` YAML anchor. `scripts/{apply-dashboards,apply-alerts}.sh` are the idempotent operator commands (`gcloud monitoring …` under the hood); both match on `displayName` and update in place.
 
@@ -877,7 +878,7 @@ Short list — each item points at deeper material.
 | React SPA not built | Roadmap §4.20 + [`design-docs/react-spa-and-websockets.md`](./design-docs/react-spa-and-websockets.md) | High for v1 launch — no UI |
 | `analytics-pipeline` Spring module deprecated; replaced by ClickHouse Kafka Engine (see `design-docs/clickhouse-kafka-engine-rollout.md`) | §4.8 | n/a — DDL + compose entry shipped; the JVM module is retained for git history only |
 | `RUNTIME_ERROR` vs INTERNAL_ERROR conflation | §4.2 failure modes | Low — minor UX paper-cut |
-| No DLQ dashboard for the poison topic | Roadmap §3.10 | Medium — operators don't see dead-lettered submissions |
+| ~~No DLQ dashboard for the poison topic~~ | Closed — `infra/observability/dashboards/dlq-poison.json` + `infra/observability/alerts/dlq-arrival-rate.json` ship the topic-depth / oldest-message-age / per-partition view and an arrivals-sustained-over-5-min alert; see §9.4 row 4 | Closed |
 | No SPOT preemption shutdown script | §11.2 + roadmap §3.8 | Medium for `oj-compute` cost-optimised path |
 | `network-policy` rules on `oj-allow-internal` too permissive (`0-65535/tcp`) | Roadmap §3.5 | Low — intra-VPC, no public ingress |
 | `pre-test ≤ ordinal 10` is a magic number | Constants in `TestCase` entity + worker | Low — refactor to config |
