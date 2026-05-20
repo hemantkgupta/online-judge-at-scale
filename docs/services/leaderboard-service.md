@@ -1,10 +1,10 @@
 # leaderboard-service
 
-> **Owner page.** Last reconciled with the repo on **2026-05-18**.
+> **Owner page.** Last reconciled with the repo on **2026-05-19**.
 >
 > The single source of truth for the leaderboard-service. Cross-cutting concerns (proto schema, Kafka topic catalogue, the Redis key catalogue, the multi-region story) live in [`../tech-spec.md`](../tech-spec.md). The upstream verdict producer is documented at [`./execution-worker.md`](./execution-worker.md).
 >
-> **Status.** Dockerfile + image + compose entry shipped (commit `6be38f4`); not yet deployed live on the GCP environment as of 2026-05-18. The compose block in [`infra/gcp/compose/control-plane-compose.yml`](../../infra/gcp/compose/control-plane-compose.yml) is in place; the next control-plane VM bounce will bring it up.
+> **Status.** Dockerfile + image + compose entry shipped (commit `6be38f4`). Stand-in leaderboard writer (M1 closure) landed 2026-05-19 — ON by default; flips OFF when scoring-pipeline (PR #8) takes over. Not yet deployed live on the GCP environment; the next control-plane VM bounce will bring the writer up.
 >
 > Read this page if you are: (a) on-call for the live leaderboard or the verdict-push WebSocket, (b) changing anything in `leaderboard-service/`, (c) thinking about how Redis keys are shaped for the scoring story.
 
@@ -12,13 +12,14 @@
 
 ## 1. Purpose
 
-The fan-out tier between the verdict stream and the contestant's browser. Three responsibilities:
+The fan-out tier between the verdict stream and the contestant's browser. Four responsibilities:
 
 1. **Kafka consumer.** Pulls `VerdictEvent` from `evaluated_results` and caches it in Redis under `verdict:{submissionId}` (TTL 24 h). The api-gateway HTTP-fallback path reads this key when a client polls `GET /api/v1/submissions/{id}/verdict` after a WebSocket drop. See [`./api-gateway.md#5-failure-modes`](./api-gateway.md#5-failure-modes) for the coupling.
 2. **WebSocket push.** Holds a STOMP-over-SockJS session per contestant on `/ws` and forwards each verdict to `/topic/verdicts/{userId}` — _but only when that user's session is on this instance_. The "is this user connected here" gate is the local `VerdictConnectionRegistry`; if not, the push is skipped and the HTTP fallback covers them on reconnect. "WebSocket fast path + HTTP reliable fallback".
 3. **Leaderboard reads.** Serves `GET /api/v1/leaderboard/{contestId}` from Redis sorted-sets — `ZREVRANGE` for the page, `ZREVRANK` + per-shard `ZCARD` for "where am I". Reads route through a read-replica template when configured; writes (verdict-cache SET, Pub/Sub) always go to the primary.
+4. **Stand-in leaderboard writer (M1 closure).** On each ACCEPTED `system`/`final` verdict, ZADDs the user into the score-range ZSETs and PUBLISHes on `score_updates:{contestId}`. Penalty = 0; the proper ICPC penalty math lives in scoring-pipeline. Behind feature flag `app.leaderboard.writer.enabled` — flipped OFF when scoring-pipeline (Flink) takes over the writes. See [§3.6 Stand-in writer (M1 cutover prep)](#36-stand-in-writer-m1-cutover-prep).
 
-What this service **doesn't** do: it does NOT compute scores or `ZADD`. The scoring-pipeline (Flink, blocked on a runtime — see [`../tech-spec.md#47-scoring-pipeline-blocked`](../tech-spec.md)) is the writer. Until that ships, the leaderboard read path returns empty. leaderboard-service is the read side and the push side; the scoring math lives elsewhere. The earlier inline tech-spec §4.6 described a simpler "ZADD-by-points-on-verdict-ingest" fallback model that the service _could_ do trivially but doesn't today. Reconcile against this page.
+Historical note (audited 2026-05-19 by agent `af394dca`): an earlier version of this page asserted that "this service does NOT compute scores or ZADD; scoring-pipeline is the writer". That was aspirational — the code had never implemented either side. With M1 closing, the stand-in writer above is now live in code; scoring-pipeline (PR #8 productionising the Flink job) remains the target architecture and takes over when its parity is observed. The two writers share the same shard router, Lua key/arg shape, and score encoding, so brief overlap during cutover is no-op.
 
 ---
 
@@ -81,11 +82,11 @@ Second CONNECT for the same user silently replaces the first — last-CONNECT-wi
 
 `RedisConfig.redisListenerContainer` subscribes to `score_updates:*` on the **primary** (deliberately, not the replica — failing closed on the delivery-critical channel). `ScoreUpdateSubscriber.onMessage` extracts the contestId from the channel name and forwards the body to `/topic/leaderboard/{contestId}`.
 
-Today nothing publishes to `score_updates:{contestId}` — the producer is the not-yet-deployed scoring-pipeline. The subscriber is idle. The `score_updates:user:{userId}` row in tech-spec §5.4 is also forward-looking — the pattern subscription would match it, but nothing publishes yet.
+The producer of `score_updates:{contestId}` is the stand-in `LeaderboardWriter` (§3.6) today, and becomes scoring-pipeline's `RedisLeaderboardSink` after cutover. Both writers publish the same JSON shape (`{userId, contestId, newScore, penaltyMinutes, newRank}`) via the same Lua, so the subscriber doesn't change. The `score_updates:user:{userId}` row in tech-spec §5.4 is still forward-looking — the pattern subscription would match it, but nothing publishes yet.
 
 ### 3.4 Score-range sharding for leaderboard reads
 
-`LeaderboardService` does NOT read a single ZSET per contest. It reads **score-range shards** via `ScoreRangeShardRouter` (ICPC default: 3–5 shards by score band). Shard key: `leaderboard:{contestId}:s{shardIdx}`. Both this service (reader) and scoring-pipeline (writer) share the router so shard boundaries agree.
+`LeaderboardService` does NOT read a single ZSET per contest. It reads **score-range shards** via `ScoreRangeShardRouter` (ICPC default: 3–5 shards by score band). Shard key: `leaderboard:{contestId}:shard:{shardIdx}`. Both this service (reader + stand-in writer) and scoring-pipeline (target writer) share the router so shard boundaries agree.
 
 `getLeaderboardPage`: `ZCARD` each shard (3–5 RTTs); walk top-down accumulating counts; issue at most one `ZREVRANGE` per shard the page window crosses. Composite ZSET score is `points * 10_000_000 - penaltyMinutes`; decode via `Math.round(score / 10_000_000.0)` to avoid the integer-division boundary bug noted in `decodePoints`.
 
@@ -97,6 +98,33 @@ Today nothing publishes to `score_updates:{contestId}` — the producer is the n
 
 `spring.threads.virtual.enabled: true` — Java 21 virtual threads for Tomcat workers + STOMP message handling. Idle WebSocket sessions cost effectively nothing.
 
+### 3.6 Stand-in writer (M1 cutover prep)
+
+`LeaderboardWriter` is a `@Component` gated by `@ConditionalOnProperty(name="app.leaderboard.writer.enabled", havingValue="true", matchIfMissing=true)`. When the flag is true (default), the bean is wired into `VerdictPushConsumer` as an `ObjectProvider<LeaderboardWriter>` and consulted after the verdict-cache write, before the WebSocket push. When false, the bean drops out of the context entirely and `ObjectProvider.getIfAvailable()` returns `null` — the cache + push paths keep running.
+
+**Per-verdict steps** (only on ACCEPTED with `phase ∈ {system, final}` and `points > 0`):
+
+1. **Idempotency.** `SADD processed:{contestId} {submissionId}` — if it returns 0, the verdict is a Kafka redelivery; skip the rest. TTL refreshed to 24 h on every successful add.
+2. **Accumulate.** `HINCRBY leaderboard:state:{contestId} {userId} {points}` returns the user's new total points across the contest. TTL refreshed to 24 h.
+3. **Encode + route.** `zsetScore = totalPoints * 10_000_000 - 0` (penalty = 0 in the stand-in). `targetShard = ScoreRangeShardRouter.defaultIcpcRouter().shardForScore(zsetScore)` — same router instance `LeaderboardService` reads from and scoring-pipeline's `RedisLeaderboardSink` writes to.
+4. **Atomic Lua.** KEYS = `[score_updates:{contestId}, leaderboard:{contestId}:shard:{target}, ...otherShardKeys]`. ARGV = `[userId, zsetScore, contestId, totalPoints, "0"]`. The Lua body is **byte-identical** to `RedisLeaderboardSink.LUA_UPDATE_SCORE` in scoring-pipeline — it ZREMs the user from non-target shards (boundary-cross cleanup keeps the user in exactly one shard), ZADDs to the target, ZREVRANKs, and PUBLISHes the score-change message on the Pub/Sub channel.
+5. **Metric.** `oj.leaderboard.writer.writes_total{contest_id, verdict}` ++.
+
+**Cutover procedure** (after scoring-pipeline / PR #8 is up):
+
+| Step | Operator action | What to watch |
+|---|---|---|
+| 1 | Submit a couple of submissions on a synthetic contest. | Verify both writers are running: `oj.leaderboard.writer.writes_total` (this service) and `oj.scoring.score_updates_total` (Flink) both increment. |
+| 2 | Compare the rates on the operator dashboard. Target: same rate for ≥5 contests over ≥24 h. | The two writers compute the same composite score from the same `(totalPoints, 0)` pair (stand-in) vs `(totalPoints, penaltyMinutes)` (Flink). Penalty math differs, so ZSET scores can diverge per user; rate parity is the criterion, not value parity. |
+| 3 | Uncomment `APP_LEADERBOARD_WRITER_ENABLED: "false"` in [`infra/gcp/compose/region.yml`](../../infra/gcp/compose/region.yml) and `docker compose up -d oj-leaderboard-service`. | The `LeaderboardWriter` bean drops out at startup; the `@KafkaListener` keeps running. Tail logs for any `BeanCreationException`; verify `oj.leaderboard.writer.writes_total` flatlines while `oj.scoring.score_updates_total` continues. |
+| 4 | (Optional cleanup) `DEL processed:{contestId}` and `leaderboard:state:{contestId}` for closed contests. | These keys are scratch state for the stand-in only; Flink doesn't use them. They TTL out 24 h after the last write, so manual cleanup is optional. |
+
+**Idempotency / replay story.** The Kafka consumer is `auto-commit=true`, `auto-offset-reset=latest` — under nominal operation each verdict is delivered once. Rebalances and partition-revoke retries can redeliver. The SADD-based dedupe guards against this without coordinating with Flink: the dedupe key namespace (`processed:{contestId}`) is local to this service. After cutover, Flink uses its own keyed-state idempotency (a re-applied ScoreUpdate produces the same ZSET state because WA-times are stored in a TreeSet); the dedupe set is only a stand-in concern.
+
+**Why penalty = 0 and not real ICPC math?** Real first-AC-wins + pre-AC-WA × 20 min penalty needs the keyed per-(user, problem) state that scoring-pipeline already implements (`ScoringState`, `ProblemScoreState`). Replicating it inside a `@KafkaListener` would mean two divergent implementations of contest scoring with subtly different bug surface. The stand-in is documented as "simple ZADD-by-points" — it gets ranks ordered correctly in points-tier space; penalty disambiguation arrives with Flink.
+
+**Code map.** `leaderboard-service/src/main/java/com/onlinejudge/leaderboard/writer/LeaderboardWriter.java`; tests at `.../writer/LeaderboardWriterTest.java` and `LeaderboardWriterDisabledTest.java`.
+
 ---
 
 ## 4. Data ownership
@@ -104,8 +132,10 @@ Today nothing publishes to `score_updates:{contestId}` — the producer is the n
 | Resource | Lifetime | Where | This service |
 |---|---|---|---|
 | `verdict:{submissionId}` | per submission, TTL 24 h | Redis primary | **WRITES** (consumer) — also read by api-gateway on the HTTP-fallback path |
-| `leaderboard:{contestId}:s{idx}` | per contest, no TTL | Redis primary (writes by scoring-pipeline once deployed) / replica (reads) | **READS ONLY** today |
-| `score_updates:{contestId}` | Pub/Sub channel | Redis primary | **SUBSCRIBES** (no producer yet — will be the scoring-pipeline) |
+| `leaderboard:{contestId}:shard:{i}` | per contest, no TTL | Redis primary (writes) / replica (reads) | **WRITES** via the stand-in `LeaderboardWriter` (flag-gated; default on); also **READS** for the leaderboard / rank endpoints. Will become read-only when scoring-pipeline / Flink takes over and `app.leaderboard.writer.enabled=false`. |
+| `score_updates:{contestId}` | Pub/Sub channel | Redis primary | **WRITES** via the Lua PUBLISH inside the stand-in writer; **SUBSCRIBES** via `ScoreUpdateSubscriber` for the `/topic/leaderboard/{contestId}` fan-out. After cutover, scoring-pipeline writes; this service stays the subscriber. |
+| `processed:{contestId}` (SET) | per contest, TTL 24 h | Redis primary | **WRITES** — Kafka-redelivery dedupe set used by the stand-in writer only. Goes away when the stand-in is flipped off. |
+| `leaderboard:state:{contestId}` (HASH) | per contest, TTL 24 h | Redis primary | **WRITES** — per-user running points hash used by the stand-in writer only (penalty-less running total). Scratch state; not consumed by anything else. |
 | `score_updates:user:{userId}` | Pub/Sub channel | Redis primary | Wired via pattern; no producer yet |
 | Kafka consumer offsets | per group | Kafka `__consumer_offsets` | Owned by group `leaderboard-verdict-push`; committed via auto-commit |
 | `userId → sessionId` map | process lifetime | JVM heap (`VerdictConnectionRegistry`) | Per-instance, ephemeral |
@@ -153,6 +183,7 @@ Cross-reference: [`../tech-spec.md#54-redis-keys`](../tech-spec.md#54-redis-keys
 | `spring.kafka.consumer.value-deserializer` | `ByteArrayDeserializer` | Proto bytes; parsed by `VerdictEvent.parseFrom`. |
 | `app.kafka.topic.evaluated-results` | `evaluated_results` | Verdict source. |
 | `app.leaderboard.default-page-size` | `100` | Hard cap 500 in `LeaderboardService`. |
+| `app.leaderboard.writer.enabled` | `true` (override: `APP_LEADERBOARD_WRITER_ENABLED`) | Stand-in `LeaderboardWriter` bean toggle. `true` (default) = this service writes the ZSETs; `false` = scoring-pipeline (Flink) owns the writes. See §3.6 for cutover. |
 | `app.redis.replica.host` / `.port` | empty / `0` | Optional read-replica. Empty → reads go to primary. |
 | `JAVA_TOOL_OPTIONS` | `-Xmx256m -XX:+ExitOnOutOfMemoryError` (compose) | Heap. Dockerfile default `-XX:MaxRAMPercentage=70`; compose overrides explicitly because the control-plane VM is memory-tight. |
 | `OTEL_JAVAAGENT_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT` | `false` / `http://oj-otel-collector:4317` | OTLP gRPC via java agent. |
@@ -162,10 +193,11 @@ Cross-reference: [`../tech-spec.md#54-redis-keys`](../tech-spec.md#54-redis-keys
 
 ## 7. Metrics emitted
 
-Today the service emits only the Spring Boot defaults (Tomcat / JVM / Lettuce). The catalogue below is the **proposed** `oj.leaderboard.*` namespace; instrumentation is a roadmap item alongside the OTEL collector deploy ([`../design-docs/otel-collector-deployment.md`](../design-docs/otel-collector-deployment.md)).
+Today the service emits Spring Boot defaults (Tomcat / JVM / Lettuce) plus the writer counter below. The rest of the catalogue is the **proposed** `oj.leaderboard.*` namespace; broader instrumentation is a roadmap item alongside the OTEL collector deploy ([`../design-docs/otel-collector-deployment.md`](../design-docs/otel-collector-deployment.md)).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
+| `oj.leaderboard.writer.writes_total` | counter | `contest_id`, `verdict` | **Live.** Stand-in `LeaderboardWriter` writes (one increment per ZADD-via-Lua). The cutover-parity tile compares this rate against `oj.scoring.score_updates_total` from Flink. Flatlines when `app.leaderboard.writer.enabled=false`. |
 | `oj.leaderboard.verdicts.consumed_total` | counter | `phase`, `result` | One per `VerdictEvent` consumed off `evaluated_results`. Sustained zero in a live contest = consumer wedged. |
 | `oj.leaderboard.verdict_cache.write_latency_seconds` | histogram | (none) | Latency of the `SET verdict:{id}` op. P99 above 50 ms = Redis hot. |
 | `oj.leaderboard.ws.sessions_active` | gauge | (none) | `VerdictConnectionRegistry.localConnectionCount()` snapshot. Per-instance. |
@@ -191,7 +223,7 @@ done
 sudo docker exec oj-redis redis-cli INFO replication | grep -E "role|offset"
 ```
 
-**Fix.** Until scoring-pipeline deploys this is the expected state — leaderboard is empty. Once it deploys: if the ZADD never landed, scoring-pipeline is wedged (its runbook). If replica lag is the cause, clear `REDIS_REPLICA_HOST` and restart.
+**Fix.** With the stand-in writer ON (default, pre-Flink): if `oj.leaderboard.writer.writes_total` is flatlining, the writer is misfiring — check logs for `[lb-writer]` warnings and confirm `app.leaderboard.writer.enabled=true`. Verify the verdict actually reached this service (`oj.leaderboard.verdicts.consumed_total`). Common cause: the verdict had `phase=pretest`, which is intentionally non-scoreable — the rank updates only on the later `system` verdict. With the stand-in OFF (post-cutover): if the ZADD never landed, scoring-pipeline is wedged (see [`./scoring-pipeline.md`](./scoring-pipeline.md) §8). If replica lag is the cause, clear `REDIS_REPLICA_HOST` and restart.
 
 ### 8.2 "WebSocket sessions dropping en masse"
 
@@ -203,7 +235,7 @@ sudo docker exec oj-redis redis-cli INFO replication | grep -E "role|offset"
 
 ### 8.3 "Redis OOM — sorted-set too large"
 
-**Symptom.** `MEMORY USAGE leaderboard:{contestId}:s{idx}` is huge; Redis OOMs.
+**Symptom.** `MEMORY USAGE leaderboard:{contestId}:shard:{idx}` is huge; Redis OOMs.
 
 **Diagnose.** `sudo docker exec oj-redis redis-cli --bigkeys` + `INFO memory`.
 
@@ -238,6 +270,8 @@ sudo docker exec oj-redis redis-cli INFO replication | grep -E "role|offset"
 | File | Coverage |
 |---|---|
 | `VerdictPushConsumerTest` | Proto parse; cache-then-push ordering; not-connected-locally branch; missing-userId drop |
+| `LeaderboardWriterTest` | Lua KEYS / ARGV shape; scoreable-phase filter (system / final yes, pretest no); ACCEPTED-only; missing-id drops; zero-points skip; SADD-based idempotency on Kafka redelivery |
+| `LeaderboardWriterDisabledTest` | With `app.leaderboard.writer.enabled=false`: the writer bean is absent, the verdict-push consumer bean is still present |
 | `VerdictConnectionRegistryTest` | Register / unregister; tab-refresh replacement; `isConnectedLocally` truth table; concurrent register from multiple sessions |
 | `LeaderboardServiceTest` | Multi-shard page assembly; cross-shard window; user-rank composition across shards; participant-count sum; composite-score decode round-trip |
 | `RedisConfigTest` | Replica template binds to replica host/port when configured; falls through to primary otherwise |
@@ -250,7 +284,7 @@ Run via `./gradlew :leaderboard-service:test`.
 
 Subscribe to `/topic/verdicts/<userId>` from a browser console connected to `ws://oj-control-plane:8082/ws`, then publish a synthetic VerdictEvent to `evaluated_results` via `kafka-console-producer`. Confirm `redis-cli GET "verdict:<submissionId>"` returned the cached JSON; the browser should log the same payload within hundreds of ms.
 
-For the leaderboard read path: `curl http://oj-control-plane:8082/api/v1/leaderboard/<contestId>?page=0&size=10` and `…/rank/<userId>`. Both return empty `entries` / `rank: -1` until scoring-pipeline starts writing.
+For the leaderboard read path: `curl http://oj-control-plane:8082/api/v1/leaderboard/<contestId>?page=0&size=10` and `…/rank/<userId>`. With the stand-in writer ON (default), submitting an ACCEPTED system-test verdict on a problem with non-zero `points` populates the user's rank within milliseconds. Pretest-only ACCEPTED verdicts do **not** show up — that's by design (mirrors scoring-pipeline's phase filter).
 
 ---
 
@@ -259,7 +293,7 @@ For the leaderboard read path: `curl http://oj-control-plane:8082/api/v1/leaderb
 - [`../design-docs/multi-region-rollout.md`](../design-docs/multi-region-rollout.md) — the regional Redis story. Each region has its own primary; cross-region leaderboard merge is a roadmap item.
 - [`../design-docs/react-spa-and-websockets.md`](../design-docs/react-spa-and-websockets.md) — the SockJS + STOMP client design; CORS hardening; auth header injection.
 - [`../design-docs/otel-collector-deployment.md`](../design-docs/otel-collector-deployment.md) — defines the proposed `oj.leaderboard.*` metric catalogue in §7.
-- The scoring-pipeline coupling is documented inline in [`../tech-spec.md#47-scoring-pipeline-blocked`](../tech-spec.md). When scoring-pipeline deploys, this page's §3 will lose the "fallback ZADD" hedge and become read-side-only.
+- The scoring-pipeline coupling is documented inline in [`../tech-spec.md#47-scoring-pipeline`](../tech-spec.md) and in [`./scoring-pipeline.md`](./scoring-pipeline.md). The §3.6 stand-in writer is the M1 closure; when scoring-pipeline deploys and the flag flips, §3.6 collapses to a "historical" subsection and §4's `leaderboard:{contestId}:shard:{i}` row goes back to READ-only.
 
 ---
 
@@ -268,6 +302,7 @@ For the leaderboard read path: `curl http://oj-control-plane:8082/api/v1/leaderb
 | Concern | File |
 |---|---|
 | Kafka consumer + cache-then-push | `leaderboard-service/src/main/java/com/onlinejudge/leaderboard/service/VerdictPushConsumer.java` |
+| Stand-in ZADD-by-points writer (flag-gated) | `.../writer/LeaderboardWriter.java` |
 | Per-instance userId→session registry | `.../service/VerdictConnectionRegistry.java` |
 | Pub/Sub subscriber → WebSocket broadcast | `.../service/ScoreUpdateSubscriber.java` |
 | Leaderboard read service (multi-shard) | `.../service/LeaderboardService.java` |

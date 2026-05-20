@@ -325,6 +325,12 @@ services:
       APP_PEER_REGION:                     ${PEER_REGION:?must set PEER_REGION}
       APP_PEER_LEADERBOARD_URL:            http://${PEER_INTERNAL_IP:?must set PEER_INTERNAL_IP}:8082
       APP_KAFKA_TOPIC_EVALUATED-RESULTS:   evaluated_results.${REGION}
+      # Stand-in leaderboard writer (M1 closure). Default ON via application.yml.
+      # Uncomment the line below to turn the writer OFF after observing rate
+      # parity on oj.scoring.score_updates_total (Flink) vs
+      # oj.leaderboard.writer.writes_total (this service) for 5 contests.
+      # Cutover procedure: docs/services/leaderboard-service.md §3.6.
+      # APP_LEADERBOARD_WRITER_ENABLED: "false"
       JAVA_TOOL_OPTIONS:                   "-Xmx256m -XX:+ExitOnOutOfMemoryError"
       <<: *otel-defaults
       OTEL_SERVICE_NAME: oj-leaderboard-service

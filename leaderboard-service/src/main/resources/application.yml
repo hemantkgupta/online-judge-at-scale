@@ -35,6 +35,15 @@ app:
 
   leaderboard:
     default-page-size: 100
+    writer:
+      # Stand-in ZADD-by-points writer (M1 closure pre-Flink).
+      # `true`  → leaderboard-service writes to leaderboard:{contestId}:shard:{i}
+      #            ZSETs on each ACCEPTED system/final verdict.
+      # `false` → the writer bean drops out; scoring-pipeline (Flink) is the
+      #            sole writer. Flip after observing rate parity on
+      #            oj.scoring.score_updates_total vs oj.leaderboard.writer.writes_total.
+      # See docs/services/leaderboard-service.md §3.6 "Stand-in writer (M1 cutover prep)".
+      enabled: ${APP_LEADERBOARD_WRITER_ENABLED:true}
   kafka:
     consumer-group: leaderboard-verdict-push
     topic:

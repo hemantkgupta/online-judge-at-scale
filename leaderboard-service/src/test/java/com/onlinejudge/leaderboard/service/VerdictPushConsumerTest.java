@@ -3,6 +3,7 @@ package com.onlinejudge.leaderboard.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.onlinejudge.common.events.Events.VerdictEvent;
+import com.onlinejudge.leaderboard.writer.LeaderboardWriter;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -10,11 +11,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.time.Duration;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -58,8 +61,24 @@ class VerdictPushConsumerTest {
     @BeforeEach
     void setUp() {
         registry = new VerdictConnectionRegistry();
-        consumer = new VerdictPushConsumer(messagingTemplate, redisTemplate, objectMapper, registry);
+        // The writer is optional (drops out via @ConditionalOnProperty when
+        // app.leaderboard.writer.enabled=false). These tests exercise the
+        // verdict-cache + WS push paths only; pass an empty provider.
+        ObjectProvider<LeaderboardWriter> emptyWriter = emptyProvider();
+        consumer = new VerdictPushConsumer(messagingTemplate, redisTemplate, objectMapper, registry, emptyWriter);
         lenient().when(redisTemplate.opsForValue()).thenReturn(valueOps);
+    }
+
+    /** Minimal {@link ObjectProvider} that resolves to no writer bean. */
+    private static ObjectProvider<LeaderboardWriter> emptyProvider() {
+        return new ObjectProvider<>() {
+            @Override public LeaderboardWriter getObject() { throw new UnsupportedOperationException(); }
+            @Override public LeaderboardWriter getObject(Object... args) { throw new UnsupportedOperationException(); }
+            @Override public LeaderboardWriter getIfAvailable() { return null; }
+            @Override public LeaderboardWriter getIfUnique() { return null; }
+            @Override public Stream<LeaderboardWriter> stream() { return Stream.empty(); }
+            @Override public Stream<LeaderboardWriter> orderedStream() { return Stream.empty(); }
+        };
     }
 
     private static byte[] proto(VerdictEvent.Builder b) {
